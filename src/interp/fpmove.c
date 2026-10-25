@@ -18,6 +18,7 @@
 #include <stdint.h>
 
 #include "core/cpu.h"
+#include "interp/fp.h"
 #include "interp/interp.h"
 
 /* Best-effort MIPS64R2 FIR for CFC1 $0 (read-only ID register); revisit
@@ -184,6 +185,18 @@ int fpmove_cop1(mips64_ctx_t *ctx, const mips_dec_t *d)
             return 0;
         }
         return MIPS_FAULT;
+    case 0x01u: /* DMFC1: full 64-bit lane to GPR */
+    case 0x05u: /* DMTC1: full 64-bit lane from GPR */
+    case 0x08u: /* BC1F/BC1FL/BC1T/BC1TL (any cc) */
+    case 0x10u: /* S: arithmetic, converts, compares */
+    case 0x11u: /* D: arithmetic, converts, compares */
+    case 0x14u: /* W: CVT.S.W / CVT.D.W source */
+    case 0x15u: /* L: CVT.S.L / CVT.D.L source */
+        /* FP arithmetic/branches live in fp.c (Phase 3, lane L3a).
+         * ctx->pc is the word's own address on every path that reaches
+         * here: interp_step calls exec_simple with ctx->pc == pc, and
+         * the delay-slot path sets ctx->pc to the slot first. */
+        return fp_cop1(ctx, ctx->pc, d);
     default:
         return MIPS_FAULT;
     }
