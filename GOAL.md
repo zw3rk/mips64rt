@@ -23,13 +23,13 @@ Implement, verify, and harden **`mips64rt`** — a zero-dependency, static-PIE (
 
 ### Phase E — Pre-Implementation Empirical Experiments (`RC-E`)
 Read [`docs/lanes/phase-e.md`](docs/lanes/phase-e.md) and run concurrent experiment lanes `E01..E06`:
-- [ ] **E01 (N64 (Base 5000) vs N32 (Base 6000) Syscalls & `TASK_SIZE` Bounds)**: Verify N64 (`1ULL<<40`) and N32 (`0x7fff8000`) address limits and `$a0..$a5` / `$a3` syscall conventions. (`experiments/E01/FINDINGS.md`)
-- [ ] **E02 (Canonical 32-Bit Sign-Extension & `DEXT*`/`DINS*`/`LDL`/`LDR`)**: Verify 32-bit sign-extension invariants and unaligned 64-bit `LDL`/`LDR`/`SDL`/`SDR` across LE and BE. (`experiments/E02/FINDINGS.md`)
-- [ ] **E03 (N64 & N32 `rt_sigframe` Layout & 128-Signal (`sigsetsize=16`) UAPI)**: Verify `rt_sigframe` and `sigcontext` (no `sc_cause` field) in both N64 and N32 ABIs. (`experiments/E03/FINDINGS.md`)
-- [ ] **E04 (Legacy vs IEEE-2008 NaN/ABS FPU Semantics in 64-Bit `FR=1` Mode)**: Verify `EF_MIPS_NAN2008` and 64-bit FPU operations under `qemu-mips64el`. (`experiments/E04/FINDINGS.md`)
-- [ ] **E05 (`LL`/`SC` & `LLD`/`SCD` Reservation Semantics)**: Verify 32-bit and 64-bit load-linked / store-conditional operations. (`experiments/E05/FINDINGS.md`)
-- [ ] **E06 (TLS (`rdhwr $29` / `set_thread_area`) in N64 and N32)**: Verify TLS pointer setup and access across `clone` and pthreads. (`experiments/E06/FINDINGS.md`)
-- [ ] **Gate `RC-E`**: All `experiments/E01..E06/FINDINGS.md` committed on `master` with target cross-compiler `sizeof`/`offsetof` and `qemu-mips64el (and qemu-mips64 / qemu-mipsn32el)` ground-truth verification.
+- [x] **E01 (N64 (Base 5000) vs N32 (Base 6000) Syscalls & `TASK_SIZE` Bounds)**: Verify N64 (`1ULL<<40`) and N32 (`0x7fff8000`) address limits and `$a0..$a5` / `$a3` syscall conventions. (`experiments/E01/FINDINGS.md`)
+- [x] **E02 (Canonical 32-Bit Sign-Extension & `DEXT*`/`DINS*`/`LDL`/`LDR`)**: Verify 32-bit sign-extension invariants and unaligned 64-bit `LDL`/`LDR`/`SDL`/`SDR` across LE and BE. (`experiments/E02/FINDINGS.md`)
+- [x] **E03 (N64 & N32 `rt_sigframe` Layout & 128-Signal (`sigsetsize=16`) UAPI)**: Verify `rt_sigframe` and `sigcontext` (no `sc_cause` field) in both N64 and N32 ABIs. (`experiments/E03/FINDINGS.md`)
+- [x] **E04 (Legacy vs IEEE-2008 NaN/ABS FPU Semantics in 64-Bit `FR=1` Mode)**: Verify `EF_MIPS_NAN2008` and 64-bit FPU operations under `qemu-mips64el`. (`experiments/E04/FINDINGS.md`)
+- [x] **E05 (`LL`/`SC` & `LLD`/`SCD` Reservation Semantics)**: Verify 32-bit and 64-bit load-linked / store-conditional operations. (`experiments/E05/FINDINGS.md`)
+- [x] **E06 (TLS (`rdhwr $29` / `set_thread_area`) in N64 and N32)**: Verify TLS pointer setup and access across `clone` and pthreads. (`experiments/E06/FINDINGS.md`)
+- [x] **Gate `RC-E`**: All `experiments/E01..E06/FINDINGS.md` committed on `master` with target cross-compiler `sizeof`/`offsetof` and `qemu-mips64el (and qemu-mips64 / qemu-mipsn32el)` ground-truth verification.
 
 ### Phase 0 — Repository Scaffold, Frozen Headers & Substrate Copy (`RC0`)
 Read [`docs/lanes/phase-0.md`](docs/lanes/phase-0.md) and run lanes `L0a..L0b`:
