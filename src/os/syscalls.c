@@ -41,6 +41,7 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
 
 /* Lane L5a: fold the /proc/self TU in the same way (its feature-test
@@ -654,4 +655,183 @@ int64_t mips_sc_getdents64(mips64_ctx_t *ctx, uint64_t fd, uint64_t dirp_va,
         }
     }
     return l2a_ret(ctx, (int64_t)n);
+}
+
+/* Lane H2: additive libc-test/LTP helpers (no reshaping of the L2a
+ * paths above). Each entry follows the same conventions (l2a_ret,
+ * guest_str, sysroot join, endian-aware putn/getn). The dispatch arms
+ * in src/os/syscall_min.c are outside this lane's exclusive files, so
+ * the RC-H coordinator wires these numbers to the entries below:
+ *   unlink 5085/6085 -> mips_sc_unlink,
+ *   truncate 5074/6074 -> mips_sc_truncate,
+ *   ftruncate 5075/6075 -> mips_sc_ftruncate,
+ *   symlinkat 5256/6260 -> mips_sc_symlinkat,
+ *   clock_getres 5223/6227 -> mips_sc_clock_getres,
+ *   clock_nanosleep 5224/6228 (+ N32 time64 6407) ->
+ *     mips_sc_clock_nanosleep (true 4-arg ABI; see below).
+ * Until then the suites observe -ENOSYS (89) on these numbers. The
+ * N32 fcntl64 path glibc's fcntl() lowers to is NOT covered here: it
+ * needs a new src/os/syscall_nr.h number (frozen) plus dispatch, so
+ * it stays -ENOSYS and is reported back (escalation rule). */
+
+/* Legacy unlink(2) (N64 5085 / N32 6085): unlinkat(AT_FDCWD).
+ * glibc unlink() still emits the legacy number (qemu-observed). */
+int64_t mips_sc_unlink(mips64_ctx_t *ctx, uint64_t path_va)
+{
+    return mips_sc_unlinkat(ctx, (uint64_t)(int64_t)-100, path_va, 0U);
+}
+
+int64_t mips_sc_truncate(mips64_ctx_t *ctx, uint64_t path_va,
+                         uint64_t len)
+{
+    char path[L2A_PATH_MAX + 1U];
+    char full[L2A_PATH_MAX + MIPS64RT_HOST_ARGS_PATH_MAX + 2U];
+    int64_t rc = guest_str(ctx, path_va, path);
+
+    if (rc < 0) {
+        return l2a_ret(ctx, rc);
+    }
+    if (mips64_sysroot_join(mips64_host_sysroot(), path, full,
+                            sizeof full) != 0) {
+        return l2a_ret(ctx, -(int64_t)ENAMETOOLONG);
+    }
+    if (truncate(full, (off_t)len) != 0) {
+        return l2a_ret(ctx, -(int64_t)errno);
+    }
+    return l2a_ret(ctx, 0);
+}
+
+int64_t mips_sc_ftruncate(mips64_ctx_t *ctx, uint64_t fd, uint64_t len)
+{
+    if (ftruncate((int)fd, (off_t)len) != 0) {
+        return l2a_ret(ctx, -(int64_t)errno);
+    }
+    return l2a_ret(ctx, 0);
+}
+
+/* symlinkat (N64 5256 / N32 6260; glibc symlink() lowers to
+ * symlinkat(AT_FDCWD)): Linux stores the target verbatim without
+ * resolving it at creation, so only the link path joins the sysroot
+ * while the target passes through untouched. */
+int64_t mips_sc_symlinkat(mips64_ctx_t *ctx, uint64_t target_va,
+                          uint64_t dirfd, uint64_t link_va)
+{
+    char target[L2A_PATH_MAX + 1U];
+    char link[L2A_PATH_MAX + 1U];
+    char full[L2A_PATH_MAX + MIPS64RT_HOST_ARGS_PATH_MAX + 2U];
+    int64_t rc = guest_str(ctx, target_va, target);
+
+    if (rc < 0) {
+        return l2a_ret(ctx, rc);
+    }
+    rc = guest_str(ctx, link_va, link);
+    if (rc < 0) {
+        return l2a_ret(ctx, rc);
+    }
+    if (mips64_sysroot_join(mips64_host_sysroot(), link, full,
+                            sizeof full) != 0) {
+        return l2a_ret(ctx, -(int64_t)ENAMETOOLONG);
+    }
+    if (symlinkat(target, (int)dirfd, full) != 0) {
+        return l2a_ret(ctx, -(int64_t)errno);
+    }
+    return l2a_ret(ctx, 0);
+}
+
+/* clock_getres (N64 5223 / N32 6227): same timespec write layout as
+ * the clock family in src/os/syscalls_time.c (16-byte N64/time64,
+ * 8-byte N32 {s32, s32} pair). */
+int64_t mips_sc_clock_getres(mips64_ctx_t *ctx, uint64_t clk,
+                             uint64_t ts_va, int is64)
+{
+    struct timespec ts;
+    uint8_t *p;
+    int be;
+
+    if (clock_getres((clockid_t)(int)clk, &ts) != 0) {
+        return l2a_ret(ctx, -(int64_t)errno);
+    }
+    p = guest_range(ctx, ts_va, is64 ? 16U : 8U, 1);
+    if (p == NULL) {
+        return l2a_ret(ctx, -(int64_t)EFAULT);
+    }
+    be = ctx->is_be != 0U;
+    if (is64) {
+        putn(p, (uint64_t)(int64_t)ts.tv_sec, 8, be);
+        putn(p + 8, (uint64_t)(int64_t)ts.tv_nsec, 8, be);
+    } else {
+        putn(p, (uint64_t)(uint32_t)(int32_t)ts.tv_sec, 4, be);
+        putn(p + 4, (uint64_t)(uint32_t)(int32_t)ts.tv_nsec, 4, be);
+    }
+    return l2a_ret(ctx, 0);
+}
+
+/* clock_nanosleep with the true 4-arg ABI (clk, flags, req, rem)
+ * (N64 5224 / N32 6228, N32 time64 6407). The current dispatch arm
+ * calls mips_sc_nanosleep with the 3-arg shift (a0, a1, a2 for
+ * clk, req, rem), so it reads the flags word (0) as the request
+ * pointer — address 0 is unmapped and every glibc nanosleep (which
+ * lowers to clock_nanosleep, qemu-observed) fails with -EFAULT.
+ * This entry takes (clk, flags, req, rem) in order; only
+ * TIMER_ABSTIME is defined (other bits are -EINVAL, matching Linux).
+ * The EINTR remainder writeback mirrors mips_sc_nanosleep. */
+int64_t mips_sc_clock_nanosleep(mips64_ctx_t *ctx, uint64_t clk,
+                                uint64_t flags, uint64_t req_va,
+                                uint64_t rem_va, int is64)
+{
+    struct timespec rq;
+    struct timespec rm;
+    struct timespec *remp = NULL;
+    uint8_t *p;
+    int64_t rc;
+    int be;
+
+    if ((flags & ~(uint64_t)TIMER_ABSTIME) != 0U) {
+        return l2a_ret(ctx, -(int64_t)EINVAL);
+    }
+    p = guest_range(ctx, req_va, is64 ? 16U : 8U, 0);
+    if (p == NULL) {
+        return l2a_ret(ctx, -(int64_t)EFAULT);
+    }
+    be = ctx->is_be != 0U;
+    if (is64) {
+        rq.tv_sec = (time_t)getn(p, 8, be);
+        rq.tv_nsec = (long)getn(p + 8, 8, be);
+    } else {
+        rq.tv_sec = (time_t)(int32_t)getn(p, 4, be);
+        rq.tv_nsec = (long)(int32_t)getn(p + 4, 4, be);
+    }
+    if (rem_va != 0U) {
+        if (guest_range(ctx, rem_va, is64 ? 16U : 8U, 1) == NULL) {
+            return l2a_ret(ctx, -(int64_t)EFAULT);
+        }
+        remp = &rm;
+    }
+    if (rq.tv_nsec < 0 || rq.tv_nsec >= 1000000000L) {
+        return l2a_ret(ctx, -(int64_t)EINVAL);
+    }
+    rc = (int64_t)clock_nanosleep((clockid_t)(int)clk, (int)flags, &rq,
+                                  remp);
+    if (rc != 0) {
+        rc = -(int64_t)errno;
+        if (remp != NULL && errno == EINTR) {
+            uint8_t *q = guest_range(ctx, rem_va, is64 ? 16U : 8U, 1);
+
+            if (q != NULL) {
+                if (is64) {
+                    putn(q, (uint64_t)(int64_t)remp->tv_sec, 8, be);
+                    putn(q + 8, (uint64_t)(int64_t)remp->tv_nsec,
+                         8, be);
+                } else {
+                    putn(q, (uint64_t)(uint32_t)(int32_t)remp->tv_sec,
+                         4, be);
+                    putn(q + 4,
+                         (uint64_t)(uint32_t)(int32_t)remp->tv_nsec,
+                         4, be);
+                }
+            }
+        }
+        return l2a_ret(ctx, rc);
+    }
+    return l2a_ret(ctx, 0);
 }
