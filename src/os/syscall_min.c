@@ -139,6 +139,8 @@ extern int64_t mips_mem_remap(mips64_ctx_t *ctx, uint64_t old_va,
                               uint64_t flags, uint64_t new_va);
 extern uint64_t mips_mem_hole_after(const mips64_ctx_t *ctx, uint64_t cand,
                                     uint64_t size);
+/* Phase 7 H1: DBT SMC hook (weak; strong def in src/dbt/dbt.c). */
+__attribute__((weak)) void dbt_invalidate_range(uint64_t va, uint64_t len);
 
 /* Guest prot bits (Linux asm-generic, shared with the target). */
 #define MIPS_PROT_READ 1U
@@ -859,6 +861,13 @@ static int64_t mips_syscall_inner(mips64_ctx_t *ctx)
     }
     if (nr == (uint64_t)(n32 ? MIPS64_NR32_pwritev : MIPS64_NR_pwritev)) {
         return mips_sc_vec(ctx, a0, a1, a2, a3, 1, 1);
+    }
+    if (nr == (uint64_t)(n32 ? MIPS64_NR32_cacheflush : MIPS64_NR_cacheflush)) {
+        /* H1: cacheflush(addr, len, kind) retires [addr, addr+len). */
+        if (a1 != 0U && dbt_invalidate_range != NULL) {
+            dbt_invalidate_range(a0, a1);
+        }
+        return sc_ret(ctx, 0);
     }
     return sc_ret(ctx, -(int64_t)ENOSYS);
 }

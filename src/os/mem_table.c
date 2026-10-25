@@ -113,6 +113,18 @@ static void copy_tag(char *dst, const char *tag)
     dst[i] = '\0';
 }
 
+/* Phase 7 H1: DBT SMC hook. Weak default here so dbt-less unit links
+ * (the test_decode host check, macOS ld has no ELF-style weak-undefined
+ * reference) keep working; the strong definition in src/dbt/dbt.c
+ * overrides it in the real translator, where the hook always fires.
+ * Hooks fire only on map/protect/unmap — never on the common
+ * store path. */
+__attribute__((weak)) void dbt_invalidate_range(uint64_t va, uint64_t len)
+{
+    (void)va;
+    (void)len;
+}
+
 /* Split the region containing va so a region starts at va. Page
  * granularity: va must be page aligned (va == 0 and va == task_size are
  * boundaries that need no split). Returns 0, or -ENOMEM when the table
@@ -303,6 +315,7 @@ int mips_mem_map(mips64_ctx_t *ctx, uint64_t va, uint64_t len, uint32_t prot,
                 rc = -ENOMEM;
             } else {
                 insert_region(va, len, prot, tag);
+                dbt_invalidate_range(va, len);
             }
         }
     }
@@ -350,6 +363,7 @@ int mips_mem_unmap(mips64_ctx_t *ctx, uint64_t va, uint64_t len)
     g_region_count = w;
     (void)mmap((void *)(uintptr_t)(ctx->guest_base + va), (size_t)len,
                PROT_NONE, MAP_PRIVATE | MAP_FIXED | MAP_ANONYMOUS, -1, 0);
+    dbt_invalidate_range(va, len);
     mem_unlock();
     return 0;
 }
@@ -400,6 +414,8 @@ int mips_mem_protect(mips64_ctx_t *ctx, uint64_t va, uint64_t len,
         if (mprotect((void *)(uintptr_t)(ctx->guest_base + va),
                      (size_t)len, host_prot(prot)) != 0) {
             rc = -ENOMEM;
+        } else {
+            dbt_invalidate_range(va, len);
         }
     }
     mem_unlock();
