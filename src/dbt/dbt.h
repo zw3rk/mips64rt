@@ -58,15 +58,22 @@ enum {
  * the resume guest VA into `ctx->pc` (via `x19`) before returning.
  * The dispatcher executes at most the `[entry, ctx->pc)` prefix of
  * the block has run natively; the `interp_step` fallback completes
- * the insn at `ctx->pc` (or faults there). */
+ * the insn at `ctx->pc` (or faults there).
+ *
+ * Values are identical to the frozen `MIPS64_EXIT_*` contract in
+ * `core/cpu.h` because the emitter (L2c) reports those codes: the
+ * dispatcher must switch on the same values (RC2: mismatched codes
+ * made `SYSCALL`(2) match `INDIRECT` and re-enter the syscall block
+ * forever). All chaining flavors share `BRANCH`; the RAS heuristic
+ * still distinguishes calls/returns via `exit_info`. */
 enum {
-    MIPS64_DBT_EXIT_FALLTHROUGH = 0, /* resume at `ctx->pc` */
-    MIPS64_DBT_EXIT_DIRECT = 1,      /* direct branch: resume at `ctx->pc` */
-    MIPS64_DBT_EXIT_INDIRECT = 2,    /* indirect: IBTC probe, then cache */
-    MIPS64_DBT_EXIT_UNDEF = 3,       /* single-step `ctx->pc` in interp */
-    MIPS64_DBT_EXIT_SINGLE_STEP = 4, /* debug/edge page: interp and resume */
-    MIPS64_DBT_EXIT_SYSCALL = 5,     /* syscall/trap insn at `ctx->pc` */
-    MIPS64_DBT_EXIT_FAULT = 6        /* `exit_reason` already recorded */
+    MIPS64_DBT_EXIT_FALLTHROUGH = MIPS64_EXIT_BRANCH, /* resume at pc */
+    MIPS64_DBT_EXIT_DIRECT = MIPS64_EXIT_BRANCH,      /* direct branch */
+    MIPS64_DBT_EXIT_INDIRECT = MIPS64_EXIT_BRANCH,   /* indirect branch */
+    MIPS64_DBT_EXIT_UNDEF = MIPS64_EXIT_UNDEF,        /* interp one step */
+    MIPS64_DBT_EXIT_SINGLE_STEP = MIPS64_EXIT_SINGLE_STEP, /* step+resume */
+    MIPS64_DBT_EXIT_SYSCALL = MIPS64_EXIT_SYSCALL,   /* syscall at pc */
+    MIPS64_DBT_EXIT_FAULT = MIPS64_EXIT_FAULT        /* reason recorded */
 };
 
 /* `exit_info` convention for `EXIT_DIRECT` (set by the emitter,

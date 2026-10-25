@@ -361,7 +361,8 @@ int ei_atomic(a64_emit_t *e, const mips_dec_t *d, uint64_t pc, int be)
     ei_mem_fault(e, pc, s1, s2);
     if (d->op == 0x30u || d->op == 0x34u) { /* LL / LLD */
         ei_add(e, 0, EI_B, EI_BASE, EI_A);
-        ei_ldxr(e, is_d, EI_C, EI_B);
+        /* Width flag is "is word": LL needs the W form, LLD the X. */
+        ei_ldxr(e, is_d == 0, EI_C, EI_B);
         ei_mov32(e, EI_T, 1u);
         ei_strb(e, EI_T, EI_CTX, MIPS64_CTX_LLBIT_OFFSET);
         ei_str(e, 0, EI_A, EI_CTX, MIPS64_CTX_LLADDR_OFFSET);
@@ -389,8 +390,14 @@ int ei_atomic(a64_emit_t *e, const mips_dec_t *d, uint64_t pc, int be)
     if (be != 0) {
         ei_rev(e, is_d != 0 ? 0xDAC00C00u : 0x5AC00800u, EI_B, EI_B);
     }
+    /* The LL block exited to the dispatcher, which need not preserve
+     * the host exclusive monitor, so a bare STXR here can never
+     * succeed. Re-arm with LDXR in this block (the value is discarded:
+     * like interp's do_sc, success needs llbit/lladdr only). Width
+     * flag is "is word", matching the fail-path load below. */
     top = e == NULL ? 0u : e->len;
-    ei_stxr(e, is_d, EI_C, EI_B, EI_T);
+    ei_ldxr(e, is_d == 0, EI_C, EI_T);
+    ei_stxr(e, is_d == 0, EI_C, EI_B, EI_T);
     ei_cbnz_back(e, 0, EI_C, top);
     ei_mov32(e, EI_B, 1u);
     ei_gst(e, EI_B, d->rt);

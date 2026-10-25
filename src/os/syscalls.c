@@ -33,6 +33,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/random.h>
@@ -510,11 +511,19 @@ int64_t mips_sc_getid(mips64_ctx_t *ctx, int which)
     return l2a_ret(ctx, v);
 }
 
+/* Deterministic getrandom stream for MIPS64RT_RANDSEED runs (difftest):
+ * xorshift64 seeded from the knob; the per-boot call counter keeps
+ * successive calls distinct. Fork duplicates the counter, so siblings
+ * repeat the stream from the fork point — identical on both engines. */
+static uint64_t l2a_rand_calls;
+
 int64_t mips_sc_getrandom(mips64_ctx_t *ctx, uint64_t buf_va, uint64_t len,
                           uint64_t flags)
 {
     uint8_t *p;
     ssize_t n;
+    const char *env = getenv("MIPS64RT_RANDSEED");
+    uint64_t i;
 
     if ((flags & ~(uint64_t)(GRND_NONBLOCK | GRND_RANDOM |
                              GRND_INSECURE)) != 0U) {
@@ -523,6 +532,21 @@ int64_t mips_sc_getrandom(mips64_ctx_t *ctx, uint64_t buf_va, uint64_t len,
     p = guest_range(ctx, buf_va, len, 1);
     if (len != 0U && p == NULL) {
         return l2a_ret(ctx, -(int64_t)EFAULT);
+    }
+    if (env != NULL && env[0] != '\0') {
+        uint64_t s = (uint64_t)strtoull(env, NULL, 0) +
+            (uint64_t)0x9E3779B97F4A7C15ULL * ++l2a_rand_calls;
+
+        if (s == 0U) {
+            s = (uint64_t)0x9E3779B97F4A7C15ULL;
+        }
+        for (i = 0U; i < len; i++) {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            p[i] = (uint8_t)s;
+        }
+        return l2a_ret(ctx, (int64_t)len);
     }
     n = getrandom(p, (size_t)len, (unsigned)flags);
     if (n < 0) {

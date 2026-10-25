@@ -22,6 +22,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
@@ -110,6 +111,25 @@ static int64_t emit_stat(mips64_ctx_t *ctx, const struct stat *hs,
     return 0;
 }
 
+/* Deterministic-guest mode: zero identity and time in a filled
+ * struct stat (fresh inodes/timestamps leak into stale exit-path
+ * regs; see mips_sc_statx). Size/mode/nlink/uid/gid/blocks stay. */
+static void l2a_stat_norm(struct stat *hs)
+{
+    if (getenv("MIPS64RT_RANDSEED") == NULL) {
+        return;
+    }
+    hs->st_dev = 0U;
+    hs->st_ino = 0U;
+    hs->st_rdev = 0U;
+    hs->st_atim.tv_sec = 0;
+    hs->st_atim.tv_nsec = 0;
+    hs->st_mtim.tv_sec = 0;
+    hs->st_mtim.tv_nsec = 0;
+    hs->st_ctim.tv_sec = 0;
+    hs->st_ctim.tv_nsec = 0;
+}
+
 /* stat/lstat/newfstatat share fstatat; only follow differs. */
 int64_t mips_sc_stat_at(mips64_ctx_t *ctx, uint64_t dirfd, uint64_t path_va,
                         uint64_t buf_va, uint64_t flags)
@@ -128,6 +148,7 @@ int64_t mips_sc_stat_at(mips64_ctx_t *ctx, uint64_t dirfd, uint64_t path_va,
     if (fstatat((int)dirfd, path, &hs, (int)flags) != 0) {
         return l2a_ret(ctx, -(int64_t)errno);
     }
+    l2a_stat_norm(&hs);
     rc = emit_stat(ctx, &hs, buf_va);
     if (rc != 0) {
         return l2a_ret(ctx, rc);
@@ -143,6 +164,7 @@ int64_t mips_sc_fstat(mips64_ctx_t *ctx, uint64_t fd, uint64_t buf_va)
     if (fstat((int)fd, &hs) != 0) {
         return l2a_ret(ctx, -(int64_t)errno);
     }
+    l2a_stat_norm(&hs);
     rc = emit_stat(ctx, &hs, buf_va);
     if (rc != 0) {
         return l2a_ret(ctx, rc);
@@ -196,11 +218,17 @@ static int64_t emit_statx(mips64_ctx_t *ctx, const struct statx *hs,
         putn(img + l2a_statx_fields[i].off, v[i],
              l2a_statx_fields[i].sz, be);
     }
-    /* The host kernel always fills the layout-stable mnt/dio fields
-     * at 144/152/156 even when libc's struct cannot name them. */
-    putn(img + 144, getn(hp + 144, 8, 0), 8, be);
-    putn(img + 152, getn(hp + 152, 4, 0), 4, be);
-    putn(img + 156, getn(hp + 156, 4, 0), 4, be);
+    /* mnt/dio live at layout-stable offsets 144/152/156 even when
+     * libc's struct cannot name them; copy them only when the kernel
+     * reports them valid in stx_mask, so unsupported fields stay zero
+     * instead of leaking host stack garbage into the guest. */
+    if ((hs->stx_mask & (uint32_t)0x1000U) != 0U) {
+        putn(img + 144, getn(hp + 144, 8, 0), 8, be);
+    }
+    if ((hs->stx_mask & (uint32_t)0x2000U) != 0U) {
+        putn(img + 152, getn(hp + 152, 4, 0), 4, be);
+        putn(img + 156, getn(hp + 156, 4, 0), 4, be);
+    }
     memcpy(dst, img, sizeof img);
     return 0;
 }
@@ -211,6 +239,8 @@ int64_t mips_sc_statx(mips64_ctx_t *ctx, uint64_t dirfd, uint64_t path_va,
     char path[L2A_PATH_MAX + 1U];
     struct statx hsx;
     int64_t rc = guest_str(ctx, path_va, path);
+
+    memset(&hsx, 0, sizeof hsx);
 
     if (rc < 0) {
         return l2a_ret(ctx, rc);
@@ -223,6 +253,27 @@ int64_t mips_sc_statx(mips64_ctx_t *ctx, uint64_t dirfd, uint64_t path_va,
     }
     if (statx((int)dirfd, path, (int)flags, (unsigned)mask, &hsx) != 0) {
         return l2a_ret(ctx, -(int64_t)errno);
+    }
+    if (getenv("MIPS64RT_RANDSEED") != NULL) {
+        /* Deterministic-guest mode: fresh files get fresh inodes and
+         * current timestamps every run, and the values leak through
+         * converted stat buffers into stale exit-path regs (RC2: the
+         * exit t1 held stdout's st_ino). Normalize identity and time
+         * so difftest compares only real behavior; production keeps
+         * host values. Size/mode/nlink/uid/gid/blocks stay real. */
+        hsx.stx_ino = 0U;
+        hsx.stx_dev_major = 0U;
+        hsx.stx_dev_minor = 0U;
+        hsx.stx_rdev_major = 0U;
+        hsx.stx_rdev_minor = 0U;
+        hsx.stx_atime.tv_sec = 0;
+        hsx.stx_atime.tv_nsec = 0;
+        hsx.stx_btime.tv_sec = 0;
+        hsx.stx_btime.tv_nsec = 0;
+        hsx.stx_ctime.tv_sec = 0;
+        hsx.stx_ctime.tv_nsec = 0;
+        hsx.stx_mtime.tv_sec = 0;
+        hsx.stx_mtime.tv_nsec = 0;
     }
     rc = emit_statx(ctx, &hsx, buf_va);
     if (rc != 0) {

@@ -50,6 +50,10 @@ void a64e_u32(a64_emit_t *e, uint32_t w);
 #define EI_B 22u
 #define EI_C 23u
 #define EI_T 24u
+/* Indirect-branch target spill: the trampoline preserves x25 across
+ * the block and no word emitter uses it, so JR/JALR park the target
+ * here while the delay slot runs (delay emission owns x21..x24). */
+#define EI_S 25u
 #define EI_XZR 31u
 
 /* AArch64 condition codes. */

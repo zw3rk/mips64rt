@@ -412,11 +412,33 @@ void mips64_dbt_trace(mips64_ctx_t *ctx, uint64_t pc, uint32_t word)
     (void)fprintf(stderr, "I %llx %x\n", (unsigned long long)pc, word);
 }
 
+/* A not-taken MIPS branch-likely annuls its delay slot: the word
+ * at `end - 4` never executes, so the trace must skip it. Mirrors
+ * the `likely` set in `ei_branch` (emit_int.c); COP1-likely declines
+ * to interp and never reaches a compiled block. */
+static int block_branch_likely(mips64_ctx_t *ctx, uint64_t end)
+{
+    uint32_t w = 0u;
+    mips_dec_t d;
+
+    if (end < 8u || mips_fetch(ctx, end - 8u, &w) != 0)
+        return 0;
+    mips_decode(w, &d);
+    if (d.op >= 0x14u && d.op <= 0x17u)
+        return 1;
+    if (d.op == 0x01u &&
+        (d.rt == 0x02u || d.rt == 0x03u || d.rt == 0x12u || d.rt == 0x13u))
+        return 1;
+    return 0;
+}
+
 /* Print the natively executed prefix of a block exit: full blocks
  * print `[start, end)`; fallback exits print `[start, ctx->pc)` (the
  * dispatcher completes the insn at `ctx->pc` via `interp_step`,
- * which prints its own line). Same `I <pc> <word>` shape as
- * `interp`'s fetch trace, so the L2d difftest compares equal. */
+ * which prints its own line). A not-taken likely exit lands exactly
+ * on `end` with its delay slot annulled, so it prints `[start,
+ * end - 4)`. Same `I <pc> <word>` shape as `interp`'s fetch trace,
+ * so the L2d difftest compares equal. */
 static void trace_block_exit(mips64_ctx_t *ctx, uint64_t start, uint64_t end,
                              int full)
 {
@@ -429,6 +451,9 @@ static void trace_block_exit(mips64_ctx_t *ctx, uint64_t start, uint64_t end,
         hi = end;
     else
         hi = ctx->pc;
+    if (full && hi == end && ctx->pc == end && end >= start + 8u &&
+        block_branch_likely(ctx, end) != 0)
+        hi = end - 4u;
     for (va = start; va < hi; va += 4u) {
         uint32_t word = 0u;
 
@@ -500,28 +525,43 @@ int dbt_run(mips64_ctx_t *ctx)
         }
         ex = mips64_dbt_enter(ctx, ctx->guest_base, code);
         switch (ex) {
-        case MIPS64_DBT_EXIT_FALLTHROUGH:
+        /* All chaining flavors share the cpu.h BRANCH code (dbt.h):
+         * one label covers FALLTHROUGH, DIRECT and INDIRECT. */
         case MIPS64_DBT_EXIT_DIRECT:
             trace_block_exit(ctx, start, end, 1);
             ras_update(ctx, ctx->exit_info);
-            continue;
-        case MIPS64_DBT_EXIT_INDIRECT:
-            trace_block_exit(ctx, start, end, 1);
-            ras_update(ctx, ctx->exit_info);
+            /* Consumed: a stale BRANCH reason must not abort the next
+             * iteration at the loop-top check (RC2: every taken branch
+             * ended the run with (exit 1)). */
+            ctx->exit_reason = MIPS64_EXIT_NONE;
+            ctx->exit_info = 0u;
             continue;
         case MIPS64_DBT_EXIT_UNDEF:
         case MIPS64_DBT_EXIT_SINGLE_STEP:
         case MIPS64_DBT_EXIT_SYSCALL:
             trace_block_exit(ctx, start, end, 0);
+            ctx->exit_reason = MIPS64_EXIT_NONE;
+            ctx->exit_info = 0u;
             rc = interp_step(ctx);
             if (rc != 0)
                 return rc;
             continue;
         case MIPS64_DBT_EXIT_FAULT:
             trace_block_exit(ctx, start, end, 0);
+            /* The faulting insn is terminal: no `interp_step`
+             * re-run prints it, so print its line here to match
+             * `interp` (which traces the faulting fetch). */
+            if (ctx->trace_enabled) {
+                uint32_t word = 0u;
+
+                if (mips_fetch(ctx, ctx->pc, &word) == 0)
+                    mips64_dbt_trace(ctx, ctx->pc, word);
+            }
             return (int)MIPS_FAULT;
         default:
             trace_block_exit(ctx, start, end, 0);
+            ctx->exit_reason = MIPS64_EXIT_NONE;
+            ctx->exit_info = 0u;
             rc = interp_step(ctx);
             if (rc != 0)
                 return rc;

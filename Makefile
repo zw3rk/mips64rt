@@ -23,9 +23,9 @@ CFLAGS := -std=c11 -Werror=vla -pedantic -Wall -Wextra -Werror -pthread
 INCLUDES := -Isrc -Isrc/rt64
 BUILD := _build
 
-# Phase 0 bootstrap binary: CLI + engine dispatch + signal-contract stub.
-# The copied `src/rt64/` substrate wires into later phases (L1c the Linux
-# layer, L2b the DBT); it is line-limit checked here, not yet linked.
+# Phase 2 binary: CLI + engine dispatch + interp + AArch64 DBT.
+# RC2 integration wires the L2a static-libc layer, the L2b DBT core
+# (encoder, dispatcher, trampoline) and the L2c integer emitter.
 BOOT_SRCS := src/main.c \
 	src/rt64/runtime/worker_loop.c \
 	src/rt64/linux/signal_core.c \
@@ -35,6 +35,17 @@ BOOT_SRCS := src/main.c \
 	src/interp/fpmove.c \
 	src/os/mem.c \
 	src/os/syscall_min.c \
+	src/os/syscalls.c \
+	src/os/syscalls_stat.c \
+	src/os/syscalls_sync.c \
+	src/os/syscalls_time.c \
+	src/dbt/a64_emit.c \
+	src/dbt/dbt.c \
+	src/dbt/emit_int.c \
+	src/dbt/emit_enc.c \
+	src/dbt/emit_alu.c \
+	src/dbt/emit_mem.c \
+	src/dbt/trampoline_a64.S \
 	src/loader.c
 
 .PHONY: help build build-cross check check-line-limits check-abi-invariants clean

@@ -30,6 +30,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/types.h>
 #include <time.h>
@@ -210,16 +211,23 @@ static size_t str_len(const char *s)
     return n;
 }
 
-/* AT_RANDOM seed: mixed host realtime clock and pid. */
+/* AT_RANDOM seed: mixed host realtime clock and pid. The
+ * MIPS64RT_RANDSEED knob overrides the seed for deterministic runs
+ * (difftest); production keeps host entropy. */
 static void rand16(uint8_t out[16])
 {
     struct timespec ts;
+    const char *env = getenv("MIPS64RT_RANDSEED");
     uint64_t s = 0U;
     unsigned i;
 
-    clock_gettime(CLOCK_REALTIME, &ts);
-    s = (uint64_t)ts.tv_nsec ^ ((uint64_t)getpid() << 32) ^
-        (uint64_t)ts.tv_sec;
+    if (env != NULL && env[0] != '\0') {
+        s = (uint64_t)strtoull(env, NULL, 0);
+    } else {
+        clock_gettime(CLOCK_REALTIME, &ts);
+        s = (uint64_t)ts.tv_nsec ^ ((uint64_t)getpid() << 32) ^
+            (uint64_t)ts.tv_sec;
+    }
     if (s == 0U) {
         s = UINT64_C(0x9E3779B97F4A7C15);
     }

@@ -21,6 +21,10 @@ NAME="mips64rt-l2d-diff-$$"
 TDIR="/tmp/d2t-$$"
 : "${MIPS64RT_DUMPSTATE:=1}"
 export MIPS64RT_DUMPSTATE
+# Deterministic AT_RANDOM for both engines (else the stack canary
+# leaks host entropy into exit-state regs). Production keeps entropy.
+: "${MIPS64RT_RANDSEED:=1}"
+export MIPS64RT_RANDSEED
 
 usage() {
 	echo "Usage: $0 GUEST [ENGINE_A [ENGINE_B]] (engines: interp|dbt)" >&2
@@ -74,12 +78,20 @@ run_engine() {
 			--name "$NAME" --memory 2g --cpus 2 \
 			--platform linux/arm64 \
 			-e MIPS64RT_DUMPSTATE \
+			-e MIPS64RT_RANDSEED \
 			-e DIFTEST_SIDE="$side" -e DIFTEST_ENG="$eng" \
 			-e DIFTEST_GUEST="$(basename "$GUEST")" \
 			-v "$ROOT:/w" -v "$GDIR:/g" -v "$TDIR:/t" -w /w "$IMG" \
-			sh -c 'timeout --kill-after=30s 120s /w/_build/mips64rt \
+			sh -c 'env -u DIFTEST_SIDE -u DIFTEST_ENG \
+				-u DIFTEST_GUEST HOSTNAME=mips64rt \
+				timeout --kill-after=30s 120s /w/_build/mips64rt \
 				--"$DIFTEST_ENG" --trace "/g/$DIFTEST_GUEST" \
-				>"/t/$DIFTEST_SIDE.out" 2>"/t/$DIFTEST_SIDE.err"'
+				>"/tmp/$DIFTEST_SIDE.out" \
+				2>"/tmp/$DIFTEST_SIDE.err"; rc=$?; \
+				cat "/tmp/$DIFTEST_SIDE.out" \
+					>"/t/$DIFTEST_SIDE.out"; \
+				cat "/tmp/$DIFTEST_SIDE.err" \
+					>"/t/$DIFTEST_SIDE.err"; exit $rc'
 		echo "$?" >"$rcfile"
 		set -e
 		if docker ps --format "{{.Names}}" | grep -q "^${NAME}$"; then
@@ -122,10 +134,15 @@ if [ "$rca" != "$rcb" ]; then
 	tail -5 "$TDIR/b.err"
 	exit 1
 fi
-grep '^I ' "$TDIR/a.err" >"$TDIR/a.trace" || true
-grep '^I ' "$TDIR/b.err" >"$TDIR/b.trace" || true
-grep '^REGS ' "$TDIR/a.err" >"$TDIR/a.regs" || true
-grep '^REGS ' "$TDIR/b.err" >"$TDIR/b.regs" || true
+# Fork children interleave nondeterministically (parent/child race, and
+# PIDs vary run to run but never appear in these streams), so the
+# comparison is order-insensitive: identical multisets of executed
+# instructions and exit-state dumps. Exit codes stay strictly compared
+# above; a missing or extra process still diverges the multiset.
+grep '^I ' "$TDIR/a.err" | sort >"$TDIR/a.trace" || true
+grep '^I ' "$TDIR/b.err" | sort >"$TDIR/b.trace" || true
+grep '^REGS ' "$TDIR/a.err" | sort >"$TDIR/a.regs" || true
+grep '^REGS ' "$TDIR/b.err" | sort >"$TDIR/b.regs" || true
 echo "trace lines: $ENGA=$(wc -l <"$TDIR/a.trace") $ENGB=$(wc -l <"$TDIR/b.trace")"
 echo "regs lines: $ENGA=$(wc -l <"$TDIR/a.regs") $ENGB=$(wc -l <"$TDIR/b.regs")"
 t_res=$(compare_stream "$TDIR/a.trace" "$TDIR/b.trace")

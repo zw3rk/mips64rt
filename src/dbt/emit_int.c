@@ -284,9 +284,13 @@ static int ei_branch(a64_emit_t *e, const mips_dec_t *d, const mips_dec_t *s,
             ei_mov64(e, EI_T, pc + 8u);
             ei_gst(e, EI_T, d->rd);
         }
+        /* The delay slot owns x21..x24, so park the target in x25
+         * (trampoline-preserved, emitter-unused) across it. */
+        ei_mov(e, EI_S, EI_A);
         if (ei_one(e, s, pc + 4u, be, 1) != 0) {
             return 1;
         }
+        ei_mov(e, EI_A, EI_S);
         ei_str(e, 0, EI_A, EI_CTX, MIPS64_CTX_PC_OFFSET);
         ei_mov32(e, EI_T, 4u);
         ei_add(e, 0, EI_T, EI_A, EI_T);
@@ -411,10 +415,13 @@ static int ei_one(a64_emit_t *e, const mips_dec_t *d, uint64_t pc, int be,
         r = ei_unaligned(e, d, pc, 0, 0, be, be != 0 ? 3 : 0, 0, 24u);
         break;
     case 0x2Cu: /* SDL */
-        r = ei_unaligned(e, d, pc, 0, 1, be, be != 0 ? 0 : 2, 0, 56u);
+        /* BE stores mirror the 32-bit BE store modes (SWL/SWR), not
+         * the load modes: SDL needs LSR-by-sk (m=1), SDR LSL-by-56-sk
+         * (m=3 after adjust). Matches do_sdl/do_sdr in interp. */
+        r = ei_unaligned(e, d, pc, 0, 1, be, be != 0 ? 1 : 2, 0, 56u);
         break;
     case 0x2Du: /* SDR */
-        r = ei_unaligned(e, d, pc, 0, 1, be, be != 0 ? 2 : 0, 0, 56u);
+        r = ei_unaligned(e, d, pc, 0, 1, be, be != 0 ? 3 : 0, 0, 56u);
         break;
     case 0x30u: /* LL */
     case 0x34u: /* LLD */
