@@ -373,6 +373,28 @@ int guest_st64(mips64_ctx_t *ctx, uint64_t va, uint64_t val);
 /* Synchronous fault: records EXIT_FAULT (lane L1c; signals in Phase 4). */
 void mips_fault(mips64_ctx_t *ctx, uint64_t addr);
 
+/* Process-global region table (src/os/mem_table.c, lane H4 fix: the
+ * host mappings are process-wide, so per-context copies go stale at
+ * clone and must not be consulted). */
+int mips_mem_ok(const mips64_ctx_t *ctx, uint64_t va, uint64_t len,
+                uint32_t need);
+int mips_mem_map(mips64_ctx_t *ctx, uint64_t va, uint64_t len,
+                 uint32_t prot, const char *tag);
+int mips_mem_unmap(mips64_ctx_t *ctx, uint64_t va, uint64_t len);
+int mips_mem_protect(mips64_ctx_t *ctx, uint64_t va, uint64_t len,
+                     uint32_t prot);
+int64_t mips_mem_remap(mips64_ctx_t *ctx, uint64_t old_va, uint64_t old_len,
+                       uint64_t new_len, uint64_t flags, uint64_t new_va);
+int mips_mem_exec_ok(const mips64_ctx_t *ctx, uint64_t pc);
+uint64_t mips_mem_hole_after(const mips64_ctx_t *ctx, uint64_t cand,
+                             uint64_t size);
+size_t mips_mem_region_count(void);
+int mips_mem_region_at(size_t idx, uint64_t *start, uint64_t *end,
+                       uint32_t *prot);
+void mips_mem_reset(void);
+size_t mips_mem_snapshot(mips64_region_t *out, size_t cap);
+void mips_mem_restore(const mips64_region_t *regs, size_t count);
+
 /* Minimal N64/N32 syscall dispatcher (src/os/syscall_min.c, lane L1c). */
 int64_t mips_syscall(mips64_ctx_t *ctx);
 

@@ -76,6 +76,11 @@
 extern int mips_mem_ok(const mips64_ctx_t *ctx, uint64_t va, uint64_t len,
                        uint32_t need);
 
+/* Process-global region table walk (owned by src/os/mem_table.c). */
+extern size_t mips_mem_region_count(void);
+extern int mips_mem_region_at(size_t idx, uint64_t *start, uint64_t *end,
+                              uint32_t *prot);
+
 /* Guest open-flag bits consulted here (MIPS UAPI asm/fcntl.h values,
  * distinct from the host's: MIPS O_DIRECTORY is 0x10000 and O_NOFOLLOW
  * is 0x20000. The RC5 watch-item: never use the host values here). */
@@ -261,11 +266,17 @@ static int proc_emit_maps(int fd)
     if (proc_ctx == NULL) {
         return -1;
     }
-    for (i = 0U; i < proc_ctx->region_count && n < 128U; i++) {
-        regs[n].base = proc_ctx->regions[i].start;
-        regs[n].len = proc_ctx->regions[i].end -
-                      proc_ctx->regions[i].start;
-        regs[n].prot = proc_ctx->regions[i].prot;
+    for (i = 0U; n < 128U; i++) {
+        uint64_t base = 0U;
+        uint64_t end = 0U;
+        uint32_t prot = 0U;
+
+        if (mips_mem_region_at((size_t)i, &base, &end, &prot) != 0) {
+            break;
+        }
+        regs[n].base = base;
+        regs[n].len = end - base;
+        regs[n].prot = prot;
         n++;
     }
     for (i = 1U; i < n; i++) {

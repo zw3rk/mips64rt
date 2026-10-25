@@ -47,6 +47,7 @@ extern int mips_mem_map(mips64_ctx_t *ctx, uint64_t va, uint64_t len,
                         uint32_t prot, const char *tag);
 extern int mips_mem_protect(mips64_ctx_t *ctx, uint64_t va, uint64_t len,
                             uint32_t prot);
+extern void mips_mem_reset(void);
 
 /* ELF admission (E01: N64 Flags 0x80000007, N32 Flags 0x80000025). */
 #define MIPS_EM_MIPS 8U
@@ -291,6 +292,9 @@ void mips_loader_init_ctx(mips64_ctx_t *ctx)
         return;
     }
     memset(ctx, 0, sizeof *ctx);
+    /* Fresh image: the dead per-context copy is zeroed above; clear
+     * the live process-global table too (lane H4). */
+    mips_mem_reset();
 }
 
 static int parse_ehdr(int fd, ehdr_t *eh)

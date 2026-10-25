@@ -74,6 +74,9 @@ extern const char *mips_proc_exe_path(void);
 /* Guest window + endian-aware accessors (src/os/mem.c, lane L1c). */
 extern int mips_mem_ok(const mips64_ctx_t *ctx, uint64_t va, uint64_t len,
                        uint32_t need);
+/* Process-global table snapshot/restore (src/os/mem_table.c). */
+extern size_t mips_mem_snapshot(mips64_region_t *out, size_t cap);
+extern void mips_mem_restore(const mips64_region_t *regs, size_t count);
 extern int guest_ld32(mips64_ctx_t *ctx, uint64_t va, uint64_t *out);
 extern int guest_ld64(mips64_ctx_t *ctx, uint64_t va, uint64_t *out);
 extern int guest_st32(mips64_ctx_t *ctx, uint64_t va, uint64_t val);
@@ -450,6 +453,11 @@ int64_t mips_sc_exec(mips64_ctx_t *ctx, uint64_t nr, uint64_t path_va,
         return exec_ret(ctx, -(int64_t)ENOMEM);
     }
     memcpy(backup, ctx, sizeof *backup);
+    /* The per-context table copy is stale after any clone; refresh
+     * it from the live process-global table so the rollback below
+     * restores the true cover (lane H4). */
+    backup->region_count =
+        mips_mem_snapshot(backup->regions, MIPS64_MAX_REGIONS);
     old_base = backup->guest_base;
     old_size = backup->task_size;
     rc = mips_load_elf(ctx, path_buf, host_argv, host_envp);
@@ -461,6 +469,7 @@ int64_t mips_sc_exec(mips64_ctx_t *ctx, uint64_t nr, uint64_t path_va,
                          (size_t)ctx->task_size);
         }
         memcpy(ctx, backup, sizeof *backup);
+        mips_mem_restore(ctx->regions, ctx->region_count);
         /* Not a MIPS image: delegate to the host kernel (scripts run
          * through their #! line there). The restore above runs first
          * so a failed host exec still returns with the old image

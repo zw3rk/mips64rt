@@ -137,6 +137,8 @@ extern int mips_mem_protect(mips64_ctx_t *ctx, uint64_t va, uint64_t len,
 extern int64_t mips_mem_remap(mips64_ctx_t *ctx, uint64_t old_va,
                               uint64_t old_len, uint64_t new_len,
                               uint64_t flags, uint64_t new_va);
+extern uint64_t mips_mem_hole_after(const mips64_ctx_t *ctx, uint64_t cand,
+                                    uint64_t size);
 
 /* Guest prot bits (Linux asm-generic, shared with the target). */
 #define MIPS_PROT_READ 1U
@@ -283,31 +285,13 @@ static int64_t sc_brk(mips64_ctx_t *ctx, uint64_t addr)
     return sc_ret(ctx, (int64_t)ctx->brk_curr);
 }
 
-/* First gap of at least size bytes at or after cand (page granular). */
+/* First gap of at least size bytes at or after cand (page granular).
+ * Served from the process-global table (lane H4): a per-context copy
+ * goes stale at clone and could hand out a live mapping. */
 static uint64_t hole_from(const mips64_ctx_t *ctx, uint64_t cand,
                           uint64_t size)
 {
-    size_t i;
-
-    if (cand + size < cand || cand + size > ctx->task_size) {
-        return 0U;
-    }
-    for (i = 0; i < ctx->region_count; i++) {
-        if (ctx->regions[i].end <= cand) {
-            continue;
-        }
-        if (ctx->regions[i].start >= cand + size) {
-            return cand;
-        }
-        cand = ctx->regions[i].end;
-        if (cand + size < cand) {
-            return 0U;
-        }
-    }
-    if (cand + size < cand || cand + size > ctx->task_size) {
-        return 0U;
-    }
-    return cand;
+    return mips_mem_hole_after(ctx, cand, size);
 }
 
 /* Unhinted search starts at mmap_base and falls back to it when the

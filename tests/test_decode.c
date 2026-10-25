@@ -37,7 +37,7 @@ static void use_scratch_window(mips64_ctx_t *ctx)
         return;
     }
     ctx->guest_base = (uint64_t)(uintptr_t)fetch_window;
-    ctx->region_count = 0U;
+    mips_mem_reset();
 }
 
 typedef struct {
@@ -411,6 +411,7 @@ static void check_fetch_faults(mips64_ctx_t *ctx)
 static void check_fetch_regions(mips64_ctx_t *ctx)
 {
     uint32_t word = 0U;
+    mips64_region_t cover;
 
     fetch_window[0x1000] = 0x00U;
     fetch_window[0x1001] = 0x00U;
@@ -420,10 +421,14 @@ static void check_fetch_regions(mips64_ctx_t *ctx)
     fetch_window[0x1ffd] = 0x00U;
     fetch_window[0x1ffe] = 0x00U;
     fetch_window[0x1fff] = 0x0cU;
-    ctx->regions[0].start = 0x1000U;
-    ctx->regions[0].end = 0x2000U;
-    ctx->regions[0].prot = MIPS_PROT_READ | MIPS_PROT_EXEC;
-    ctx->region_count = 1U;
+    /* Lane H4: cover lives in the process-global table, loaded via
+     * the public snapshot/restore entry points (no host mapping is
+     * touched; fetch reads the scratch window through guest_base). */
+    memset(&cover, 0, sizeof cover);
+    cover.start = 0x1000U;
+    cover.end = 0x2000U;
+    cover.prot = MIPS_PROT_READ | MIPS_PROT_EXEC;
+    mips_mem_restore(&cover, 1U);
     if (mips_fetch(ctx, 0x1000U, &word) != 0 || word != 0x0c000000U) {
         printf("FAIL fetch-region: covered 0x1000 got 0x%08x\n", word);
         failures++;
@@ -442,12 +447,13 @@ static void check_fetch_regions(mips64_ctx_t *ctx)
     }
     /* RC1: fetch requires PROT_EXEC, so a PROT_NONE page faults
      * instead of trapping the host (branch-likely pageend probe). */
-    ctx->regions[0].prot = 0U;
+    cover.prot = 0U;
+    mips_mem_restore(&cover, 1U);
     if (mips_fetch(ctx, 0x1000U, &word) != MIPS_FAULT) {
         printf("FAIL fetch-region: PROT_NONE 0x1000 did not fault\n");
         failures++;
     }
-    ctx->region_count = 0U;
+    mips_mem_reset();
 }
 
 int main(void)

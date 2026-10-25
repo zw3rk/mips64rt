@@ -46,6 +46,7 @@ BOOT_SRCS := src/main.c \
 	src/interp/fp_cvt.c \
 	src/interp/fp_ps.c \
 	src/os/mem.c \
+	src/os/mem_table.c \
 	src/os/syscall_min.c \
 	src/os/syscalls.c \
 	src/os/syscalls_stat.c \
@@ -97,7 +98,7 @@ check: build check-line-limits
 	fi
 	@if [ -f tests/check_abi_invariants.c ]; then $(MAKE) check-abi-invariants; fi
 	@if [ -f tests/test_decode.c ]; then \
-		$(HOST_CC) -std=c11 -Werror=vla -pedantic -Wall -Wextra -Werror -Isrc tests/test_decode.c src/interp/decode.c src/os/mem.c tests/stubs_signal.c -o $(BUILD)/test_decode && $(BUILD)/test_decode; \
+		$(HOST_CC) -std=c11 -Werror=vla -pedantic -Wall -Wextra -Werror -pthread -Isrc tests/test_decode.c src/interp/decode.c src/os/mem.c src/os/mem_table.c tests/stubs_signal.c -o $(BUILD)/test_decode && $(BUILD)/test_decode; \
 	fi
 
 check-line-limits:

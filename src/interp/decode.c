@@ -20,6 +20,8 @@
 
 #include <string.h>
 
+extern int mips_mem_exec_ok(const mips64_ctx_t *ctx, uint64_t pc);
+
 void mips_decode(uint32_t word, mips_dec_t *d)
 {
     uint16_t imm;
@@ -54,17 +56,9 @@ void mips_decode(uint32_t word, mips_dec_t *d)
  */
 static int fetch_covered(const mips64_ctx_t *ctx, uint64_t pc)
 {
-    size_t i;
-
-    if (ctx->region_count == 0U) {
-        return 1;
-    }
-    for (i = 0; i < ctx->region_count; i++) {
-        if (ctx->regions[i].start <= pc && pc + 4U <= ctx->regions[i].end) {
-            return (ctx->regions[i].prot & MIPS_PROT_EXEC) != 0U;
-        }
-    }
-    return 0;
+    /* Process-global table (lane H4): per-context copies go stale at
+     * clone, so the fetch check consults the shared cover. */
+    return mips_mem_exec_ok(ctx, pc);
 }
 
 int mips_fetch(mips64_ctx_t *ctx, uint64_t pc, uint32_t *word)
