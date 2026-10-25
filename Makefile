@@ -28,7 +28,14 @@ BUILD := _build
 # (encoder, dispatcher, trampoline) and the L2c integer emitter.
 # RC3 integration adds the L3a FPU interpreter and L3b FP emitter.
 # RC4 integration adds the L4a signal, L4b thread/futex, L4c exec seams.
+# RC6 integration adds the L6a host-contract surface (arg parsing) and
+# the Class-B cache/family providers it consumes (digest, leaf,
+# broker rendezvous).
 BOOT_SRCS := src/main.c \
+	src/os/host_args.c \
+	src/rt64/aot/sha256.c \
+	src/rt64/aot/identity.c \
+	src/rt64/runtime/family_broker.c \
 	src/rt64/runtime/worker_loop.c \
 	src/rt64/linux/signal_core.c \
 	src/interp/decode.c \

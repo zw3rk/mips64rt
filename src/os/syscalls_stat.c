@@ -16,6 +16,7 @@
 
 #include "core/cpu.h"
 
+#include "os/host_args.h"
 #include "os/syscall_nr.h"
 #include "os/sigframe_mips64rt.h"
 
@@ -135,6 +136,7 @@ int64_t mips_sc_stat_at(mips64_ctx_t *ctx, uint64_t dirfd, uint64_t path_va,
                         uint64_t buf_va, uint64_t flags)
 {
     char path[L2A_PATH_MAX + 1U];
+    char full[L2A_PATH_MAX + MIPS64RT_HOST_ARGS_PATH_MAX + 2U];
     struct stat hs;
     int64_t rc = guest_str(ctx, path_va, path);
 
@@ -145,7 +147,13 @@ int64_t mips_sc_stat_at(mips64_ctx_t *ctx, uint64_t dirfd, uint64_t path_va,
                              AT_NO_AUTOMOUNT)) != 0U) {
         return l2a_ret(ctx, -(int64_t)EINVAL);
     }
-    if (fstatat((int)dirfd, path, &hs, (int)flags) != 0) {
+    /* Guest-absolute paths resolve against the start-up sysroot (no
+     * sysroot: byte-identical copy). */
+    if (mips64_sysroot_join(mips64_host_sysroot(), path, full,
+                            sizeof full) != 0) {
+        return l2a_ret(ctx, -(int64_t)ENAMETOOLONG);
+    }
+    if (fstatat((int)dirfd, full, &hs, (int)flags) != 0) {
         return l2a_ret(ctx, -(int64_t)errno);
     }
     l2a_stat_norm(&hs);
@@ -237,6 +245,7 @@ int64_t mips_sc_statx(mips64_ctx_t *ctx, uint64_t dirfd, uint64_t path_va,
                       uint64_t flags, uint64_t mask, uint64_t buf_va)
 {
     char path[L2A_PATH_MAX + 1U];
+    char full[L2A_PATH_MAX + MIPS64RT_HOST_ARGS_PATH_MAX + 2U];
     struct statx hsx;
     int64_t rc = guest_str(ctx, path_va, path);
 
@@ -251,7 +260,13 @@ int64_t mips_sc_statx(mips64_ctx_t *ctx, uint64_t dirfd, uint64_t path_va,
                              AT_STATX_DONT_SYNC)) != 0U) {
         return l2a_ret(ctx, -(int64_t)EINVAL);
     }
-    if (statx((int)dirfd, path, (int)flags, (unsigned)mask, &hsx) != 0) {
+    /* Guest-absolute paths resolve against the start-up sysroot (no
+     * sysroot: byte-identical copy). */
+    if (mips64_sysroot_join(mips64_host_sysroot(), path, full,
+                            sizeof full) != 0) {
+        return l2a_ret(ctx, -(int64_t)ENAMETOOLONG);
+    }
+    if (statx((int)dirfd, full, (int)flags, (unsigned)mask, &hsx) != 0) {
         return l2a_ret(ctx, -(int64_t)errno);
     }
     if (getenv("MIPS64RT_RANDSEED") != NULL) {

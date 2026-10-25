@@ -113,6 +113,9 @@ int mips64_cache_leaf(const uint8_t runtime_digest[MIPS64_SHA256_BYTES],
 #define MIPS64_ELFCLASS64 2u
 #define MIPS64_ELFDATA2LSB 1u
 #define MIPS64_EM_MIPS 8u
+/* The cache identity also covers the translator itself, which is an
+ * AArch64 static-PIE on the build host. */
+#define MIPS64_EM_AARCH64 183u
 #define MIPS64_ET_DYN 3u
 #define MIPS64_PT_DYNAMIC 2u
 #define MIPS64_DT_NULL 0u
@@ -198,9 +201,13 @@ int mips64_elf_static_pie_check(const char *path)
         close(fd);
         return MIPS64_ELF_NOT_STATIC_PIE;
     }
-    if (load_u16le(ehdr + 18u) != MIPS64_EM_MIPS) {
-        close(fd);
-        return MIPS64_ELF_NOT_STATIC_PIE;
+    {
+        uint16_t machine = load_u16le(ehdr + 18u);
+
+        if (machine != MIPS64_EM_MIPS && machine != MIPS64_EM_AARCH64) {
+            close(fd);
+            return MIPS64_ELF_NOT_STATIC_PIE;
+        }
     }
     is_n32 = ehdr[4] == MIPS64_ELFCLASS32;
     if (load_u16le(ehdr + 16u) != MIPS64_ET_DYN) {

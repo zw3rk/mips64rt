@@ -134,6 +134,9 @@ extern int mips_mem_map(mips64_ctx_t *ctx, uint64_t va, uint64_t len,
 extern int mips_mem_unmap(mips64_ctx_t *ctx, uint64_t va, uint64_t len);
 extern int mips_mem_protect(mips64_ctx_t *ctx, uint64_t va, uint64_t len,
                             uint32_t prot);
+extern int64_t mips_mem_remap(mips64_ctx_t *ctx, uint64_t old_va,
+                              uint64_t old_len, uint64_t new_len,
+                              uint64_t flags, uint64_t new_va);
 
 /* Guest prot bits (Linux asm-generic, shared with the target). */
 #define MIPS_PROT_READ 1U
@@ -350,7 +353,10 @@ static int64_t sc_mmap(mips64_ctx_t *ctx, uint64_t addr, uint64_t len,
         return sc_ret(ctx, -(int64_t)EINVAL);
     }
     if ((flags & MIPS_MAP_FIXED) != 0U) {
-        va = addr & MIPS64_PAGE_MASK;
+        if ((addr & (MIPS64_PAGE_SIZE - 1U)) != 0U) {
+            return sc_ret(ctx, -(int64_t)EINVAL);
+        }
+        va = addr;
         if (va + size < va || va + size > ctx->task_size) {
             return sc_ret(ctx, -(int64_t)EINVAL);
         }
@@ -363,7 +369,10 @@ static int64_t sc_mmap(mips64_ctx_t *ctx, uint64_t addr, uint64_t len,
             return sc_ret(ctx, (int64_t)rc);
         }
     } else if ((flags & MIPS_MAP_FIXED_NOREPLACE) != 0U && addr != 0U) {
-        va = addr & MIPS64_PAGE_MASK;
+        if ((addr & (MIPS64_PAGE_SIZE - 1U)) != 0U) {
+            return sc_ret(ctx, -(int64_t)EINVAL);
+        }
+        va = addr;
         if (va + size < va || va + size > ctx->task_size) {
             return sc_ret(ctx, -(int64_t)EINVAL);
         }
@@ -621,23 +630,30 @@ static int64_t mips_syscall_inner(mips64_ctx_t *ctx)
     if (nr == (uint64_t)(n32 ? MIPS64_NR32_munmap : MIPS64_NR_munmap)) {
         int rc;
 
-        if (a1 == 0U) {
+        if (a1 == 0U || (a0 & (MIPS64_PAGE_SIZE - 1U)) != 0U) {
             return sc_ret(ctx, -(int64_t)EINVAL);
         }
-        rc = mips_mem_unmap(ctx, a0 & MIPS64_PAGE_MASK, a1);
+        rc = mips_mem_unmap(ctx, a0, a1);
         if (rc != 0) {
             return sc_ret(ctx, (int64_t)rc);
         }
         return sc_ret(ctx, 0);
     }
+    if (nr == (uint64_t)(n32 ? MIPS64_NR32_mremap : MIPS64_NR_mremap)) {
+        int64_t rc = mips_mem_remap(ctx, a0, a1, a2, a3, a4);
+
+        return sc_ret(ctx, rc);
+    }
     if (nr == (uint64_t)(n32 ? MIPS64_NR32_mprotect : MIPS64_NR_mprotect)) {
         int rc;
 
-        if (a1 == 0U || (a2 & ~(uint64_t)7U) != 0U) {
+        if ((a0 & (MIPS64_PAGE_SIZE - 1U)) != 0U ||
+            (a2 & ~(uint64_t)7U) != 0U) {
             return sc_ret(ctx, -(int64_t)EINVAL);
         }
-        rc = mips_mem_protect(ctx, a0 & MIPS64_PAGE_MASK, a1,
-                              (uint32_t)(a2 & 7U));
+        /* A zero length is a no-op success (contract section 2.1);
+         * mips_mem_protect rounds positive lengths up to 4 KiB. */
+        rc = mips_mem_protect(ctx, a0, a1, (uint32_t)(a2 & 7U));
         if (rc != 0) {
             return sc_ret(ctx, (int64_t)rc);
         }

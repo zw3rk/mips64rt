@@ -27,6 +27,7 @@
 
 #include "core/cpu.h"
 
+#include "os/host_args.h"
 #include "os/syscall_nr.h"
 
 #include <errno.h>
@@ -259,6 +260,7 @@ int64_t mips_sc_openat(mips64_ctx_t *ctx, uint64_t dirfd, uint64_t path_va,
                        uint64_t flags, uint64_t mode)
 {
     char path[L2A_PATH_MAX + 1U];
+    char full[L2A_PATH_MAX + MIPS64RT_HOST_ARGS_PATH_MAX + 2U];
     int64_t rc = guest_str(ctx, path_va, path);
     int hflags;
     int fd;
@@ -280,7 +282,13 @@ int64_t mips_sc_openat(mips64_ctx_t *ctx, uint64_t dirfd, uint64_t path_va,
     if (rc != 0) {
         return l2a_ret(ctx, rc);
     }
-    fd = openat((int)dirfd, path, hflags, (mode_t)(mode & 0777U));
+    /* Guest-absolute paths resolve against the start-up sysroot (no
+     * sysroot: byte-identical copy). */
+    if (mips64_sysroot_join(mips64_host_sysroot(), path, full,
+                            sizeof full) != 0) {
+        return l2a_ret(ctx, -(int64_t)ENAMETOOLONG);
+    }
+    fd = openat((int)dirfd, full, hflags, (mode_t)(mode & 0777U));
     if (fd < 0) {
         return l2a_ret(ctx, -(int64_t)errno);
     }
@@ -434,6 +442,7 @@ int64_t mips_sc_access_at(mips64_ctx_t *ctx, uint64_t dirfd,
                           uint64_t path_va, uint64_t mode, uint64_t flags)
 {
     char path[L2A_PATH_MAX + 1U];
+    char full[L2A_PATH_MAX + MIPS64RT_HOST_ARGS_PATH_MAX + 2U];
     int64_t rc = guest_str(ctx, path_va, path);
 
     if (rc < 0) {
@@ -442,7 +451,11 @@ int64_t mips_sc_access_at(mips64_ctx_t *ctx, uint64_t dirfd,
     if ((flags & ~(uint64_t)(AT_SYMLINK_NOFOLLOW | AT_EACCESS)) != 0U) {
         return l2a_ret(ctx, -(int64_t)EINVAL);
     }
-    if (faccessat((int)dirfd, path, (int)mode, (int)flags) != 0) {
+    if (mips64_sysroot_join(mips64_host_sysroot(), path, full,
+                            sizeof full) != 0) {
+        return l2a_ret(ctx, -(int64_t)ENAMETOOLONG);
+    }
+    if (faccessat((int)dirfd, full, (int)mode, (int)flags) != 0) {
         return l2a_ret(ctx, -(int64_t)errno);
     }
     return l2a_ret(ctx, 0);
@@ -471,7 +484,15 @@ int64_t mips_sc_readlinkat(mips64_ctx_t *ctx, uint64_t dirfd,
     if (size != 0U && p == NULL) {
         return l2a_ret(ctx, -(int64_t)EFAULT);
     }
-    n = readlinkat((int)dirfd, path, (char *)p, (size_t)size);
+    {
+        char full[L2A_PATH_MAX + MIPS64RT_HOST_ARGS_PATH_MAX + 2U];
+
+        if (mips64_sysroot_join(mips64_host_sysroot(), path, full,
+                               sizeof full) != 0) {
+            return l2a_ret(ctx, -(int64_t)ENAMETOOLONG);
+        }
+        n = readlinkat((int)dirfd, full, (char *)p, (size_t)size);
+    }
     if (n < 0) {
         return l2a_ret(ctx, -(int64_t)errno);
     }
@@ -482,6 +503,7 @@ int64_t mips_sc_unlinkat(mips64_ctx_t *ctx, uint64_t dirfd, uint64_t path_va,
                          uint64_t flags)
 {
     char path[L2A_PATH_MAX + 1U];
+    char full[L2A_PATH_MAX + MIPS64RT_HOST_ARGS_PATH_MAX + 2U];
     int64_t rc = guest_str(ctx, path_va, path);
 
     if (rc < 0) {
@@ -490,7 +512,11 @@ int64_t mips_sc_unlinkat(mips64_ctx_t *ctx, uint64_t dirfd, uint64_t path_va,
     if ((flags & ~(uint64_t)AT_REMOVEDIR) != 0U) {
         return l2a_ret(ctx, -(int64_t)EINVAL);
     }
-    if (unlinkat((int)dirfd, path, (int)flags) != 0) {
+    if (mips64_sysroot_join(mips64_host_sysroot(), path, full,
+                            sizeof full) != 0) {
+        return l2a_ret(ctx, -(int64_t)ENAMETOOLONG);
+    }
+    if (unlinkat((int)dirfd, full, (int)flags) != 0) {
         return l2a_ret(ctx, -(int64_t)errno);
     }
     return l2a_ret(ctx, 0);

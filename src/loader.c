@@ -31,6 +31,7 @@
 #include "loader.h"
 
 #include "core/cpu.h"
+#include "os/host_args.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -792,8 +793,19 @@ int mips_load_elf(mips64_ctx_t *ctx, const char *path, char **argv,
         uint64_t ibias;
         uint64_t iseg_end = 0U;
         uint64_t iphdr = 0U;
-        int ifd = open(interp_guest, O_RDONLY);
+        /* Guest-absolute interpreter paths resolve against the start-up
+         * sysroot (no sysroot: byte-identical copy). */
+        char interp_host[sizeof interp_guest +
+                         MIPS64RT_HOST_ARGS_PATH_MAX];
+        int ifd;
 
+        if (mips64_sysroot_join(mips64_host_sysroot(), interp_guest,
+                               interp_host, sizeof interp_host) != 0) {
+            close(fd);
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+        ifd = open(interp_host, O_RDONLY);
         if (ifd < 0) {
             int e = errno;
 

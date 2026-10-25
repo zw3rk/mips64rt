@@ -349,6 +349,173 @@ int mips_mem_protect(mips64_ctx_t *ctx, uint64_t va, uint64_t len,
     return 0;
 }
 
+/* mremap flags (Linux uapi, arch-independent values). */
+#define MIPS_MREMAP_MAYMOVE 1U
+#define MIPS_MREMAP_FIXED 2U
+
+/* First hole of at least size bytes at or after cand; 0 when none. */
+static uint64_t remap_hole(const mips64_ctx_t *ctx, uint64_t cand,
+                           uint64_t size)
+{
+    size_t i;
+
+    if (size == 0U || size > ctx->task_size ||
+        cand > ctx->task_size - size) {
+        return 0U;
+    }
+    for (i = 0; i < ctx->region_count; i++) {
+        if (ctx->regions[i].end <= cand) {
+            continue;
+        }
+        if (ctx->regions[i].start >= cand + size) {
+            return cand;
+        }
+        cand = ctx->regions[i].end;
+        if (cand > ctx->task_size - size) {
+            return 0U;
+        }
+    }
+    return cand;
+}
+
+/* Protection of the region covering va (caller guarantees mapped). */
+static uint32_t remap_prot(const mips64_ctx_t *ctx, uint64_t va)
+{
+    size_t i;
+
+    for (i = 0; i < ctx->region_count; i++) {
+        if (ctx->regions[i].start <= va && va < ctx->regions[i].end) {
+            return ctx->regions[i].prot;
+        }
+    }
+    return 0U;
+}
+
+/*
+ * Resize/move a mapping (contract section 2.1): old address alignment
+ * and zero sizes are -EINVAL, unknown flags are -EINVAL, FIXED needs
+ * MAYMOVE. Lengths round up to 4 KiB; the old range must be fully
+ * mapped (-ENOMEM otherwise). Shrink and in-place growth keep the old
+ * address; MAYMOVE relocates through a fresh hole (contents copied);
+ * FIXED unmaps the destination first and refuses overlap. Returns the
+ * new address, or a negative errno.
+ */
+int64_t mips_mem_remap(mips64_ctx_t *ctx, uint64_t old_va, uint64_t old_len,
+                       uint64_t new_len, uint64_t flags, uint64_t new_va)
+{
+    uint64_t old_size;
+    uint64_t new_size;
+    uint32_t prot;
+    uint64_t dst;
+    int rc;
+
+    if (ctx == NULL || ctx->guest_base == 0U) {
+        return -(int64_t)EINVAL;
+    }
+    if ((flags & ~(uint64_t)(MIPS_MREMAP_MAYMOVE |
+                             MIPS_MREMAP_FIXED)) != 0U) {
+        return -(int64_t)EINVAL;
+    }
+    if (((flags & (uint64_t)MIPS_MREMAP_FIXED) != 0U) &&
+        ((flags & (uint64_t)MIPS_MREMAP_MAYMOVE) == 0U)) {
+        return -(int64_t)EINVAL;
+    }
+    if (old_len == 0U || new_len == 0U) {
+        return -(int64_t)EINVAL;
+    }
+    if ((old_va & (MIPS64_PAGE_SIZE - 1U)) != 0U) {
+        return -(int64_t)EINVAL;
+    }
+    if (((flags & (uint64_t)MIPS_MREMAP_FIXED) != 0U) &&
+        ((new_va & (MIPS64_PAGE_SIZE - 1U)) != 0U)) {
+        return -(int64_t)EINVAL;
+    }
+    old_size = page_up(old_len);
+    new_size = page_up(new_len);
+    if (old_size < MIPS64_PAGE_SIZE || old_size > ctx->task_size ||
+        old_va > ctx->task_size - old_size ||
+        new_size < MIPS64_PAGE_SIZE || new_size > ctx->task_size) {
+        return -(int64_t)EINVAL;
+    }
+    if (!mips_mem_ok(ctx, old_va, old_size, 0U)) {
+        return -(int64_t)ENOMEM;
+    }
+    prot = remap_prot(ctx, old_va);
+    if (new_size <= old_size &&
+        ((flags & (uint64_t)MIPS_MREMAP_FIXED) == 0U)) {
+        /* Shrink in place; the tail is dropped, contents kept. A
+         * FIXED request always relocates (even when shrinking). */
+        if (new_size < old_size) {
+            rc = mips_mem_unmap(ctx, old_va + new_size,
+                                old_size - new_size);
+            if (rc != 0) {
+                return (int64_t)rc;
+            }
+        }
+        return (int64_t)old_va;
+    }
+    if ((flags & (uint64_t)MIPS_MREMAP_FIXED) != 0U) {
+        dst = new_va;
+        if (dst > ctx->task_size - new_size) {
+            return -(int64_t)EINVAL;
+        }
+        /* Fixed moves must not overlap the source (the destination
+         * is unmapped first, which would destroy overlapped data). */
+        if (!(dst + new_size <= old_va || old_va + old_size <= dst)) {
+            return -(int64_t)EINVAL;
+        }
+        rc = mips_mem_unmap(ctx, dst, new_size);
+        if (rc != 0) {
+            return (int64_t)rc;
+        }
+    } else if ((flags & (uint64_t)MIPS_MREMAP_MAYMOVE) == 0U) {
+        uint64_t ext = old_va + old_size;
+
+        /* Grow in place or fail. */
+        if (old_va > ctx->task_size - new_size) {
+            return -(int64_t)ENOMEM;
+        }
+        if (mips_mem_ok(ctx, old_va, new_size, 0U)) {
+            return (int64_t)old_va; /* extension already mapped */
+        }
+        if (remap_hole(ctx, ext, new_size - old_size) != ext) {
+            return -(int64_t)ENOMEM;
+        }
+        rc = mips_mem_map(ctx, ext, new_size - old_size, prot, "remap");
+        if (rc != 0) {
+            return (int64_t)rc;
+        }
+        return (int64_t)old_va;
+    } else {
+        uint64_t cand = ctx->mmap_base != 0U ? ctx->mmap_base : old_va;
+
+        /* Relocate through a fresh hole; the old image stays intact
+         * until the copy lands. */
+        dst = remap_hole(ctx, cand, new_size);
+        if (dst == 0U) {
+            return -(int64_t)ENOMEM;
+        }
+    }
+    rc = mips_mem_map(ctx, dst, new_size, prot, "remap");
+    if (rc != 0) {
+        return (int64_t)rc;
+    }
+    {
+        /* A FIXED shrink relocates fewer bytes than the source holds. */
+        uint64_t kept = old_size < new_size ? old_size : new_size;
+        uint8_t *to = (uint8_t *)mips64_guest_ptr(ctx, dst);
+        const uint8_t *from = (const uint8_t *)mips64_guest_ptr(ctx,
+                                                                old_va);
+
+        memcpy(to, from, (size_t)kept);
+    }
+    rc = mips_mem_unmap(ctx, old_va, old_size);
+    if (rc != 0) {
+        return (int64_t)rc;
+    }
+    return (int64_t)dst;
+}
+
 /*
  * Reserve task_size host VA (PROT_NONE, MAP_NORESERVE) and record
  * guest_base. The size follows ctx->is_n32 (N64 1ULL<<40, N32

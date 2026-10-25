@@ -98,6 +98,12 @@ int mips64_parse_host_args(int argc, char **argv, mips64_host_args_t *out);
 int mips64_sysroot_join(const char *sysroot, const char *guest_path,
                         char *out, size_t out_size);
 
+/* Process-wide guest sysroot for path translation (loader, execve,
+ * *at). Set once at start-up from the parsed config before any guest
+ * thread runs; read-only afterwards. NULL (or empty) clears it. */
+void mips64_host_set_sysroot(const char *sysroot);
+const char *mips64_host_sysroot(void);
+
 /* Scan a raw auxv `(key, value)` pair vector (`n` pairs) for
  * `AT_EXECFD`. Returns the descriptor (any value `>= 0`, including 0)
  * with `*found` set to 1, or -1 with `*found` set to 0 when the key is

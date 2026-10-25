@@ -270,6 +270,9 @@ int mips64_worker_loop_run(const mips64_run_config_t *config, int guest_argc,
     rc_auth = admit_authorities(config);
     if (rc_auth != 0)
         return rc_auth;
+    /* Publish the sysroot for loader/exec/openat translation (single
+     * start-up write before any guest thread runs). */
+    mips64_host_set_sysroot(config->has_sysroot ? config->sysroot : NULL);
     if (mips64_runtime_digest_self(digest) == 0) {
         have_digest = 1;
         if (config->trace) {

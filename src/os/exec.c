@@ -51,6 +51,7 @@
 
 #include "core/cpu.h"
 
+#include "os/host_args.h"
 #include "os/syscall_nr.h"
 #include "rt64/linux/signal_core.h"
 
@@ -414,6 +415,22 @@ int64_t mips_sc_exec(mips64_ctx_t *ctx, uint64_t nr, uint64_t path_va,
             k++;
         }
         path_buf[k] = '\0';
+    }
+    /* Guest-absolute paths resolve against the start-up sysroot (the
+     * loader, the host-execve fallthrough, and AT_EXECFN below all
+     * consume `exec_path`). */
+    {
+        char exec_path[EXEC_PATH_MAX +
+                       MIPS64RT_HOST_ARGS_PATH_MAX];
+
+        if (mips64_sysroot_join(mips64_host_sysroot(), path_buf,
+                               exec_path, sizeof exec_path) != 0) {
+            return exec_ret(ctx, -(int64_t)ENAMETOOLONG);
+        }
+        if (strlen(exec_path) >= sizeof path_buf) {
+            return exec_ret(ctx, -(int64_t)ENAMETOOLONG);
+        }
+        memcpy(path_buf, exec_path, strlen(exec_path) + 1u);
     }
     rc = copy_guest_vec(ctx, argv, &host_argv, &argc, &budget, 1);
     if (rc != 0) {

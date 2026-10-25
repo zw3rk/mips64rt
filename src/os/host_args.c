@@ -365,6 +365,32 @@ int mips64_parse_host_args(int argc, char **argv, mips64_host_args_t *out)
     return MIPS64RT_HOST_ARGS_OK;
 }
 
+/* Start-up sysroot cell (see the header): written once before guest
+ * threads exist, then read-only. Sized like the parsed `--sysroot`. */
+static char host_sysroot[MIPS64RT_HOST_ARGS_PATH_MAX];
+static int host_has_sysroot;
+
+void mips64_host_set_sysroot(const char *sysroot)
+{
+    if (sysroot == NULL || sysroot[0] == '\0') {
+        host_sysroot[0] = '\0';
+        host_has_sysroot = 0;
+        return;
+    }
+    if (strlen(sysroot) >= sizeof host_sysroot) {
+        host_sysroot[0] = '\0';
+        host_has_sysroot = 0;
+        return;
+    }
+    memcpy(host_sysroot, sysroot, strlen(sysroot) + 1u);
+    host_has_sysroot = 1;
+}
+
+const char *mips64_host_sysroot(void)
+{
+    return host_has_sysroot ? host_sysroot : NULL;
+}
+
 int mips64_sysroot_join(const char *sysroot, const char *guest_path,
                         char *out, size_t out_size)
 {
