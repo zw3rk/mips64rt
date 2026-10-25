@@ -1,0 +1,146 @@
+P1-ISA suite abi=N32 endian=LE
+P1-INFO model abi=N32 endian=LE void*=4 long=4 llong=8
+P1-PASS datamodel
+P1-PASS addiu-plus1
+P1-PASS addiu-minus1
+P1-PASS addu-wrap-zero
+P1-PASS addu-sign-bit
+P1-PASS subu-wrap
+P1-PASS and-low32
+P1-PASS or-low32
+P1-PASS xor-low32
+P1-PASS nor-low32
+P1-PASS slt-neg1-lt-1
+P1-PASS sltu-ffff-lt-1
+P1-PASS sltiu-0-lt-1
+P1-PASS lui-sign
+P1-PASS ext-8-8
+P1-PASS ins-8-8
+P1-PASS zero-stays-zero
+P1-PASS daddiu-64
+P1-PASS daddiu-neg
+P1-PASS daddu-64
+P1-PASS dsubu-64
+P1-PASS daddu-wrap64
+P1-PASS sll-into-sign
+P1-PASS sll-sa0-sext
+P1-PASS srl
+P1-PASS sra-sign
+P1-PASS sllv
+P1-PASS srlv
+P1-PASS srav
+P1-PASS rotr
+P1-PASS dsll
+P1-PASS dsll-4
+P1-PASS dsll32
+P1-PASS dsrl-4
+P1-PASS dsra-4
+P1-PASS drotr-8
+P1-PASS dsbh
+P1-PASS dshd
+P1-PASS dclz
+P1-PASS dclo
+P1-PASS dext-8-8
+P1-PASS dext-0-32
+P1-PASS dextm-16-48
+P1-PASS dextu-48-16
+P1-PASS dextu-32-32
+P1-PASS dins-8-8
+P1-PASS dinsm-16-32
+P1-PASS dinsu-48-16
+P1-PASS mult-lo
+P1-PASS mult-hi
+P1-PASS multu-lo
+P1-PASS multu-hi
+P1-PASS div-lo
+P1-PASS div-hi
+P1-PASS div-neg-lo
+P1-PASS div-neg-hi
+P1-PASS divu-lo
+P1-PASS divu-hi
+P1-PASS dmult-lo
+P1-PASS dmult-hi
+P1-PASS ddiv-lo
+P1-PASS ddiv-hi
+P1-PASS beq-taken
+P1-PASS beq-not-taken
+P1-PASS bne-taken
+P1-PASS bne-not-taken
+P1-PASS blez-taken-zero
+P1-PASS blez-taken-neg
+P1-PASS blez-not-taken
+P1-PASS bgtz-taken
+P1-PASS bgtz-not-taken-zero
+P1-PASS bgtz-not-taken-neg
+P1-PASS bltz-taken
+P1-PASS bltz-not-taken-zero
+P1-PASS bltz-not-taken-pos
+P1-PASS bgez-taken-zero
+P1-PASS bgez-taken-pos
+P1-PASS bgez-not-taken
+P1-PASS beql-taken
+P1-PASS beql-not-taken
+P1-PASS bnel-taken
+P1-PASS bnel-not-taken
+P1-PASS blezl-taken
+P1-PASS blezl-not-taken
+P1-PASS bgtzl-taken
+P1-PASS bgtzl-not-taken
+P1-PASS bltzl-taken
+P1-PASS bltzl-not-taken
+P1-PASS bgezl-taken
+P1-PASS bgezl-not-taken
+P1-PASS bltzal-taken
+P1-PASS bltzal-not-taken
+P1-PASS bgezal-taken
+P1-PASS bgezal-not-taken
+P1-PASS bltzall-taken
+P1-PASS bltzall-not-taken
+P1-PASS bgezall-taken
+P1-PASS jal-link
+P1-PASS jalr-link
+P1-PASS jr-computed
+P1-PASS sc-without-ll-fails-32
+P1-PASS scd-without-lld-fails-64
+P1-PASS ll-loads-value-32
+P1-PASS lld-loads-value-64
+P1-PASS imm-llsc-succeeds-32
+P1-PASS imm-lldscd-succeeds-64
+P1-PASS repeat-sc-fails-32
+P1-PASS repeat-scd-fails-64
+P1-PASS store-same-addr-clears-32
+P1-PASS store-same-addr-clears-64
+P1-INFO same-line-32 ll=0xaaaaaaaa sc=1 mem=0xcccccccc
+P1-INFO same-line-64 ll=0xaaaaaaaaaaaaaaaa sc=1 mem=0xcccccccccccccccc
+P1-FAIL lwl-lwr-align-0 got=0xa80000ab want=0xabaaa9a8
+P1-FAIL lwl-lwr-align-1 got=0xafaeadac want=0xacabaaa9
+P1-FAIL lwl-lwr-align-2 got=0xaaafaead want=0xadacabaa
+P1-FAIL lwl-lwr-align-3 got=0xabaaafae want=0xaeadacab
+P1-FAIL swl-swr-align-0
+P1-FAIL swl-swr-align-1
+P1-FAIL swl-swr-align-2
+P1-FAIL swl-swr-align-3
+P1-INFO ldl-ldr-canonical xmod=3 ymod=2
+P1-FAIL ldl-ldr-canonical-pair got=0xabaab7b6b5b4b3b2 want=0xb2b1b0afaeadacab
+P1-FAIL sdl-sdr-canonical-pair
+P1-PASS rdhwr-nonzero
+P1-PASS rdhwr-fixed-matches
+P1-PASS rdhwr-returns-set-value
+P1-PASS rdhwr-restored
+P1-PASS lw-sext
+P1-PASS lwu-zext
+P1-PASS lb-sext
+P1-PASS lbu-zext
+P1-PASS lh-sext
+P1-PASS lhu-zext
+P1-PASS unaligned-lw-child-faults
+P1-INFO unaligned-lw status=35584
+P1-PASS likely-annul-skips-protnone
+P1-INFO pageend-offset=4
+P1-INFO pageend-child status=0
+P1-INFO raw-write-ok
+P1-PASS raw-write
+P1-PASS raw-exit
+P1-SUMMARY failed=10 total=134
+P1-RESULT: FAIL
+P1-EXIT: 1
