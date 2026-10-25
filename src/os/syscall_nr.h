@@ -9,12 +9,18 @@
  * its number in $v0; args in $a0..$a5; $a3 = 0/$v0 on success,
  * $a3 = 1/$v0 = +errno on error).
  *
- * Source: Linux arch/mips UAPI unistd_n64.h / unistd_n32.h as shipped in
- * libc6-dev-mips64el-cross (Debian trixie, linux/arm64); every entry below
- * was extracted mechanically from those headers (number = base + index,
- * quoted in the per-line comment). Spot checks against qemu ground truth:
- * read 5000/6000, write 5001/6001, mmap 5009/6009, getpid 5038/6038,
- * exit 5058/6058, set_thread_area 5242/6246 (experiments/E01, E06).
+ * Source: Linux arch/mips/include/uapi/asm/unistd_n64.h /
+ * unistd_n32.h as shipped in libc6-dev-mips64el-cross and
+ * libc6-dev-mipsn32-mips64el-cross (Debian trixie, linux/arm64); every
+ * entry below was extracted mechanically from those headers (number =
+ * base + index, quoted in the per-line comment). Lane L2a re-verified
+ * each Phase 2 number against those two headers inside a
+ * debian:stable-slim container (grep of the __NR rows) and executed
+ * the N64/N32 fills live under qemu-mips64el / qemu-mipsn32el 10.0.13
+ * (stat family, timespec, statx, getdents64, glibc -strace selection).
+ * Spot checks against qemu ground truth: read 5000/6000, write
+ * 5001/6001, mmap 5009/6009, getpid 5038/6038, exit 5058/6058,
+ * set_thread_area 5242/6246 (experiments/E01, E06).
  *
  * MIPS N64/N32 define no vfork entry (verified absent from both headers):
  * glibc vfork lowers to clone (lane L4b); see the proc layer in Phase 4
@@ -316,6 +322,9 @@
 /* N32 time64 variants (64-bit time_t on the 32-bit-pointer ABI). */
 #define MIPS64_NR32_clock_gettime64  6403 /* n32 index 403 */
 #define MIPS64_NR32_clock_settime64  6404 /* n32 index 404 */
+/* L2a: glibc nanosleep() lowers to clock_nanosleep(_time64) (observed
+ * via qemu -strace), so the N32 time64 companion is wired too. */
+#define MIPS64_NR32_clock_nanosleep_time64 6407 /* n32 index 407 */
 #define MIPS64_NR32_futex_time64     6422 /* n32 index 422 */
 
 /* Guest trap encoding: `syscall 0`. */

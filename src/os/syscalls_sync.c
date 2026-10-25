@@ -1,0 +1,239 @@
+/*
+ * src/os/syscalls_sync.c — Futex, signal mask, robust lists, and
+ * vectored I/O (lane L2a).
+ *
+ * Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Single-threaded futex minimum (WAIT/WAKE), the recorded
+ * rt_sigprocmask mask (no delivery until Phase 4), set_robust_list /
+ * get_robust_list (recorded in ctx, never installed on the host), and
+ * readv/writev/preadv/pwritev over the MIPS {base, len} iovec (16
+ * bytes N64, 8 bytes N32, verified live under qemu). Shared helpers
+ * (l2a_ret, putn, getn, guest_range) live in src/os/syscalls.c.
+ */
+#define _GNU_SOURCE
+
+#include "core/cpu.h"
+
+#include "os/syscall_nr.h"
+
+#include <errno.h>
+#include <limits.h>
+#include <stdint.h>
+#include <string.h>
+#include <sys/syscall.h>
+#include <sys/types.h>
+#include <sys/uio.h>
+
+/* Shared helpers owned by src/os/syscalls.c. */
+extern int mips_mem_ok(const mips64_ctx_t *ctx, uint64_t va, uint64_t len,
+                       uint32_t need);
+extern int64_t l2a_ret(mips64_ctx_t *ctx, int64_t raw);
+extern void putn(uint8_t *p, uint64_t v, unsigned n, int be);
+extern uint64_t getn(const uint8_t *p, unsigned n, int be);
+extern uint8_t *guest_range(mips64_ctx_t *ctx, uint64_t va, uint64_t len,
+                            int write);
+
+/* MIPS futex ops (linux/futex.h, arch-independent) and signal-mask ops
+ * (UAPI asm/signal.h: 1/2/3 on MIPS, unlike asm-generic 0/1/2). */
+#define MIPS_FUTEX_WAIT         0
+#define MIPS_FUTEX_WAKE         1
+#define MIPS_FUTEX_PRIVATE_FLAG 0x80
+#define MIPS_SIG_BLOCK          1
+#define MIPS_SIG_UNBLOCK        2
+#define MIPS_SIG_SETMASK        3
+
+/* Single-threaded futex minimum: WAIT mismatches get EAGAIN, matches
+ * return 0 (a legal spurious wakeup); WAKE has nobody to wake. Beyond
+ * WAIT/WAKE (+PRIVATE_FLAG): ENOSYS. */
+int64_t mips_sc_futex(mips64_ctx_t *ctx, uint64_t uaddr, uint64_t op,
+                      uint64_t val, uint64_t timeout_va, uint64_t uaddr2,
+                      uint64_t val3)
+{
+    uint8_t *p;
+    uint32_t cur;
+    uint64_t cmd;
+
+    (void)timeout_va;
+    (void)uaddr2;
+    (void)val3;
+    if ((uaddr & 3U) != 0U) {
+        return l2a_ret(ctx, -(int64_t)EINVAL);
+    }
+    cmd = op & ~(uint64_t)MIPS_FUTEX_PRIVATE_FLAG;
+    if (cmd != (uint64_t)MIPS_FUTEX_WAIT &&
+        cmd != (uint64_t)MIPS_FUTEX_WAKE) {
+        return l2a_ret(ctx, -(int64_t)ENOSYS);
+    }
+    p = guest_range(ctx, uaddr, 4U, 0);
+    if (p == NULL) {
+        return l2a_ret(ctx, -(int64_t)EFAULT);
+    }
+    cur = (uint32_t)getn(p, 4, ctx->is_be != 0U);
+    if (cmd == (uint64_t)MIPS_FUTEX_WAIT && cur != (uint32_t)val) {
+        return l2a_ret(ctx, -(int64_t)EAGAIN);
+    }
+    return l2a_ret(ctx, 0);
+}
+
+/* Recorded guest signal mask (no delivery until Phase 4). The kernel
+ * mask is 16 bytes on both ABIs, so other sigsetsizes are -EINVAL. */
+static uint64_t l2a_sigmask[2];
+
+int64_t mips_sc_rt_sigprocmask(mips64_ctx_t *ctx, uint64_t how,
+                               uint64_t set_va, uint64_t oldset_va,
+                               uint64_t sigsetsize)
+{
+    uint8_t *p;
+    int be;
+
+    if (sigsetsize != 16U) {
+        return l2a_ret(ctx, -(int64_t)EINVAL);
+    }
+    be = ctx->is_be != 0U;
+    if (set_va != 0U) {
+        uint64_t nw0;
+        uint64_t nw1;
+
+        p = guest_range(ctx, set_va, 16U, 0);
+        if (p == NULL) {
+            return l2a_ret(ctx, -(int64_t)EFAULT);
+        }
+        /* Opaque 16-byte record in guest byte order; Phase 4 splits
+         * it into words at delivery time. */
+        nw0 = getn(p, 8, be);
+        nw1 = getn(p + 8, 8, be);
+        if (how == (uint64_t)MIPS_SIG_BLOCK) {
+            l2a_sigmask[0] |= nw0;
+            l2a_sigmask[1] |= nw1;
+        } else if (how == (uint64_t)MIPS_SIG_UNBLOCK) {
+            l2a_sigmask[0] &= ~nw0;
+            l2a_sigmask[1] &= ~nw1;
+        } else if (how == (uint64_t)MIPS_SIG_SETMASK) {
+            l2a_sigmask[0] = nw0;
+            l2a_sigmask[1] = nw1;
+        } else {
+            return l2a_ret(ctx, -(int64_t)EINVAL);
+        }
+    }
+    if (oldset_va != 0U) {
+        p = guest_range(ctx, oldset_va, 16U, 1);
+        if (p == NULL) {
+            return l2a_ret(ctx, -(int64_t)EFAULT);
+        }
+        putn(p, l2a_sigmask[0], 8, be);
+        putn(p + 8, l2a_sigmask[1], 8, be);
+    }
+    return l2a_ret(ctx, 0);
+}
+
+/* Robust lists are recorded in ctx, never installed on the host:
+ * single-threaded guests never contend, so the host kernel has nothing
+ * to clean up. Phase 4 installs a real host-side list for threads. */
+int64_t mips_sc_robust(mips64_ctx_t *ctx, int set, uint64_t a0, uint64_t a1,
+                       uint64_t a2)
+{
+    unsigned ws = ctx->is_n32 != 0U ? 4U : 8U;
+    uint8_t *hp;
+    uint8_t *lp;
+    int be = ctx->is_be != 0U;
+
+    if (set) {
+        if (a1 != (uint64_t)ws) {
+            return l2a_ret(ctx, -(int64_t)EINVAL);
+        }
+        ctx->robust_list_head = a0;
+        ctx->robust_list_len = a1;
+        return l2a_ret(ctx, 0);
+    }
+    /* Only the calling thread's own list; anything else needs ptrace. */
+    if (a0 != 0U) {
+        return l2a_ret(ctx, -(int64_t)EPERM);
+    }
+    hp = guest_range(ctx, a1, (uint64_t)ws, 1);
+    lp = guest_range(ctx, a2, (uint64_t)ws, 1);
+    if (hp == NULL || lp == NULL) {
+        return l2a_ret(ctx, -(int64_t)EFAULT);
+    }
+    putn(hp, ctx->robust_list_head, ws, be);
+    putn(lp, ctx->robust_list_len, ws, be);
+    return l2a_ret(ctx, 0);
+}
+
+/* Vectored I/O for readv/writev/preadv/pwritev. The MIPS iovec is
+ * {base, len} in the ABI word size; entries stream to the host in
+ * 64-entry chunks with the offset advanced, preserving short-count
+ * semantics. */
+int64_t mips_sc_vec(mips64_ctx_t *ctx, uint64_t fd, uint64_t iov_va,
+                    uint64_t iovcnt, uint64_t off, int is_p, int is_write)
+{
+    uint64_t total = 0U;
+    uint64_t idx = 0U;
+    uint64_t cur = off;
+    int be = ctx->is_be != 0U;
+    int n32 = ctx->is_n32 != 0U;
+    uint64_t step = n32 ? 8U : 16U;
+
+    if (iovcnt > (uint64_t)IOV_MAX) {
+        return l2a_ret(ctx, -(int64_t)EINVAL);
+    }
+    if (iovcnt == 0U) {
+        return l2a_ret(ctx, 0);
+    }
+    if (!mips_mem_ok(ctx, iov_va, iovcnt * step,
+                      (uint32_t)MIPS_PROT_READ)) {
+        return l2a_ret(ctx, -(int64_t)EFAULT);
+    }
+    while (idx < iovcnt) {
+        struct iovec hv[64];
+        uint64_t n = iovcnt - idx;
+        uint64_t want = 0U;
+        uint64_t k;
+        ssize_t rc;
+
+        if (n > 64U) {
+            n = 64U;
+        }
+        for (k = 0U; k < n; k++) {
+            const uint8_t *e = (const uint8_t *)mips64_guest_ptr(
+                ctx, iov_va + (idx + k) * step);
+            uint64_t base;
+            uint64_t len;
+
+            if (n32) {
+                base = getn(e, 4, be);
+                len = getn(e + 4, 4, be);
+            } else {
+                base = getn(e, 8, be);
+                len = getn(e + 8, 8, be);
+            }
+            hv[k].iov_len = (size_t)len;
+            want += len;
+            hv[k].iov_base = guest_range(ctx, base, len, is_write ? 0 : 1);
+            if (len != 0U && hv[k].iov_base == NULL) {
+                return l2a_ret(ctx, -(int64_t)EFAULT);
+            }
+        }
+        if (is_p) {
+            rc = is_write ? pwritev((int)fd, hv, (int)n, (off_t)cur) :
+                            preadv((int)fd, hv, (int)n, (off_t)cur);
+        } else {
+            rc = is_write ? writev((int)fd, hv, (int)n) :
+                            readv((int)fd, hv, (int)n);
+        }
+        if (rc < 0) {
+            if (total != 0U) {
+                return l2a_ret(ctx, (int64_t)total);
+            }
+            return l2a_ret(ctx, -(int64_t)errno);
+        }
+        total += (uint64_t)rc;
+        cur += (uint64_t)rc;
+        idx += n;
+        if ((uint64_t)rc < want || rc == 0) {
+            break;
+        }
+    }
+    return l2a_ret(ctx, (int64_t)total);
+}

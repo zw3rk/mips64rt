@@ -50,6 +50,61 @@
 /* Region helpers owned by src/os/mem.c (lane L1c). */
 extern int mips_mem_ok(const mips64_ctx_t *ctx, uint64_t va, uint64_t len,
                        uint32_t need);
+/* Static-libc layer owned by src/os/syscalls.c (lane L2a). Each entry
+ * takes the decoded guest args and returns the raw host result with the
+ * $a3 convention already recorded in the guest regs. */
+extern int64_t mips_sc_openat(mips64_ctx_t *ctx, uint64_t dirfd,
+                              uint64_t path_va, uint64_t flags,
+                              uint64_t mode);
+extern int64_t mips_sc_fcntl(mips64_ctx_t *ctx, uint64_t fd, uint64_t cmd,
+                             uint64_t arg);
+extern int64_t mips_sc_clock_gettime(mips64_ctx_t *ctx, uint64_t clk,
+                                     uint64_t ts_va, int is64);
+extern int64_t mips_sc_nanosleep(mips64_ctx_t *ctx, uint64_t clk,
+                                 uint64_t req_va, uint64_t rem_va, int is64,
+                                 int use_clock);
+extern int64_t mips_sc_getrandom(mips64_ctx_t *ctx, uint64_t buf_va,
+                                 uint64_t len, uint64_t flags);
+extern int64_t mips_sc_futex(mips64_ctx_t *ctx, uint64_t uaddr, uint64_t op,
+                             uint64_t val, uint64_t timeout_va,
+                             uint64_t uaddr2, uint64_t val3);
+extern int64_t mips_sc_rt_sigprocmask(mips64_ctx_t *ctx, uint64_t how,
+                                      uint64_t set_va, uint64_t oldset_va,
+                                      uint64_t sigsetsize);
+extern int64_t mips_sc_ioctl(mips64_ctx_t *ctx, uint64_t fd, uint64_t cmd,
+                             uint64_t arg);
+extern int64_t mips_sc_lseek(mips64_ctx_t *ctx, uint64_t fd, uint64_t offset,
+                             uint64_t whence);
+extern int64_t mips_sc_stat_at(mips64_ctx_t *ctx, uint64_t dirfd,
+                               uint64_t path_va, uint64_t buf_va,
+                               uint64_t flags);
+extern int64_t mips_sc_fstat(mips64_ctx_t *ctx, uint64_t fd,
+                             uint64_t buf_va);
+extern int64_t mips_sc_statx(mips64_ctx_t *ctx, uint64_t dirfd,
+                             uint64_t path_va, uint64_t flags, uint64_t mask,
+                             uint64_t buf_va);
+extern int64_t mips_sc_getdents64(mips64_ctx_t *ctx, uint64_t fd,
+                                  uint64_t dirp_va, uint64_t count);
+extern int64_t mips_sc_readlinkat(mips64_ctx_t *ctx, uint64_t dirfd,
+                                  uint64_t path_va, uint64_t buf_va,
+                                  uint64_t size);
+extern int64_t mips_sc_access_at(mips64_ctx_t *ctx, uint64_t dirfd,
+                                 uint64_t path_va, uint64_t mode,
+                                 uint64_t flags);
+extern int64_t mips_sc_pipe2(mips64_ctx_t *ctx, uint64_t fds_va,
+                             uint64_t flags);
+extern int64_t mips_sc_dup(mips64_ctx_t *ctx, uint64_t oldfd, uint64_t newfd,
+                           uint64_t flags, int op);
+extern int64_t mips_sc_getid(mips64_ctx_t *ctx, int which);
+extern int64_t mips_sc_robust(mips64_ctx_t *ctx, int set, uint64_t a0,
+                              uint64_t a1, uint64_t a2);
+extern int64_t mips_sc_unlinkat(mips64_ctx_t *ctx, uint64_t dirfd,
+                                uint64_t path_va, uint64_t flags);
+extern int64_t mips_sc_close_range(mips64_ctx_t *ctx, uint64_t first,
+                                   uint64_t last, uint64_t flags);
+extern int64_t mips_sc_vec(mips64_ctx_t *ctx, uint64_t fd, uint64_t iov_va,
+                           uint64_t iovcnt, uint64_t off, int is_p,
+                           int is_write);
 extern int mips_mem_map(mips64_ctx_t *ctx, uint64_t va, uint64_t len,
                         uint32_t prot, const char *tag);
 extern int mips_mem_unmap(mips64_ctx_t *ctx, uint64_t va, uint64_t len);
@@ -617,6 +672,142 @@ int64_t mips_syscall(mips64_ctx_t *ctx)
          * back via ctx->ulr. */
         ctx->ulr = a0;
         return sc_ret(ctx, 0);
+    }
+    /* ---- Lane L2a: static-libc layer (src/os/syscalls.c). The -100
+     * dirfd below is AT_FDCWD; 0x100 is AT_SYMLINK_NOFOLLOW (both
+     * arch-independent, verified in the UAPI container). ---- */
+    if (nr == (uint64_t)(n32 ? MIPS64_NR32_openat : MIPS64_NR_openat)) {
+        return mips_sc_openat(ctx, a0, a1, a2, a3);
+    }
+    if (nr == (uint64_t)(n32 ? MIPS64_NR32_fcntl : MIPS64_NR_fcntl)) {
+        return mips_sc_fcntl(ctx, a0, a1, a2);
+    }
+    if (nr == (uint64_t)(n32 ? MIPS64_NR32_clock_gettime
+                             : MIPS64_NR_clock_gettime)) {
+        return mips_sc_clock_gettime(ctx, a0, a1, n32 ? 0 : 1);
+    }
+    if (n32 && nr == (uint64_t)MIPS64_NR32_clock_gettime64) {
+        return mips_sc_clock_gettime(ctx, a0, a1, 1);
+    }
+    if (nr == (uint64_t)(n32 ? MIPS64_NR32_nanosleep
+                             : MIPS64_NR_nanosleep)) {
+        return mips_sc_nanosleep(ctx, 0U, a0, a1, n32 ? 0 : 1, 0);
+    }
+    if (nr == (uint64_t)(n32 ? MIPS64_NR32_clock_nanosleep
+                             : MIPS64_NR_clock_nanosleep)) {
+        return mips_sc_nanosleep(ctx, a0, a1, a2, n32 ? 0 : 1, 1);
+    }
+    if (n32 && nr == (uint64_t)MIPS64_NR32_clock_nanosleep_time64) {
+        return mips_sc_nanosleep(ctx, a0, a1, a2, 1, 1);
+    }
+    if (nr == (uint64_t)(n32 ? MIPS64_NR32_getrandom
+                             : MIPS64_NR_getrandom)) {
+        return mips_sc_getrandom(ctx, a0, a1, a2);
+    }
+    if (nr == (uint64_t)(n32 ? MIPS64_NR32_futex : MIPS64_NR_futex)) {
+        return mips_sc_futex(ctx, a0, a1, a2, a3, a4, a5);
+    }
+    if (nr == (uint64_t)(n32 ? MIPS64_NR32_rt_sigprocmask
+                             : MIPS64_NR_rt_sigprocmask)) {
+        return mips_sc_rt_sigprocmask(ctx, a0, a1, a2, a3);
+    }
+    if (nr == (uint64_t)(n32 ? MIPS64_NR32_ioctl : MIPS64_NR_ioctl)) {
+        return mips_sc_ioctl(ctx, a0, a1, a2);
+    }
+    if (nr == (uint64_t)(n32 ? MIPS64_NR32_lseek : MIPS64_NR_lseek)) {
+        return mips_sc_lseek(ctx, a0, a1, a2);
+    }
+    if (nr == (uint64_t)(n32 ? MIPS64_NR32_stat : MIPS64_NR_stat)) {
+        return mips_sc_stat_at(ctx, (uint64_t)(int64_t)-100, a0, a1, 0U);
+    }
+    if (nr == (uint64_t)(n32 ? MIPS64_NR32_fstat : MIPS64_NR_fstat)) {
+        return mips_sc_fstat(ctx, a0, a1);
+    }
+    if (nr == (uint64_t)(n32 ? MIPS64_NR32_lstat : MIPS64_NR_lstat)) {
+        return mips_sc_stat_at(ctx, (uint64_t)(int64_t)-100, a0, a1, 0x100U);
+    }
+    if (nr == (uint64_t)(n32 ? MIPS64_NR32_newfstatat
+                             : MIPS64_NR_newfstatat)) {
+        return mips_sc_stat_at(ctx, a0, a1, a2, a3);
+    }
+    if (nr == (uint64_t)(n32 ? MIPS64_NR32_statx : MIPS64_NR_statx)) {
+        return mips_sc_statx(ctx, a0, a1, a2, a3, a4);
+    }
+    if (nr == (uint64_t)(n32 ? MIPS64_NR32_getdents64
+                             : MIPS64_NR_getdents64)) {
+        return mips_sc_getdents64(ctx, a0, a1, a2);
+    }
+    if (nr == (uint64_t)(n32 ? MIPS64_NR32_readlinkat
+                             : MIPS64_NR_readlinkat)) {
+        return mips_sc_readlinkat(ctx, a0, a1, a2, a3);
+    }
+    if (nr == (uint64_t)(n32 ? MIPS64_NR32_access : MIPS64_NR_access)) {
+        return mips_sc_access_at(ctx, (uint64_t)(int64_t)-100, a0, a1, 0U);
+    }
+    if (nr == (uint64_t)(n32 ? MIPS64_NR32_faccessat
+                             : MIPS64_NR_faccessat)) {
+        return mips_sc_access_at(ctx, a0, a1, a2, a3);
+    }
+    if (nr == (uint64_t)(n32 ? MIPS64_NR32_pipe2 : MIPS64_NR_pipe2)) {
+        return mips_sc_pipe2(ctx, a0, a1);
+    }
+    if (nr == (uint64_t)(n32 ? MIPS64_NR32_dup : MIPS64_NR_dup)) {
+        return mips_sc_dup(ctx, a0, 0U, 0U, 0);
+    }
+    if (nr == (uint64_t)(n32 ? MIPS64_NR32_dup2 : MIPS64_NR_dup2)) {
+        return mips_sc_dup(ctx, a0, a1, 0U, 1);
+    }
+    if (nr == (uint64_t)(n32 ? MIPS64_NR32_dup3 : MIPS64_NR_dup3)) {
+        return mips_sc_dup(ctx, a0, a1, a2, 2);
+    }
+    if (nr == (uint64_t)(n32 ? MIPS64_NR32_getpid : MIPS64_NR_getpid)) {
+        return mips_sc_getid(ctx, 0);
+    }
+    if (nr == (uint64_t)(n32 ? MIPS64_NR32_getppid : MIPS64_NR_getppid)) {
+        return mips_sc_getid(ctx, 1);
+    }
+    if (nr == (uint64_t)(n32 ? MIPS64_NR32_getuid : MIPS64_NR_getuid)) {
+        return mips_sc_getid(ctx, 2);
+    }
+    if (nr == (uint64_t)(n32 ? MIPS64_NR32_geteuid : MIPS64_NR_geteuid)) {
+        return mips_sc_getid(ctx, 3);
+    }
+    if (nr == (uint64_t)(n32 ? MIPS64_NR32_getgid : MIPS64_NR_getgid)) {
+        return mips_sc_getid(ctx, 4);
+    }
+    if (nr == (uint64_t)(n32 ? MIPS64_NR32_getegid : MIPS64_NR_getegid)) {
+        return mips_sc_getid(ctx, 5);
+    }
+    if (nr == (uint64_t)(n32 ? MIPS64_NR32_gettid : MIPS64_NR_gettid)) {
+        return mips_sc_getid(ctx, 6);
+    }
+    if (nr == (uint64_t)(n32 ? MIPS64_NR32_set_robust_list
+                             : MIPS64_NR_set_robust_list)) {
+        return mips_sc_robust(ctx, 1, a0, a1, 0U);
+    }
+    if (nr == (uint64_t)(n32 ? MIPS64_NR32_get_robust_list
+                             : MIPS64_NR_get_robust_list)) {
+        return mips_sc_robust(ctx, 0, a0, a1, a2);
+    }
+    if (nr == (uint64_t)(n32 ? MIPS64_NR32_unlinkat
+                             : MIPS64_NR_unlinkat)) {
+        return mips_sc_unlinkat(ctx, a0, a1, a2);
+    }
+    if (nr == (uint64_t)(n32 ? MIPS64_NR32_close_range
+                             : MIPS64_NR_close_range)) {
+        return mips_sc_close_range(ctx, a0, a1, a2);
+    }
+    if (nr == (uint64_t)(n32 ? MIPS64_NR32_readv : MIPS64_NR_readv)) {
+        return mips_sc_vec(ctx, a0, a1, a2, 0U, 0, 0);
+    }
+    if (nr == (uint64_t)(n32 ? MIPS64_NR32_writev : MIPS64_NR_writev)) {
+        return mips_sc_vec(ctx, a0, a1, a2, 0U, 0, 1);
+    }
+    if (nr == (uint64_t)(n32 ? MIPS64_NR32_preadv : MIPS64_NR_preadv)) {
+        return mips_sc_vec(ctx, a0, a1, a2, a3, 1, 0);
+    }
+    if (nr == (uint64_t)(n32 ? MIPS64_NR32_pwritev : MIPS64_NR_pwritev)) {
+        return mips_sc_vec(ctx, a0, a1, a2, a3, 1, 1);
     }
     return sc_ret(ctx, -(int64_t)ENOSYS);
 }
