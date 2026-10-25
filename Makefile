@@ -5,8 +5,18 @@
 
 .DEFAULT_GOAL := help
 
-CC ?= cc
+NIX_A64_GCC := /nix/store/82ac69jwkpj68v4mx22yxnwzqj0ql4l5-aarch64-unknown-linux-musl-gcc-wrapper-15.2.0/bin/aarch64-unknown-linux-musl-gcc
+ifeq ($(origin CC),default)
+ifeq ($(wildcard $(NIX_A64_GCC)),$(NIX_A64_GCC))
+CC := $(NIX_A64_GCC)
+else
+CC := $(shell command -v aarch64-unknown-linux-musl-gcc 2>/dev/null || echo cc)
+endif
+endif
 CROSS_CC ?= aarch64-unknown-linux-musl-gcc
+# Host-native tools (tests/check_abi_invariants) always build with the host
+# C compiler, even when CC resolves to the aarch64-musl cross compiler.
+HOST_CC ?= cc
 # `-pthread` for the Phase 4 thread runtime; glibc >= 2.34 and macOS link
 # without it, older glibc needs it.
 CFLAGS := -std=c11 -Werror=vla -pedantic -Wall -Wextra -Werror -pthread
@@ -35,7 +45,7 @@ build: $(BUILD)/mips64rt
 
 $(BUILD)/mips64rt: $(BOOT_SRCS) src/core/cpu.h src/os/syscall_nr.h
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) $(INCLUDES) $(BOOT_SRCS) -o $@
+	$(CC) -static-pie -fPIE $(CFLAGS) $(INCLUDES) $(BOOT_SRCS) -o $@
 
 build-cross:
 	@mkdir -p $(BUILD)
@@ -43,8 +53,12 @@ build-cross:
 
 check: build check-line-limits
 	@$(CC) $(CFLAGS) $(INCLUDES) -fsyntax-only src/core/cpu.h src/os/syscall_nr.h
-	@$(BUILD)/mips64rt --version
-	@$(BUILD)/mips64rt --help >/dev/null
+	@if [ "$$(uname -s)" = "Linux" ] && [ "$$(uname -m)" = "aarch64" ]; then \
+		$(BUILD)/mips64rt --version; \
+		$(BUILD)/mips64rt --help >/dev/null; \
+	else \
+		echo "check: skipping native --version/--help (host $$(uname -s)/$$(uname -m) cannot execute the aarch64-musl binary; use Docker)"; \
+	fi
 	@if [ -f tests/check_abi_invariants.c ]; then $(MAKE) check-abi-invariants; fi
 
 check-line-limits:
@@ -58,7 +72,7 @@ check-line-limits:
 
 check-abi-invariants:
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) $(INCLUDES) tests/check_abi_invariants.c -o $(BUILD)/check_abi_invariants
+	$(HOST_CC) -std=c11 -Werror=vla -pedantic -Wall -Wextra -Werror -Isrc tests/check_abi_invariants.c -o $(BUILD)/check_abi_invariants
 	$(BUILD)/check_abi_invariants
 
 clean:
