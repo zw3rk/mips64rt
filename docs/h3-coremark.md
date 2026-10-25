@@ -1,8 +1,10 @@
 # H3 — Instrumented CoreMark: `interp` vs `dbt` (Phase 7 lane H3)
 
-Gate status: **RED** — measured `dbt` throughput is below `interp`
-throughput on CoreMark (deficit finding, no translator fix attempted:
-`src/` is out of scope for this lane).
+Gate status: **GREEN** (coordinator follow-up, see below) —
+`dbt` median 81.11 it/s vs `interp` median 33.53 it/s (2.42x) with
+all CRCs byte-identical to the oracle, 33/33 checks pass. Original
+lane finding was RED (`dbt` 0.47x `interp`); the deficit was fixed
+in `src/dbt/dbt.c` + `src/os/threads.c` on `master`.
 
 ## What was built
 
@@ -72,6 +74,35 @@ iterations/sec at `ITER=400`, `--cpus 2`). Any perf fix lives in
 reported with measurements, gate red, no fix invented. For
 reference, the `qemu-mips64el` oracle runs the same binary at
 ~1049 it/s (`interp` ≈ 0.029x oracle, `dbt` ≈ 0.014x oracle).
+
+## Coordinator follow-up (gate now green)
+
+Root causes of `dbt` 0.47x `interp`, all per-block-entry fixed costs
+that exceeded the translated body on branch-heavy CoreMark code:
+
+1. Every block-cache *and* IBTC hit re-fetched every covered guest
+   word through `mips_fetch` and folded it through FNV-1a. Now: one
+   `mips_mem_ok` cover check plus a host `memcmp` against a
+   `malloc`'d snapshot taken at compile time (same SMC detection
+   power — any clobbering plain store still retires the entry).
+2. Every translated block paid a `sigsetjmp` signal-mask save
+   (a `sigprocmask` round-trip). Now: plain `setjmp`; the fault
+   handler unblocks `SIGSEGV`/`SIGBUS` itself before jumping
+   (async-signal-safe, mask is otherwise constant across blocks).
+3. Every translated block re-installed the host-fault guard through
+   a mutex. Now: installed once per `dbt_run` (idempotent).
+
+Re-measured `sh tests/coremark/run_coremark.sh` on `master`
+(`ITER=400`, `--cpus 2`, five interleaved runs per engine):
+
+| engine | median | range |
+| --- | --- | --- |
+| `qemu-mips64el` (oracle) | 1048.63 | — |
+| `--interp` | 33.53 | 29.31–34.62 |
+| `--dbt` | 81.11 | 78.84–96.00 |
+
+`dbt` is 2.42x `interp`; ranges disjoint in the fast direction.
+`H3-SUMMARY pass=33 fail=0`, `H3-RESULT: PASS`.
 
 ## Reproduce
 
