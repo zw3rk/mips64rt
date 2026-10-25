@@ -1,0 +1,2 @@
+/usr/mips64el-linux-gnuabi64/include/asm/sigcontext.h:47:	unsigned long		sc_hi1;		/* Was sc_cause */
+/usr/mips64el-linux-gnuabi64/include/bits/sigcontext.h:31:   sc_cause -> sc_hi1

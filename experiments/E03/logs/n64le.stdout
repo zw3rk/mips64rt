@@ -1,0 +1,104 @@
+--- sizes ---
+sizeof(sigset_t)=128
+sizeof(struct sigaction)=152
+sizeof(siginfo_t)=128
+sizeof(ucontext_t)=768
+sizeof(mcontext_t)=600
+sizeof(gregset_t)=256
+sizeof(fpregset_t)=256
+sizeof(greg_t)=8
+sizeof(struct sigcontext)=600
+sizeof(struct stat)=216
+sizeof(struct stat64)=216
+sizeof(stack_t)=24
+--- sigaction offsets ---
+offsetof(struct sigaction,sa_handler)=8
+offsetof(struct sigaction,sa_mask)=16
+offsetof(struct sigaction,sa_flags)=0
+offsetof(struct sigaction,sa_restorer)=144
+--- ucontext offsets ---
+offsetof(ucontext_t,uc_flags)=0
+offsetof(ucontext_t,uc_link)=8
+offsetof(ucontext_t,uc_stack)=16
+offsetof(ucontext_t,uc_mcontext)=40
+offsetof(ucontext_t,uc_sigmask)=640
+--- stack_t offsets ---
+offsetof(stack_t,ss_sp)=0
+offsetof(stack_t,ss_flags)=16
+offsetof(stack_t,ss_size)=8
+--- mcontext (glibc MIPS64) offsets ---
+offsetof(mcontext_t,gregs)=0
+offsetof(mcontext_t,fpregs)=256
+offsetof(mcontext_t,mdhi)=512
+offsetof(mcontext_t,hi1)=520
+offsetof(mcontext_t,hi2)=528
+offsetof(mcontext_t,hi3)=536
+offsetof(mcontext_t,mdlo)=544
+offsetof(mcontext_t,lo1)=552
+offsetof(mcontext_t,lo2)=560
+offsetof(mcontext_t,lo3)=568
+offsetof(mcontext_t,pc)=576
+offsetof(mcontext_t,fpc_csr)=584
+offsetof(mcontext_t,used_math)=588
+offsetof(mcontext_t,dsp)=592
+--- sigcontext (kernel ABI64/N32 layout) offsets ---
+offsetof(struct sigcontext,sc_regs)=0
+offsetof(struct sigcontext,sc_fpregs)=256
+offsetof(struct sigcontext,sc_mdhi)=512
+offsetof(struct sigcontext,sc_hi1)=520
+offsetof(struct sigcontext,sc_hi2)=528
+offsetof(struct sigcontext,sc_hi3)=536
+offsetof(struct sigcontext,sc_mdlo)=544
+offsetof(struct sigcontext,sc_lo1)=552
+offsetof(struct sigcontext,sc_lo2)=560
+offsetof(struct sigcontext,sc_lo3)=568
+offsetof(struct sigcontext,sc_pc)=576
+offsetof(struct sigcontext,sc_fpc_csr)=584
+offsetof(struct sigcontext,sc_used_math)=588
+offsetof(struct sigcontext,sc_dsp)=592
+offsetof(struct sigcontext,sc_reserved)=596
+--- siginfo offsets ---
+offsetof(siginfo_t,si_signo)=0
+offsetof(siginfo_t,si_errno)=8
+offsetof(siginfo_t,si_code)=4
+--- stat ---
+offsetof(struct stat,st_dev)=0
+offsetof(struct stat,st_ino)=24
+offsetof(struct stat,st_mode)=32
+offsetof(struct stat,st_nlink)=40
+offsetof(struct stat,st_uid)=48
+offsetof(struct stat,st_gid)=52
+offsetof(struct stat,st_size)=72
+offsetof(struct stat,st_blksize)=136
+offsetof(struct stat,st_blocks)=152
+--- constants ---
+_NSIG=128
+NSIG=128
+SIGRTMIN=34
+SIGRTMAX=127
+SI_QUEUE=-1
+--- sigset128 ---
+sigismember(1)=1
+sigismember(31)=1
+sigismember(32)=0
+sigismember(64)=1
+sigismember(120)=1
+sigismember(127)=1
+--- delivery SIGSEGV ---
+got_sig=11
+got_code=1
+seen_addr=0x0
+seen_pc=0x120004d28
+seen_sp=0xffffb5a6eb10
+seen_fpc_csr=0x0
+--- delivery SIGILL ---
+got_sig=4
+got_code=-6
+seen_addr=0x458
+seen_pc=0x1200138a4
+seen_sp=0xffffb5a6ea90
+seen_fpc_csr=0x0
+raw_sigprocmask_size16=0 errno=0
+raw_sigprocmask_size8=-1 errno=22
+kernel_sigset_bytes=16
+RESULT=PASS
