@@ -211,8 +211,11 @@ static void insert_region(mips64_ctx_t *ctx, uint64_t va, uint64_t len,
 
 /*
  * Map [va, va+len) inside the reservation with the given guest prot.
- * Both must be page aligned. The host mapping is MAP_FIXED anonymous
- * with PROT_EXEC stripped (W^X). Returns 0, -EINVAL, -EEXIST, -ENOMEM.
+ * The address must be page aligned; a positive length rounds up to a
+ * 4 KiB multiple for the mapped extent (contract section 2.1), so
+ * callers may pass byte-exact sizes. The host mapping is MAP_FIXED
+ * anonymous with PROT_EXEC stripped (W^X). Returns 0, -EINVAL,
+ * -EEXIST, -ENOMEM.
  */
 int mips_mem_map(mips64_ctx_t *ctx, uint64_t va, uint64_t len, uint32_t prot,
                  const char *tag)
@@ -222,14 +225,15 @@ int mips_mem_map(mips64_ctx_t *ctx, uint64_t va, uint64_t len, uint32_t prot,
     if (ctx == NULL || ctx->guest_base == 0U) {
         return -EINVAL;
     }
-    if (len == 0U || (va & (MIPS64_PAGE_SIZE - 1U)) != 0U ||
-        (len & (MIPS64_PAGE_SIZE - 1U)) != 0U) {
+    if (len == 0U || (va & (MIPS64_PAGE_SIZE - 1U)) != 0U) {
         return -EINVAL;
     }
     if ((prot & ~(MIPS_PROT_READ | MIPS_PROT_WRITE | MIPS_PROT_EXEC)) != 0U) {
         return -EINVAL;
     }
-    if (len > ctx->task_size || va > ctx->task_size - len) {
+    len = page_up(len);
+    if (len < MIPS64_PAGE_SIZE || len > ctx->task_size ||
+        va > ctx->task_size - len) {
         return -EINVAL;
     }
     {
@@ -296,7 +300,10 @@ int mips_mem_unmap(mips64_ctx_t *ctx, uint64_t va, uint64_t len)
 }
 
 /* Change protection on a fully mapped range; -ENOMEM when any byte is
- * unmapped. The host mapping keeps PROT_EXEC stripped (W^X). */
+ * unmapped. The host mapping keeps PROT_EXEC stripped (W^X). A zero
+ * length succeeds as a no-op and a positive length rounds up to a 4
+ * KiB multiple (contract section 2.1: `mprotect` alignment, `munmap`
+ * `len == 0` differs). */
 int mips_mem_protect(mips64_ctx_t *ctx, uint64_t va, uint64_t len,
                      uint32_t prot)
 {
@@ -306,14 +313,18 @@ int mips_mem_protect(mips64_ctx_t *ctx, uint64_t va, uint64_t len,
     if (ctx == NULL || ctx->guest_base == 0U) {
         return -EINVAL;
     }
-    if (len == 0U || (va & (MIPS64_PAGE_SIZE - 1U)) != 0U) {
+    if ((va & (MIPS64_PAGE_SIZE - 1U)) != 0U) {
         return -EINVAL;
     }
     if ((prot & ~(MIPS_PROT_READ | MIPS_PROT_WRITE | MIPS_PROT_EXEC)) != 0U) {
         return -EINVAL;
     }
+    if (len == 0U) {
+        return 0;
+    }
     len = page_up(len);
-    if (len > ctx->task_size || va > ctx->task_size - len) {
+    if (len < MIPS64_PAGE_SIZE || len > ctx->task_size ||
+        va > ctx->task_size - len) {
         return -EINVAL;
     }
     end = va + len;
