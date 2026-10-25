@@ -782,6 +782,13 @@ static int64_t mips_syscall_inner(mips64_ctx_t *ctx)
                              : MIPS64_NR_readlinkat)) {
         return mips_sc_readlinkat(ctx, a0, a1, a2, a3);
     }
+    if (nr == (uint64_t)(n32 ? MIPS64_NR32_readlink
+                             : MIPS64_NR_readlink)) {
+        /* Lane L5a: glibc readlink(2) still emits the legacy number
+         * (qemu-observed); serve it as readlinkat(AT_FDCWD). */
+        return mips_sc_readlinkat(ctx, (uint64_t)(int64_t)-100, a0, a1,
+                                  a2);
+    }
     if (nr == (uint64_t)(n32 ? MIPS64_NR32_access : MIPS64_NR_access)) {
         return mips_sc_access_at(ctx, (uint64_t)(int64_t)-100, a0, a1, 0U);
     }

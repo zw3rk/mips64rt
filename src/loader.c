@@ -13,10 +13,15 @@
  * ET_EXEC images load at their linked addresses; ET_DYN (static-PIE)
  * images take a fixed load bias. PT_LOAD segments are mapped writable
  * for the fill and dropped to their final protection afterwards; the
- * host side never gains PROT_EXEC (W^X). The initial stack (argc/argv/
- * envp/auxv incl. AT_PHDR/AT_ENTRY, AT_UID/AT_EUID/AT_GID/AT_EGID,
- * AT_CLKTCK=100) is built at the per-ABI stack top with the native
- * word size (8 bytes N64, 4 bytes N32) in guest byte order.
+ * host side never gains PROT_EXEC (W^X). A PT_INTERP image maps its
+ * named interpreter at a second fixed bias (per-ABI, see above),
+ * keeps AT_PHDR/PHENT/PHNUM on the exe while AT_ENTRY names the exe
+ * entry, adds AT_BASE (interpreter base) and AT_HWCAP2, and starts at
+ * the interpreter entry; ld.so does its own relocation. The initial
+ * stack (argc/argv/envp/auxv incl. AT_PHDR/AT_ENTRY,
+ * AT_UID/AT_EUID/AT_GID/AT_EGID, AT_CLKTCK=100) is built at the
+ * per-ABI stack top with the native word size (8 bytes N64, 4 bytes
+ * N32) in guest byte order.
  *
  * RC1 integration: expose _POSIX_C_SOURCE so musl sees clock_gettime
  * under strict -std=c11 (same pattern as src/main.c).
@@ -56,6 +61,16 @@ extern int mips_mem_protect(mips64_ctx_t *ctx, uint64_t va, uint64_t len,
 #define MIPS_PF_R 4U
 #define MIPS_EF_ABI 0x0000F000U
 #define MIPS_EF_ABI2 0x00000020U
+#define MIPS_PT_INTERP 3U
+
+/* Load bias for the PT_INTERP interpreter (ld.so, an ET_DYN image in
+ * practice), distinct from the exe ET_DYN bias above: the exe lives at
+ * 4 MiB while the interpreter lives at the frozen per-ABI bias from
+ * src/core/cpu.h (N64 0x7f00000000, N32 0x3f800000), so neither mapping
+ * can collide. Runtime mmap holes start at the per-ABI mmap base and
+ * the initial stack sits at the task top, keeping clear of both. */
+#define MIPS_INTERP_BIAS_N64 MIPS64_N64_INTERP_BIAS
+#define MIPS_INTERP_BIAS_N32 MIPS64_N32_INTERP_BIAS
 
 /* Fixed load bias for ET_DYN (static-PIE) guests. */
 #define MIPS_DYN_BIAS UINT64_C(0x400000)
@@ -79,6 +94,20 @@ extern int mips_mem_protect(mips64_ctx_t *ctx, uint64_t va, uint64_t len,
 #define MIPS_AT_SECURE 23U
 #define MIPS_AT_RANDOM 25U
 #define MIPS_AT_EXECFN 31U
+/* Dynamic-link tags handed to the interpreter (Linux generic values).
+ * AT_BASE names the interpreter load bias; AT_PHDR/PHENT/PHNUM keep
+ * describing the exe and AT_ENTRY keeps naming the exe entry, as the
+ * kernel does. */
+#define MIPS_AT_BASE 7U
+#define MIPS_AT_HWCAP2 26U
+
+/* Guest /proc/self interception (src/os/proc.c, lane L5a): the loader
+ * reports each exec (guest path + argv copy) and the exact auxv rows
+ * handed to the guest. proc.c is folded into the syscalls.c TU (the
+ * Makefile is frozen), so these are plain externs resolved at link. */
+extern void mips_proc_note_exec(const char *guest_path, int argc,
+                                char **argv, const mips64_ctx_t *ctx);
+extern void mips_proc_note_auxv(const uint64_t *pairs, size_t npairs);
 
 /* Guest prot bits (Linux asm-generic, shared with the target). */
 #define MIPS_PROT_READ 1U
@@ -359,9 +388,171 @@ static int parse_phdr(int fd, const ehdr_t *eh, uint16_t idx, phdr_t *ph)
     return 0;
 }
 
+/* Map every PT_LOAD of an already-open ELF image at bias (lane L5a
+ * helper: the exe and the PT_INTERP interpreter share this one W^X
+ * fill path). On success reports the segment end and the guest VA of
+ * the program-header table; on failure returns -1 with errno set and
+ * leaves fd open for the caller to close. */
+static int map_segments(mips64_ctx_t *ctx, int fd, const ehdr_t *eh,
+                        uint64_t bias, uint64_t *seg_end_out,
+                        uint64_t *phdr_out)
+{
+    uint64_t seg_end = 0U;
+    uint64_t phdr = 0U;
+    uint16_t i;
+
+    for (i = 0; i < eh->phnum; i++) {
+        phdr_t ph;
+        uint64_t va;
+        uint64_t page_off;
+        uint64_t map_va;
+        uint64_t map_len;
+        uint64_t filesz;
+        uint64_t memsz;
+        uint32_t prot;
+        uint8_t *dst;
+        int rc;
+
+        if (parse_phdr(fd, eh, i, &ph) != 0) {
+            errno = ENOEXEC;
+            return -1;
+        }
+        if (ph.type != MIPS_PT_LOAD) {
+            continue;
+        }
+        if (ph.memsz < ph.filesz || ph.memsz == 0U) {
+            errno = ENOEXEC;
+            return -1;
+        }
+        va = bias + ph.vaddr;
+        /* ELF congruence (p_offset == p_vaddr mod p_align) lets a
+         * toolchain pack a segment at an unaligned va; the host map
+         * is page granular, so map from the page floor and fill at
+         * the page offset. */
+        page_off = va & (MIPS64_PAGE_SIZE - 1U);
+        map_va = va - page_off;
+        map_len = (ph.memsz + page_off + (MIPS64_PAGE_SIZE - 1U)) &
+                  MIPS64_PAGE_MASK;
+        if (map_len == 0U || map_va + map_len < map_va ||
+            map_va + map_len > ctx->task_size) {
+            errno = ENOEXEC;
+            return -1;
+        }
+        /* RC1 integration: ELF p_flags number the corners oppositely
+         * to MIPS_PROT_* (PF_R=4 vs PROT_READ=1, PF_X=1 vs PROT_EXEC=4);
+         * translate explicitly, never by masking. */
+        prot = 0U;
+        if ((ph.flags & MIPS_PF_R) != 0U) {
+            prot |= MIPS_PROT_READ;
+        }
+        if ((ph.flags & MIPS_PF_W) != 0U) {
+            prot |= MIPS_PROT_WRITE;
+        }
+        if ((ph.flags & MIPS_PF_X) != 0U) {
+            prot |= MIPS_PROT_EXEC;
+        }
+        /* Map writable for the fill; final protection is enforced
+         * below once the segment body is in place. */
+        rc = mips_mem_map(ctx, map_va, map_len, prot | MIPS_PROT_WRITE,
+                          "elf");
+        if (rc != 0) {
+            errno = rc == -EEXIST ? EEXIST : ENOMEM;
+            return -1;
+        }
+        dst = (uint8_t *)mips64_guest_ptr(ctx, va);
+        filesz = ph.filesz;
+        if (filesz > 0U) {
+            uint64_t done = 0U;
+
+            while (done < filesz) {
+                uint64_t left = filesz - done;
+                size_t chunk =
+                    left > (uint64_t)0x40000000 ? 0x40000000U : (size_t)left;
+                ssize_t got = read_at(fd, dst + done, chunk,
+                                      ph.offset + done);
+
+                if (got != (ssize_t)chunk) {
+                    errno = got < 0 ? errno : ENOEXEC;
+                    return -1;
+                }
+                done += (uint64_t)chunk;
+            }
+        }
+        memsz = ph.memsz;
+        if (memsz > filesz) {
+            memset(dst + filesz, 0, (size_t)(memsz - filesz));
+        }
+        if ((prot & MIPS_PROT_WRITE) == 0U) {
+            rc = mips_mem_protect(ctx, map_va, map_len, prot);
+            if (rc != 0) {
+                errno = ENOMEM;
+                return -1;
+            }
+        }
+        if (va + memsz > seg_end) {
+            seg_end = va + memsz;
+        }
+        if (ph.offset <= eh->phoff &&
+            eh->phoff - ph.offset < ph.filesz) {
+            phdr = bias + ph.vaddr + (eh->phoff - ph.offset);
+        }
+    }
+    if (seg_end == 0U || phdr == 0U) {
+        errno = ENOEXEC;
+        return -1;
+    }
+    *seg_end_out = seg_end;
+    *phdr_out = phdr;
+    return 0;
+}
+
+/* Read the PT_INTERP pathname out of an already-open ELF image (guest
+ * coordinates). Returns 0 with the NUL-terminated path in out when the
+ * image names an interpreter, -1 otherwise (static image or
+ * truncation). Runs once per exec; the interpreter file itself is
+ * opened by the caller. */
+static int read_interp_path(int fd, const ehdr_t *eh, char *out, size_t cap)
+{
+    uint16_t i;
+
+    if (cap == 0U) {
+        return -1;
+    }
+    out[0] = '\0';
+    for (i = 0; i < eh->phnum; i++) {
+        phdr_t ph;
+        size_t k = 0U;
+
+        if (parse_phdr(fd, eh, i, &ph) != 0) {
+            return -1;
+        }
+        if (ph.type != MIPS_PT_INTERP) {
+            continue;
+        }
+        if (ph.filesz == 0U || ph.filesz >= (uint64_t)cap) {
+            return -1;
+        }
+        if (read_at(fd, out, (size_t)ph.filesz, ph.offset) !=
+            (ssize_t)ph.filesz) {
+            return -1;
+        }
+        out[ph.filesz] = '\0';
+        /* The table entry must be NUL-terminated inside filesz. */
+        while (k < (size_t)ph.filesz && out[k] != '\0') {
+            k++;
+        }
+        if (k >= (size_t)ph.filesz) {
+            return -1;
+        }
+        return out[0] != '\0' ? 0 : -1;
+    }
+    return -1;
+}
+
 static int build_stack(mips64_ctx_t *ctx, int argc, char **argv, char **envp,
                        uint64_t phdr_va, uint64_t phent, uint64_t phnum,
-                       uint64_t entry, const char *path)
+                       uint64_t entry, uint64_t interp_base, int have_interp,
+                       const char *path)
 {
     int w32 = ctx->is_n32 != 0U ? 1 : 0;
     uint64_t ws = w32 ? 4U : 8U;
@@ -394,10 +585,10 @@ static int build_stack(mips64_ctx_t *ctx, int argc, char **argv, char **envp,
         nenv++;
     }
     str_size += (uint64_t)str_len(path) + 1U + 16U;
-    /* 15 auxv rows (14 + AT_NULL): argc + argv[] + NULL + envp[] +
-     * NULL + auxv pairs. */
+    /* Auxv rows: 15 for static guests (14 + AT_NULL); the interpreter
+     * handoff adds AT_BASE + AT_HWCAP2 for 17 rows. */
     frame = ws + ws * ((uint64_t)argc + 1U) + ws * (kept + 1U) +
-            ws * 2U * 15U;
+            ws * 2U * (have_interp != 0 ? 17U : 15U);
     if (str_size + frame >= MIPS_STACK_SIZE) {
         errno = E2BIG;
         return -1;
@@ -459,7 +650,7 @@ static int build_stack(mips64_ctx_t *ctx, int argc, char **argv, char **envp,
         uint64_t off = 0U;
         uint64_t p = argv_base;
         uint64_t q = env_base;
-        uint64_t auxv[30];
+        uint64_t auxv[34];
         unsigned naux = 0U;
         unsigned r;
 
@@ -500,6 +691,15 @@ static int build_stack(mips64_ctx_t *ctx, int argc, char **argv, char **envp,
         AUX(MIPS_AT_SECURE, 0U);
         AUX(MIPS_AT_RANDOM, rnd_va);
         AUX(MIPS_AT_EXECFN, execfn_va);
+        /* Interpreter handoff (kernel behavior): AT_ENTRY above already
+         * names the exe entry while control transfers to the
+         * interpreter; AT_BASE names the interpreter load bias and
+         * AT_HWCAP2 completes the pair. AT_PHDR/PHENT/PHNUM keep
+         * describing the exe. */
+        if (have_interp != 0) {
+            AUX(MIPS_AT_BASE, interp_base);
+            AUX(MIPS_AT_HWCAP2, 0U);
+        }
         AUX(MIPS_AT_NULL, 0U);
 #undef AUX
         for (r = 0U; r < naux; r++) {
@@ -507,11 +707,16 @@ static int build_stack(mips64_ctx_t *ctx, int argc, char **argv, char **envp,
             off += ws;
         }
         /* Guest-visible auxv copy for the /proc/self layer (Phase 5);
-         * 15 rows fit the 64-entry buffer (30 used). */
+         * 17 rows fit the 64-entry buffer (34 used). */
         for (r = 0U; r < naux && r < 64U; r++) {
             ctx->auxv_data[r] = auxv[r];
         }
         ctx->auxv_bytes = (size_t)naux * sizeof(uint64_t);
+        /* Hand the guest-visible state to the /proc/self layer: a copy
+         * of the argv strings (the caller's vectors may be freed after
+         * exec) and the exact auxv rows placed on the stack. */
+        mips_proc_note_exec(path, argc, argv, ctx);
+        mips_proc_note_auxv(auxv, (size_t)naux / 2U);
     }
     ctx->gpr[MIPS64_REG_SP] = sp;
     ctx->stack_top = stack_top;
@@ -527,8 +732,11 @@ int mips_load_elf(mips64_ctx_t *ctx, const char *path, char **argv,
     uint64_t seg_end = 0U;
     uint64_t phdr = 0U;
     uint64_t entry;
-    uint16_t i;
+    uint64_t interp_base = 0U;
+    uint64_t interp_entry = 0U;
+    char interp_guest[4096];
     int kind;
+    int have_interp = 0;
     int argc = 0;
     int fd;
 
@@ -568,113 +776,51 @@ int mips_load_elf(mips64_ctx_t *ctx, const char *path, char **argv,
                                        : MIPS64_N64_MMAP_BASE;
     ctx->mmap_cursor = ctx->mmap_base;
     bias = eh.type == MIPS_ET_DYN ? MIPS_DYN_BIAS : 0U;
-    for (i = 0; i < eh.phnum; i++) {
-        phdr_t ph;
-        uint64_t va;
-        uint64_t page_off;
-        uint64_t map_va;
-        uint64_t map_len;
-        uint64_t filesz;
-        uint64_t memsz;
-        uint32_t prot;
-        uint8_t *dst;
-        int rc;
-
-        if (parse_phdr(fd, &eh, i, &ph) != 0) {
-            close(fd);
-            errno = ENOEXEC;
-            return -1;
-        }
-        if (ph.type != MIPS_PT_LOAD) {
-            continue;
-        }
-        if (ph.memsz < ph.filesz || ph.memsz == 0U) {
-            close(fd);
-            errno = ENOEXEC;
-            return -1;
-        }
-        va = bias + ph.vaddr;
-        /* ELF congruence (p_offset == p_vaddr mod p_align) lets a
-         * toolchain pack a segment at an unaligned va; the host map
-         * is page granular, so map from the page floor and fill at
-         * the page offset. */
-        page_off = va & (MIPS64_PAGE_SIZE - 1U);
-        map_va = va - page_off;
-        map_len = (ph.memsz + page_off + (MIPS64_PAGE_SIZE - 1U)) &
-                  MIPS64_PAGE_MASK;
-        if (map_len == 0U || map_va + map_len < map_va ||
-            map_va + map_len > ctx->task_size) {
-            close(fd);
-            errno = ENOEXEC;
-            return -1;
-        }
-        /* RC1 integration: ELF p_flags number the corners oppositely
-         * to MIPS_PROT_* (PF_R=4 vs PROT_READ=1, PF_X=1 vs PROT_EXEC=4);
-         * translate explicitly, never by masking. */
-        prot = 0U;
-        if ((ph.flags & MIPS_PF_R) != 0U) {
-            prot |= MIPS_PROT_READ;
-        }
-        if ((ph.flags & MIPS_PF_W) != 0U) {
-            prot |= MIPS_PROT_WRITE;
-        }
-        if ((ph.flags & MIPS_PF_X) != 0U) {
-            prot |= MIPS_PROT_EXEC;
-        }
-        /* Map writable for the fill; final protection is enforced
-         * below once the segment body is in place. */
-        rc = mips_mem_map(ctx, map_va, map_len, prot | MIPS_PROT_WRITE,
-                          "elf");
-        if (rc != 0) {
-            close(fd);
-            errno = rc == -EEXIST ? EEXIST : ENOMEM;
-            return -1;
-        }
-        dst = (uint8_t *)mips64_guest_ptr(ctx, va);
-        filesz = ph.filesz;
-        if (filesz > 0U) {
-            uint64_t done = 0U;
-
-            while (done < filesz) {
-                uint64_t left = filesz - done;
-                size_t chunk =
-                    left > (uint64_t)0x40000000 ? 0x40000000U : (size_t)left;
-                ssize_t got = read_at(fd, dst + done, chunk,
-                                      ph.offset + done);
-
-                if (got != (ssize_t)chunk) {
-                    close(fd);
-                    errno = got < 0 ? errno : ENOEXEC;
-                    return -1;
-                }
-                done += (uint64_t)chunk;
-            }
-        }
-        memsz = ph.memsz;
-        if (memsz > filesz) {
-            memset(dst + filesz, 0, (size_t)(memsz - filesz));
-        }
-        if ((prot & MIPS_PROT_WRITE) == 0U) {
-            rc = mips_mem_protect(ctx, map_va, map_len, prot);
-            if (rc != 0) {
-                close(fd);
-                errno = ENOMEM;
-                return -1;
-            }
-        }
-        if (va + memsz > seg_end) {
-            seg_end = va + memsz;
-        }
-        if (ph.offset <= eh.phoff &&
-            eh.phoff - ph.offset < ph.filesz) {
-            phdr = bias + ph.vaddr + (eh.phoff - ph.offset);
-        }
-    }
-    close(fd);
-    if (seg_end == 0U || phdr == 0U) {
-        errno = ENOEXEC;
+    if (map_segments(ctx, fd, &eh, bias, &seg_end, &phdr) != 0) {
+        close(fd);
         return -1;
     }
+    /* PT_INTERP: map the named interpreter at its own load bias and
+     * transfer control to it. AT_ENTRY keeps naming the exe entry and
+     * AT_PHDR/PHENT/PHNUM keep describing the exe (kernel behavior);
+     * only pc and the new AT_BASE point at the interpreter. No
+     * DT_NEEDED/relocation engine: ld.so relocates itself. The heap
+     * stays after the exe (as on Linux), not after the interpreter
+     * image mapped above it. */
+    if (read_interp_path(fd, &eh, interp_guest, sizeof interp_guest) == 0) {
+        ehdr_t ieh;
+        uint64_t ibias;
+        uint64_t iseg_end = 0U;
+        uint64_t iphdr = 0U;
+        int ifd = open(interp_guest, O_RDONLY);
+
+        if (ifd < 0) {
+            int e = errno;
+
+            close(fd);
+            errno = e;
+            return -1;
+        }
+        if (parse_ehdr(ifd, &ieh) != 0 || classify(&ieh) != kind) {
+            close(ifd);
+            close(fd);
+            errno = ENOEXEC;
+            return -1;
+        }
+        ibias = ieh.type == MIPS_ET_DYN ?
+            (ctx->is_n32 != 0U ? MIPS_INTERP_BIAS_N32 :
+                                 MIPS_INTERP_BIAS_N64) : 0U;
+        if (map_segments(ctx, ifd, &ieh, ibias, &iseg_end, &iphdr) != 0) {
+            close(ifd);
+            close(fd);
+            return -1;
+        }
+        close(ifd);
+        interp_entry = ibias + ieh.entry;
+        interp_base = ibias;
+        have_interp = 1;
+    }
+    close(fd);
     entry = bias + eh.entry;
     ctx->elf_base = bias;
     ctx->elf_entry = entry;
@@ -682,10 +828,12 @@ int mips_load_elf(mips64_ctx_t *ctx, const char *path, char **argv,
                     MIPS64_PAGE_MASK;
     ctx->brk_curr = ctx->brk_base;
     if (build_stack(ctx, argc, argv, envp, phdr, eh.is64 ? 56U : 32U,
-                      (uint64_t)eh.phnum, entry, path) != 0) {
+                      (uint64_t)eh.phnum, entry, interp_base, have_interp,
+                      path) != 0) {
         return -1;
     }
-    ctx->pc = entry;
-    ctx->next_pc = entry + 4U;
+    ctx->interp_base = have_interp != 0 ? interp_base : 0U;
+    ctx->pc = have_interp != 0 ? interp_entry : entry;
+    ctx->next_pc = (have_interp != 0 ? interp_entry : entry) + 4U;
     return 0;
 }
