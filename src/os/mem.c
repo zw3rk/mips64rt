@@ -33,6 +33,18 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+/* Phase 7 H1: DBT SMC hook. Weak default here so dbt-less unit links
+ * (the test_decode host check, macOS ld has no ELF-style weak-undefined
+ * reference) keep working; the strong definition in src/dbt/dbt.c
+ * overrides it in the real translator, where the hook always fires.
+ * Hooks fire only on map/protect/unmap — never on the common
+ * store path. */
+__attribute__((weak)) void dbt_invalidate_range(uint64_t va, uint64_t len)
+{
+    (void)va;
+    (void)len;
+}
+
 /* macOS hides MAP_NORESERVE under strict feature macros; the reservation
  * is an overcommit hint only, so degrading to 0 there is correct. */
 #ifndef MAP_NORESERVE
@@ -256,6 +268,7 @@ int mips_mem_map(mips64_ctx_t *ctx, uint64_t va, uint64_t len, uint32_t prot,
         return -ENOMEM;
     }
     insert_region(ctx, va, len, prot, tag);
+    dbt_invalidate_range(va, len);
     return 0;
 }
 
@@ -296,6 +309,7 @@ int mips_mem_unmap(mips64_ctx_t *ctx, uint64_t va, uint64_t len)
     ctx->region_count = w;
     (void)mmap((void *)(uintptr_t)(ctx->guest_base + va), (size_t)len,
                PROT_NONE, MAP_PRIVATE | MAP_FIXED | MAP_ANONYMOUS, -1, 0);
+    dbt_invalidate_range(va, len);
     return 0;
 }
 
@@ -346,6 +360,7 @@ int mips_mem_protect(mips64_ctx_t *ctx, uint64_t va, uint64_t len,
                  host_prot(prot)) != 0) {
         return -ENOMEM;
     }
+    dbt_invalidate_range(va, len);
     return 0;
 }
 
