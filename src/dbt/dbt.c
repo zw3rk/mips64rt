@@ -80,7 +80,7 @@ void dbt_invalidate_range(uint64_t va, uint64_t len)
     (void)len;
     /* Range-granular SMC tracking lands with the L2a syscall hooks; a
      * full epoch bump keeps every stale translation unreachable, and
-     * the per-block guest-word hash below retires translations
+     * the per-entry guest-word snapshot below retires translations
      * clobbered by plain stores without any hook. */
     dbt_invalidate_all();
 }
@@ -141,9 +141,19 @@ typedef struct {
     uint64_t pc;
     dbt_block_t blk;   /* frozen shape: pc/end/code/len/smc_version */
     uint64_t epoch;    /* `dbt_smc_epoch` at compile time */
-    uint64_t sum;      /* FNV-1a hash of the guest words compiled from */
+    uint32_t *snap;    /* malloc'd copy of the covered guest words */
     int fallback;      /* set: run `interp_step`, never native code */
 } dbt_entry_t;
+
+/* Release an entry snapshot (evict/decline overwrite, code mappings
+ * are intentionally retained per the RC2 1024-entry bound). */
+static void dbt_snap_drop(dbt_entry_t *e)
+{
+    if (e != NULL && e->snap != NULL) {
+        free(e->snap);
+        e->snap = NULL;
+    }
+}
 
 static dbt_entry_t block_cache[MIPS64_DBT_CACHE_ENTRIES];
 static uint64_t ras[MIPS64_DBT_RAS_ENTRIES];
@@ -181,46 +191,41 @@ static void ibtc_insert(mips64_ctx_t *ctx, uint64_t guest, void *host)
     slots[ibtc_index(guest)].host = host;
 }
 
-/* FNV-1a hash of the guest words [`va`, `end`) the way the compile
- * scan fetches them (`mips_fetch`, endianness-aware). Returns 0 when
- * the range is not fully readable (treat as a lookup miss: the
- * dispatcher retranslates, and `interp` raises the guest fault). The
- * byte order folded here is canonical, so LE/BE guests hash stably. */
-static int dbt_guest_sum(mips64_ctx_t *ctx, uint64_t va, uint64_t end,
-                         uint64_t *out)
+/* Snapshot match for one cache entry: a single cover check plus a
+ * host-side memcmp of the covered guest words. Same detection power
+ * as the old per-word fetch+hash (any clobbering plain store
+ * retires the translation), at one lock acquisition and no fetch
+ * calls: the per-entry O(block) scan with per-word overhead is what
+ * kept `dbt` below `interp` on branch-heavy code (lane H3). Returns
+ * 0 when the range is not fully readable (lookup miss: the
+ * dispatcher retranslates, and `interp` raises the guest fault). */
+static int dbt_snap_match(mips64_ctx_t *ctx, const dbt_entry_t *e)
 {
-    uint64_t h = UINT64_C(1469598103934665603);
-    unsigned k;
+    uint64_t len;
+    const void *cur;
 
-    for (; va < end; va += (uint64_t)4) {
-        uint32_t w = 0u;
-
-        if (mips_fetch(ctx, va, &w) != 0)
-            return 0;
-        for (k = 0; k < 4u; k++) {
-            h ^= (uint64_t)((w >> (8u * k)) & 0xffu);
-            h *= UINT64_C(1099511628211);
-        }
-    }
-    *out = h;
-    return 1;
+    if (e->snap == NULL || e->blk.guest_end <= e->blk.guest_pc)
+        return 0;
+    len = e->blk.guest_end - e->blk.guest_pc;
+    if (!mips_mem_ok(ctx, e->blk.guest_pc, len, MIPS_PROT_READ))
+        return 0;
+    cur = mips64_guest_ptr(ctx, e->blk.guest_pc);
+    return memcmp(cur, e->snap, (size_t)len) == 0;
 }
 
 /* Validate one cache entry: epoch match plus, for native entries, a
- * guest-word hash match (retires translations clobbered by plain
- * stores with no remap epoch bump). Negative entries need no hash:
+ * guest-word snapshot match (retires translations clobbered by plain
+ * stores with no remap epoch bump). Negative entries need no check:
  * the `interp_step` fallback always reads current bytes. */
 static dbt_entry_t *lookup_entry(mips64_ctx_t *ctx, uint64_t pc)
 {
     dbt_entry_t *e = &block_cache[cache_index(pc)];
-    uint64_t sum;
 
     if (!e->used || e->pc != pc || e->epoch != dbt_smc_epoch)
         return NULL;
     if (e->fallback || e->blk.code == NULL)
         return e;
-    if (!dbt_guest_sum(ctx, e->blk.guest_pc, e->blk.guest_end, &sum) ||
-        sum != e->sum)
+    if (!dbt_snap_match(ctx, e))
         return NULL;
     return e;
 }
@@ -299,7 +304,7 @@ static int compile_decline(mips64_ctx_t *ctx, uint64_t pc)
     e->blk.code_len = 0;
     e->blk.smc_version = (uint32_t)dbt_smc_epoch;
     e->epoch = dbt_smc_epoch;
-    e->sum = 0;
+    dbt_snap_drop(e);
     e->fallback = 1;
     return 1;
 }
@@ -308,6 +313,7 @@ int dbt_compile(mips64_ctx_t *ctx, uint64_t pc)
 {
     static uint32_t staging[MIPS64_DBT_STAGING_WORDS];
     mips_dec_t insns[MIPS64_DBT_MAX_INSNS];
+    uint32_t raw[MIPS64_DBT_MAX_INSNS];
     dbt_entry_t *slot;
     uint64_t start_page;
     uint64_t cur;
@@ -344,6 +350,7 @@ int dbt_compile(mips64_ctx_t *ctx, uint64_t pc)
         mips_decode(word, d);
         if (is_fp_coproc(d))
             return compile_decline(ctx, pc);
+        raw[n] = word;
         n++;
         cur += 4u;
         if (is_bare_ender(d) || mips_is_trap(d))
@@ -363,6 +370,7 @@ int dbt_compile(mips64_ctx_t *ctx, uint64_t pc)
             mips_decode(word, s);
             if (is_fp_coproc(s))
                 return compile_decline(ctx, pc);
+            raw[n] = word;
             n++;
             cur += 4u;
             break;
@@ -377,12 +385,18 @@ int dbt_compile(mips64_ctx_t *ctx, uint64_t pc)
         return compile_decline(ctx, pc);
     {
         void *host = dbt_code_publish((const uint8_t *)staging, out_len);
-        uint64_t sum = 0u;
+        size_t words = (size_t)(out_end - pc) / 4u;
+        uint32_t *snap = NULL;
 
         if (host == NULL)
             return 1; /* Resource exhaustion: retry later, cache nothing. */
-        if (!dbt_guest_sum(ctx, pc, out_end, &sum))
-            return 1;
+        if (words == 0u || words > MIPS64_DBT_MAX_INSNS)
+            return compile_decline(ctx, pc);
+        snap = (uint32_t *)malloc(words * sizeof *snap);
+        if (snap == NULL)
+            return 1; /* Retry later, cache nothing. */
+        memcpy(snap, raw, words * sizeof *snap);
+        dbt_snap_drop(slot);
         slot->used = 1;
         slot->pc = pc;
         slot->blk.guest_pc = pc;
@@ -391,7 +405,7 @@ int dbt_compile(mips64_ctx_t *ctx, uint64_t pc)
         slot->blk.code_len = out_len;
         slot->blk.smc_version = (uint32_t)dbt_smc_epoch;
         slot->epoch = dbt_smc_epoch;
-        slot->sum = sum;
+        slot->snap = snap;
         slot->fallback = 0;
         ibtc_insert(ctx, pc, host);
         ctx->blocks_compiled++;
@@ -533,6 +547,11 @@ int dbt_run(mips64_ctx_t *ctx)
                 return rc;
         }
     }
+    /* Guard installed once per run (idempotent): the reservation base
+     * is fixed for the run, so per-block install only paid a mutex
+     * round-trip per translated block (lane H3). */
+    mips_hostfault_install((const void *)(uintptr_t)ctx->guest_base,
+                           ctx->task_size);
     for (;;) {
         uint64_t pc = ctx->pc;
         dbt_entry_t *e;
@@ -570,8 +589,6 @@ int dbt_run(mips64_ctx_t *ctx)
                 return rc;
             continue;
         }
-        mips_hostfault_install((const void *)(uintptr_t)ctx->guest_base,
-                               ctx->task_size);
         dbt_ge.base = ctx->guest_base;
         dbt_ge.code = code;
         dbt_ge.ex = MIPS64_DBT_EXIT_FAULT;

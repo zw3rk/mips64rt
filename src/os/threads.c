@@ -415,7 +415,12 @@ void mips_thread_exit(mips64_ctx_t *ctx, int status)
 /* Size check for the pedantic-safe void * -> function pointer copy. */
 typedef void (*l4b_code_t)(mips64_ctx_t *);
 
-static _Thread_local sigjmp_buf l4b_jb;
+/* Plain jump buffer (no signal-mask save): the dispatcher mask is
+ * constant across blocks, and the handler unblocks the fault signals
+ * itself before jumping, so per-block entry pays register saves only
+ * instead of a sigprocmask round-trip (lane H3: the mask save cost
+ * more than the translated block on branch-heavy code). */
+static _Thread_local jmp_buf l4b_jb;
 static _Thread_local volatile sig_atomic_t l4b_armed = 0;
 static _Thread_local int l4b_fault_sig = 0;
 static _Thread_local uint64_t l4b_fault_addr = 0U;
@@ -462,13 +467,23 @@ static void l4b_handler(int sig, siginfo_t *si, void *uc)
     inside = (l4b_pool == NULL) ||
              (addr >= base && addr - base < (uintptr_t)l4b_pool_len);
     if (l4b_armed != 0 && inside) {
+        sigset_t unblock;
+
+        /* The plain setjmp above saves no mask, and this signal is
+         * blocked for the handler's duration: unblock here (async
+         * safe) so a later fault still reaches this handler instead
+         * of killing the process with the signal blocked. */
+        (void)sigemptyset(&unblock);
+        (void)sigaddset(&unblock, SIGSEGV);
+        (void)sigaddset(&unblock, SIGBUS);
+        (void)sigprocmask(SIG_UNBLOCK, &unblock, NULL);
         l4b_fault_sig = sig;
         /* Report the pool-relative offset: the coordinator installs
          * the guard over the guest reservation, so this is the guest
          * VA the faulting access targeted. */
         l4b_fault_addr = (l4b_pool == NULL) ? (uint64_t)addr :
             (uint64_t)(addr - base);
-        siglongjmp(l4b_jb, 1);
+        longjmp(l4b_jb, 1);
     }
     l4b_forward(sig, si, uc);
 }
@@ -521,7 +536,7 @@ int mips_hostfault_run(mips64_ctx_t *ctx, void *code, uint32_t *reasonp)
     l4b_armed = 1;
     l4b_fault_sig = 0;
     l4b_fault_addr = 0U;
-    if (sigsetjmp(l4b_jb, 1) == 0) {
+    if (setjmp(l4b_jb) == 0) {
         fn(ctx);
         l4b_armed = 0;
         if (reasonp != NULL) {
