@@ -69,9 +69,9 @@ Write `docs/lanes/phase-4.md` and run concurrent lanes `L4a..L4c`:
 
 ### Phase 5 — Dynamic Linking (`PT_INTERP`), `BusyBox`, & Target `libc` Matrix (`RC5`)
 Write `docs/lanes/phase-5.md` and run concurrent lanes `L5a..L5b`:
-- [ ] **Lane `L5a`**: `PT_INTERP` dynamic loader (`ld.so`) mapping, complete auxiliary vector (`AT_PHDR`, `AT_ENTRY`, `AT_BASE`, `AT_HWCAP`, `AT_HWCAP2`, `AT_RANDOM`, `AT_EXECFN`), and `/proc/self/{exe,maps,cmdline,stat,auxv}` interception.
-- [ ] **Lane `L5b`**: Dynamic `test_p5_dyn` (`dlopen`/`dlsym`, TLS `__thread`, shared library calls) and target `BusyBox` qualification (`sh -c 'ls / && echo ok | wc -c'`).
-- [ ] **Gate `RC5`**: Dynamic `test_p5_dyn` and `BusyBox` match `qemu-mips64el (and qemu-mips64 / qemu-mipsn32el)` on both `interp` and `dbt`.
+- [x] **Lane `L5a`**: `PT_INTERP` dynamic loader (`ld.so`) mapping, complete auxiliary vector (`AT_PHDR`, `AT_ENTRY`, `AT_BASE`, `AT_HWCAP`, `AT_HWCAP2`, `AT_RANDOM`, `AT_EXECFN`), and `/proc/self/{exe,maps,cmdline,stat,auxv}` interception.
+- [x] **Lane `L5b`**: Dynamic `test_p5_dyn` (`dlopen`/`dlsym`, TLS `__thread`, shared library calls) and target `BusyBox` qualification (`sh -c 'ls / && echo ok | wc -c'`).
+- [x] **Gate `RC5`**: Dynamic `test_p5_dyn` and `BusyBox` match `qemu-mips64el (and qemu-mips64 / qemu-mipsn32el / qemu-mipsn32)` on both `interp` and `dbt` (`run_p5_busybox.sh` 17/17 PASS; P1/P3/P4 re-runs green with interp==dbt byte-identical).
 
 ### Phase 6 — `hyper-linux` (`hl`) Host Contract & Dual-Host Parity (`RC6`)
 Write `docs/lanes/phase-6.md` and run lanes `L6a..L6b`:
