@@ -858,14 +858,13 @@ int interp_step(mips64_ctx_t *ctx)
 {
     uint64_t pc = ctx->pc;
     mips_dec_t d;
-    int rc;
+    int rc = fetch_decode(ctx, pc, &d);
 
-    if (fetch_decode(ctx, pc, &d) != 0) {
-        return MIPS_FAULT;
-    }
-    if (interp_is_control(&d)) {
+    /* A fetch fault that delivered a signal (moved pc, exit NONE)
+     * resumes at the handler via the RC4 check below. */
+    if (rc == 0 && interp_is_control(&d)) {
         rc = exec_branch(ctx, pc, &d);
-    } else {
+    } else if (rc == 0) {
         rc = exec_simple(ctx, pc, &d);
         if (rc == 0) {
             ctx->pc = pc + 4u;

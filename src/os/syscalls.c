@@ -190,7 +190,10 @@ int64_t guest_str(mips64_ctx_t *ctx, uint64_t va, char *out)
 }
 
 /* Master MIPS -> host open-flag table; each caller passes its allowed
- * subset. O_LARGEFILE is dropped (64-bit host: always largefile). */
+ * subset. O_LARGEFILE is dropped (64-bit host: always largefile).
+ * O_TMPFILE is absent here on purpose (see map_open_flags): it is the
+ * combination O_DIRECTORY | __O_TMPFILE, and a subset test would also
+ * fire on a plain O_DIRECTORY. */
 static const struct {
     uint64_t mf;
     int hf;
@@ -201,14 +204,13 @@ static const struct {
     { MIPS_O_DIRECT, O_DIRECT }, { MIPS_O_DIRECTORY, O_DIRECTORY },
     { MIPS_O_NOFOLLOW, O_NOFOLLOW }, { MIPS_O_CLOEXEC, O_CLOEXEC },
     { MIPS_O_NOATIME, O_NOATIME }, { MIPS_O_PATH, O_PATH },
-    { MIPS_O_TMPFILE, O_TMPFILE },
 };
 
 /* Translate mf (masked to allowed) to host flags; -EINVAL on the rest. */
 static int64_t map_open_flags(uint64_t mf, uint64_t allowed, int *host_out)
 {
     uint64_t known = (uint64_t)(MIPS_O_ACCMODE | MIPS_O_SYNC |
-        MIPS_O_DSYNC | MIPS_O_LARGEFILE);
+        MIPS_O_DSYNC | MIPS_O_LARGEFILE | MIPS_O_TMPFILE);
     size_t i;
     int h;
 
@@ -218,7 +220,19 @@ static int64_t map_open_flags(uint64_t mf, uint64_t allowed, int *host_out)
     if ((mf & ~known) != 0U || (mf & ~allowed) != 0U) {
         return -(int64_t)EINVAL;
     }
+    /* O_TMPFILE is O_DIRECTORY | __O_TMPFILE on both sides; the table
+     * loop below tests subsets, so a plain O_DIRECTORY would also
+     * match a TMPFILE row and poison the host flags with __O_TMPFILE
+     * (the kernel then fails the open with EINVAL: O_TMPFILE demands
+     * write access). Require the full combination here; a lone
+     * __O_TMPFILE bit is EINVAL on Linux, so reject it the same way. */
     h = (int)(mf & (uint64_t)MIPS_O_ACCMODE);
+    if ((mf & (uint64_t)MIPS_O_TMPFILE) == (uint64_t)MIPS_O_TMPFILE) {
+        h |= O_TMPFILE;
+    } else if ((mf & (uint64_t)(MIPS_O_TMPFILE ^ MIPS_O_DIRECTORY)) !=
+               0U) {
+        return -(int64_t)EINVAL;
+    }
     if ((mf & (uint64_t)MIPS_O_SYNC) != 0U) {
         h |= O_SYNC;
     } else if ((mf & (uint64_t)MIPS_O_DSYNC) != 0U) {

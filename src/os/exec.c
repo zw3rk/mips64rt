@@ -38,6 +38,14 @@
  * request is refused with -EPERM. On failure the previous image is
  * restored intact and a negative errno is returned with the $a3 = 1 /
  * $v0 = +errno convention.
+ *
+ * A file the loader rejects as "not a MIPS image" (ENOEXEC: host-arch
+ * ELF, script, directory) falls through to a host execve (qemu-user
+ * behavior): the translator process is already the forked child, so
+ * replacing it is exactly right, and the parent's wait4/waitid
+ * collects the host exit. Host-only env (LD_*, MIPS64RT_*) is
+ * scrubbed from the delegated vector so a stale guest LD_PRELOAD
+ * cannot divert the host binary.
  */
 #define _GNU_SOURCE
 
@@ -60,6 +68,8 @@
 /* Loader entry (src/loader.c, lane L1c). Rebuilds stack/auxv and sets pc. */
 extern int mips_load_elf(mips64_ctx_t *ctx, const char *path, char **argv,
                          char **envp);
+/* Guest exe path noted by the /proc/self layer (src/os/proc.c). */
+extern const char *mips_proc_exe_path(void);
 /* Guest window + endian-aware accessors (src/os/mem.c, lane L1c). */
 extern int mips_mem_ok(const mips64_ctx_t *ctx, uint64_t va, uint64_t len,
                        uint32_t need);
@@ -368,9 +378,9 @@ int64_t mips_sc_exec(mips64_ctx_t *ctx, uint64_t nr, uint64_t path_va,
             return exec_ret(ctx, -(int64_t)EBADF);
         }
     } else {
-        if (a3 != 0U || a4 != 0U) {
-            return exec_ret(ctx, -(int64_t)EINVAL);
-        }
+        /* execve takes three arguments; $a3/$a4 ($7/$8) hold caller
+         * residue the kernel never reads, so they must not be
+         * validated (busybox faults otherwise while qemu passes). */
         path = path_va;
         argv = argv_va;
         envp = envp_va;
@@ -387,6 +397,23 @@ int64_t mips_sc_exec(mips64_ctx_t *ctx, uint64_t nr, uint64_t path_va,
     }
     if (path_buf[0] == '\0') {
         return exec_ret(ctx, -(int64_t)ENOENT);
+    }
+    /* /proc/self/exe names the current guest image (qemu-user re-execs
+     * the guest, never the host translator). Resolve it through the
+     * noted guest path before the loader opens anything: opening the
+     * host's /proc/self/exe would admit the translator itself. */
+    if (strcmp(path_buf, "/proc/self/exe") == 0) {
+        const char *exe = mips_proc_exe_path();
+        size_t k = 0U;
+
+        if (exe == NULL) {
+            return exec_ret(ctx, -(int64_t)ENOENT);
+        }
+        while (exe[k] != '\0' && k + 1U < sizeof path_buf) {
+            path_buf[k] = exe[k];
+            k++;
+        }
+        path_buf[k] = '\0';
     }
     rc = copy_guest_vec(ctx, argv, &host_argv, &argc, &budget, 1);
     if (rc != 0) {
@@ -409,8 +436,6 @@ int64_t mips_sc_exec(mips64_ctx_t *ctx, uint64_t nr, uint64_t path_va,
     old_base = backup->guest_base;
     old_size = backup->task_size;
     rc = mips_load_elf(ctx, path_buf, host_argv, host_envp);
-    free_vec(host_argv, argc);
-    free_vec(host_envp, envc);
     if (rc != 0) {
         int e = errno != 0 ? errno : ENOEXEC;
         /* Tear down the partial new window, restore the old image. */
@@ -419,12 +444,37 @@ int64_t mips_sc_exec(mips64_ctx_t *ctx, uint64_t nr, uint64_t path_va,
                          (size_t)ctx->task_size);
         }
         memcpy(ctx, backup, sizeof *backup);
+        /* Not a MIPS image: delegate to the host kernel (scripts run
+         * through their #! line there). The restore above runs first
+         * so a failed host exec still returns with the old image
+         * intact; on success this process is replaced outright. */
+        if (e == ENOEXEC) {
+            size_t w = 0U;
+            size_t r;
+
+            for (r = 0U; r < envc; r++) {
+                if (strncmp(host_envp[r], "LD_", 3) != 0 &&
+                    strncmp(host_envp[r], "MIPS64RT_", 9) != 0) {
+                    host_envp[w++] = host_envp[r];
+                } else {
+                    free(host_envp[r]);
+                }
+            }
+            host_envp[w] = NULL;
+            envc = w;
+            (void)execve(path_buf, host_argv, host_envp);
+            e = errno != 0 ? errno : ENOEXEC;
+        }
+        free_vec(host_argv, argc);
+        free_vec(host_envp, envc);
         free(backup);
         if (e == 38) {
             e = 89;
         }
         return exec_ret(ctx, -(int64_t)e);
     }
+    free_vec(host_argv, argc);
+    free_vec(host_envp, envc);
     /* Old reservation is now orphaned (the loader zeroed ctx first):
      * release it; the new window owns the address space. */
     if (old_base != 0U && old_size != 0U && old_base != ctx->guest_base) {

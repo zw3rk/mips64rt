@@ -165,6 +165,14 @@ void mips_proc_note_exec(const char *guest_path, int argc, char **argv,
     proc_ctx = ctx;
 }
 
+/* Current guest executable path for /proc/self/exe resolution (used
+ * by exec: qemu-user re-execs the guest image, never the host
+ * translator). NULL when nothing has been noted yet. */
+const char *mips_proc_exe_path(void)
+{
+    return proc_exe[0] != '\0' ? proc_exe : NULL;
+}
+
 void mips_proc_note_auxv(const uint64_t *pairs, size_t npairs)
 {
     size_t n = npairs > 20U ? 20U : npairs;

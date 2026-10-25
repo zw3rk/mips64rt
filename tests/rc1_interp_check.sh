@@ -32,6 +32,13 @@
 # Tripwire: each variant must show exactly 2 worker fault lines
 # (one per deferred child); more means a new fault is hiding behind
 # the filter.
+#
+# Post-RC4 update (Phase 5): signal delivery is live (pageend and the
+# SIGBUS child now run their guest handlers), so the worker reports
+# no faults and the tripwire below expects 0. The pageend-offset
+# value itself stays engine-specific by test design (qemu records
+# the translated delay-slot fetch at +4; a correct engine faults on
+# the annulled fall-through at +8), so it remains filtered.
 set -u
 ROOT="$(cd "$(dirname "$0")/.." || exit 1; pwd)"
 T="$ROOT/tests"
@@ -104,8 +111,8 @@ for v in n64be n32be; do
 	grep -v '^P1-EXIT: ' "$golden" | filter_deferred >"$tmp_golden"
 	filter_deferred "$interp" >"$tmp_interp"
 	faults=$(grep -c '^mips64rt: guest fault at pc=' "$interp" || true)
-	if [ "$faults" != "2" ]; then
-		echo "RC1 $v: want exactly 2 deferred signal faults, saw $faults"
+	if [ "$faults" != "0" ]; then
+		echo "RC1 $v: want no worker faults post-RC4, saw $faults"
 		fails=$((fails + 1))
 	fi
 	if cmp -s "$tmp_golden" "$tmp_interp"; then
@@ -129,8 +136,8 @@ for v in n64le n32le; do
 	grep -v '^P1-EXIT: ' "$golden" | filter_deferred >"$tmp_golden"
 	filter_deferred "$interp" >"$tmp_interp"
 	faults=$(grep -c '^mips64rt: guest fault at pc=' "$interp" || true)
-	if [ "$faults" != "2" ]; then
-		echo "RC1 $v: want exactly 2 deferred signal faults, saw $faults"
+	if [ "$faults" != "0" ]; then
+		echo "RC1 $v: want no worker faults post-RC4, saw $faults"
 		fails=$((fails + 1))
 	fi
 	if cmp -s "$tmp_golden" "$tmp_interp"; then
