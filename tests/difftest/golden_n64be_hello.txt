@@ -1,0 +1,2 @@
+D2-HELLO hello from static libc
+D2-EXIT: 0

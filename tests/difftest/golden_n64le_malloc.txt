@@ -1,0 +1,6 @@
+D2-MALLOC small=e4c87008
+D2-MALLOC calloc-zero=1
+D2-MALLOC large=c1d96c08
+D2-MALLOC realloc=e93e6800
+D2-MALLOC done
+D2-EXIT: 0
