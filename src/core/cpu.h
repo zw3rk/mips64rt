@@ -120,6 +120,25 @@ enum {
  *   0x150 ibtc_ptr, 0x158 pad
  *   0x160 fpr[32]        256 B of u64 slots, 16-byte aligned (FR=1)
  */
+/* Guest signal action (Phase 4, lane L4a): handler/flags/restorer are
+ * guest VAs; mask is the 128-bit kernel sigset (word 0 holds 1..64). */
+typedef struct {
+    uint64_t handler;
+    uint64_t flags;
+    uint64_t mask[2];
+    uint64_t restorer;
+} mips64_sigaction_t;
+
+/* Queued pending signal (kill to self, or a second sync fault while one
+ * is being delivered). Bounded ring; overflow drops (documented RC4
+ * limitation, identical in both engines). */
+typedef struct {
+    uint32_t signo;
+    int32_t  code;
+    int32_t  errnum;
+    uint64_t addr;
+} mips64_sigpend_t;
+
 typedef struct mips64_ctx {
     uint64_t gpr[32];           /* 0x000 */
     uint64_t pc;                /* 0x100 */
@@ -197,6 +216,14 @@ typedef struct mips64_ctx {
     uint64_t blocks_compiled;
     uint64_t icache_flushes;
     uint64_t wx_transitions;
+
+    /* Guest signal actions + masks (Phase 4, lane L4a). Index 1..128,
+     * appended after all offset-locked fields (extend at end only). */
+    mips64_sigaction_t sigactions[129];
+    uint64_t sig_blocked[2];
+    mips64_sigpend_t pend_queue[16];
+    uint32_t pend_head;
+    uint32_t pend_count;
 } mips64_ctx_t;
 
 /* ABI-locked offsets (SPEC 2.1, verified by tests/check_abi_invariants). */
