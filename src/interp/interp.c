@@ -699,11 +699,15 @@ static int exec_simple(mips64_ctx_t *ctx, uint64_t cur_pc, const mips_dec_t *d)
     case 0x3Du: /* SDC1 */
         /* fpmove_mem records mapping faults itself; just propagate. */
         return fpmove_mem(ctx, d);
-    case 0x11u: /* COP1: moves via fpmove.c; arithmetic faults (Phase 3) */
-        if (fpmove_cop1(ctx, d) != 0) {
-            return fault_at(ctx, cur_pc);
+    case 0x11u: /* COP1 via fpmove.c+fp.c (1/2 = BC1 run-stop/pc-final) */
+    {
+        int rc = fpmove_cop1(ctx, d);
+
+        if (rc == 1 || rc == 2) {
+            return rc;
         }
-        return 0;
+        return (rc != 0) ? fault_at(ctx, cur_pc) : 0;
+    }
     case 0x2Fu: /* CACHE */
     case 0x33u: /* PREF */
         return 0;
