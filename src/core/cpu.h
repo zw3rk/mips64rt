@@ -144,11 +144,17 @@ typedef struct mips64_ctx {
 
     /* ---- C-only tail (no asm offset dependencies; extend at end only) ---- */
 
-    /* Guest memory layout inside TASK_SIZE. */
+    /* Guest memory layout inside TASK_SIZE. Phase 1 reservation model: a
+     * single host-VA reservation of task_size bytes (PROT_NONE,
+     * MAP_NORESERVE); guest mappings are placed MAP_FIXED inside it so
+     * guest_base + va is the host address. The rt64 family broker
+     * integration (Phase 4/6) keeps this field as the process window base. */
     uint64_t task_size;
+    uint64_t guest_base;        /* host base of the TASK_SIZE reservation */
     uint64_t brk_base;
     uint64_t brk_curr;
     uint64_t mmap_cursor;
+    uint64_t mmap_base;         /* unhinted-mmap search base (per ABI) */
     uint64_t interp_base;
     uint64_t elf_base;
     uint64_t elf_entry;
@@ -249,6 +255,14 @@ static inline void mips64_spin_unlock(_Atomic uint32_t *lock)
 
 /* Fault sentinel for guest memory helpers (Phase 1, lane L1c). */
 #define MIPS_FAULT (-1)
+
+/* Guest VA -> host pointer under the Phase 1 reservation model:
+ * guest_base + va. va is never truncated: N64 VAs use the full 64 bits,
+ * N32 VAs fit in 32 bits but are still carried in uint64_t. */
+static inline void *mips64_guest_ptr(const mips64_ctx_t *ctx, uint64_t guest_va)
+{
+    return (void *)(uintptr_t)(ctx->guest_base + guest_va);
+}
 
 static inline int mips_is_be(const mips64_ctx_t *ctx)
 {
