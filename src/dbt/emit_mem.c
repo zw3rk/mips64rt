@@ -70,6 +70,18 @@ static void ei_mem_addr(a64_emit_t *e, const mips_dec_t *d)
     ei_add(e, 0, EI_A, EI_A, EI_T);
 }
 
+/* Record this word's guest pc in the scratch slot for the host-fault
+ * guard: a captured fault reports precise sc_pc even though compiled
+ * blocks do not advance ctx->pc per instruction. `reg` must be dead at
+ * the call site (callers place this after the host address is
+ * finalised); the transient spill users overwrite-then-read their own
+ * value in program order, so the record always wins at capture time. */
+static void ei_mem_pc_reg(a64_emit_t *e, uint64_t pc, unsigned reg)
+{
+    ei_mov64(e, reg, pc);
+    ei_str(e, 0, reg, EI_CTX, EI_OFF_SCRATCH);
+}
+
 /* Alignment (align = 1/2/4/8, 0 skips) + task_size bounds checks with
  * the address in EI_A. Falls through with B = x20 + A; faults share
  * one epilogue per word. */
@@ -143,6 +155,9 @@ int ei_mem_aligned(a64_emit_t *e, const mips_dec_t *d, uint64_t pc,
     }
     ei_mem_addr(e, d);
     ei_mem_checked(e, pc, align);
+    /* EI_A is dead past the host-address computation (the fault
+     * epilogue already branched away); record before the access. */
+    ei_mem_pc_reg(e, pc, EI_A);
     if (is_load != 0) {
         switch (d->op) {
         case 0x20u: /* LB */
@@ -291,6 +306,9 @@ int ei_unaligned(a64_emit_t *e, const mips_dec_t *d, uint64_t pc,
     s = ei_bcc(e, EI_HS);
     ei_add(e, 0, EI_B, EI_BASE, EI_A);
     ei_gld(e, EI_C, d->rt);
+    /* EI_A is the load destination below, so its address value is dead;
+     * record before the first host access. */
+    ei_mem_pc_reg(e, pc, EI_A);
     if (is_d != 0) {
         ei_ldr(e, 0, EI_A, EI_B, 0u);
     } else {
@@ -322,6 +340,9 @@ int ei_unaligned(a64_emit_t *e, const mips_dec_t *d, uint64_t pc,
     } else {
         ei_merge_store(e, is_d == 0, m, cval);
         ei_ldr(e, 0, EI_B, EI_CTX, EI_OFF_SCRATCH);
+        /* EI_C died with the merge (value now in A); record before the
+         * final host store. */
+        ei_mem_pc_reg(e, pc, EI_C);
         if (be != 0) {
             ei_rev(e, is_d != 0 ? 0xDAC00C00u : 0x5AC00800u, EI_A, EI_A);
         }
@@ -343,6 +364,7 @@ int ei_atomic(a64_emit_t *e, const mips_dec_t *d, uint64_t pc, int be)
     int is_d = (d->op == 0x34u || d->op == 0x3Cu) ? 1 : 0;
     size_t s1;
     size_t s2;
+    size_t s3;
     size_t dead;
     size_t done;
     size_t top;
@@ -361,6 +383,10 @@ int ei_atomic(a64_emit_t *e, const mips_dec_t *d, uint64_t pc, int be)
     ei_mem_fault(e, pc, s1, s2);
     if (d->op == 0x30u || d->op == 0x34u) { /* LL / LLD */
         ei_add(e, 0, EI_B, EI_BASE, EI_A);
+        /* EI_T held task_size for the bounds check above and is dead
+         * now; EI_A still carries the guest address for the LLADDR
+         * store below, so the pc record must not use EI_A here. */
+        ei_mem_pc_reg(e, pc, EI_T);
         /* Width flag is "is word": LL needs the W form, LLD the X. */
         ei_ldxr(e, is_d == 0, EI_C, EI_B);
         ei_mov32(e, EI_T, 1u);
@@ -382,6 +408,11 @@ int ei_atomic(a64_emit_t *e, const mips_dec_t *d, uint64_t pc, int be)
      * compute it before the reservation check. */
     ei_add(e, 0, EI_T, EI_BASE, EI_A);
     ei_gld(e, EI_B, d->rt);
+    /* EI_C is dead here (overwritten by the load below); the record
+     * must precede the reservation check because the llbit==0 path
+     * skips the second record yet still faults on the fail-path
+     * load. */
+    ei_mem_pc_reg(e, pc, EI_C);
     ei_ldrb(e, EI_C, EI_CTX, MIPS64_CTX_LLBIT_OFFSET);
     dead = ei_cbz(e, 0, 0, EI_C);
     ei_ldr(e, 0, EI_C, EI_CTX, MIPS64_CTX_LLADDR_OFFSET);
@@ -392,11 +423,18 @@ int ei_atomic(a64_emit_t *e, const mips_dec_t *d, uint64_t pc, int be)
     }
     /* The LL block exited to the dispatcher, which need not preserve
      * the host exclusive monitor, so a bare STXR here can never
-     * succeed. Re-arm with LDXR in this block (the value is discarded:
-     * like interp's do_sc, success needs llbit/lladdr only). Width
+     * succeed. Re-arm with LDXR in this block. RC4: commit only when
+     * the lane still holds the LL-observed value — per-ctx llbit
+     * cannot see foreign stores, and two host threads share no
+     * monitor. EI_A is dead past the lladdr check, so it carries
+     * llval (raw host order on both sides, like the LL store). Width
      * flag is "is word", matching the fail-path load below. */
     top = e == NULL ? 0u : e->len;
+    ei_mem_pc_reg(e, pc, EI_A);
     ei_ldxr(e, is_d == 0, EI_C, EI_T);
+    ei_ldr(e, 0, EI_A, EI_CTX, MIPS64_CTX_LLVAL_OFFSET);
+    ei_cmp(e, 0, EI_C, EI_A);
+    s3 = ei_bcc(e, EI_NE);
     ei_stxr(e, is_d == 0, EI_C, EI_B, EI_T);
     ei_cbnz_back(e, 0, EI_C, top);
     ei_mov32(e, EI_B, 1u);
@@ -405,6 +443,7 @@ int ei_atomic(a64_emit_t *e, const mips_dec_t *d, uint64_t pc, int be)
     done = ei_b(e);
     ei_patch_at(e, dead, e == NULL ? 0u : e->len, 0);
     ei_patch_at(e, s1, e == NULL ? 0u : e->len, 0);
+    ei_patch_at(e, s3, e == NULL ? 0u : e->len, 0);
     ei_ldr(e, is_d == 0, EI_T, EI_T, 0u);
     ei_mov(e, EI_B, EI_XZR);
     ei_gst(e, EI_B, d->rt);

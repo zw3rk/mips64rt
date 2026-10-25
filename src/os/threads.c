@@ -224,6 +224,13 @@ static int64_t l4b_clone_thread(mips64_ctx_t *ctx, uint64_t flags,
     }
     memcpy(child, ctx, sizeof *child);
     mips64_ctx_clear_ll(child);
+    /* The child resumes after the clone with return value 0 in
+     * $v0/$a3 (re-executing the syscall would respawn grandchildren;
+     * the parent's pc still points at the clone). */
+    child->pc += 4U;
+    child->next_pc = child->pc + 4U;
+    child->gpr[MIPS64_REG_V0] = 0U;
+    child->gpr[MIPS64_REG_A3] = 0U;
     child->gpr[MIPS64_REG_SP] = stack_va;
     if ((flags & L4B_CLONE_SETTLS) != 0U) {
         child->ulr = tls_va;
@@ -456,7 +463,11 @@ static void l4b_handler(int sig, siginfo_t *si, void *uc)
              (addr >= base && addr - base < (uintptr_t)l4b_pool_len);
     if (l4b_armed != 0 && inside) {
         l4b_fault_sig = sig;
-        l4b_fault_addr = (uint64_t)addr;
+        /* Report the pool-relative offset: the coordinator installs
+         * the guard over the guest reservation, so this is the guest
+         * VA the faulting access targeted. */
+        l4b_fault_addr = (l4b_pool == NULL) ? (uint64_t)addr :
+            (uint64_t)(addr - base);
         siglongjmp(l4b_jb, 1);
     }
     l4b_forward(sig, si, uc);
@@ -487,9 +498,12 @@ void mips_hostfault_install(const void *pool, size_t len)
 
 /*
  * Run JIT code under the guard: 0 on success (reasonp takes the ctx
- * exit reason), MIPS_FAULT (-1) on a caught fault (records the guest
- * fault via mips_fault, reasonp takes EXIT_FAULT), -EINVAL on bad
- * arguments. code is a void (*)(mips64_ctx_t *) entry point.
+ * exit reason), MIPS_FAULT (-1) on a caught fault (records EXIT_FAULT
+ * with the fault-address low half, reasonp takes EXIT_FAULT),
+ * -EINVAL on bad arguments. code is a void (*)(mips64_ctx_t *) entry
+ * point. The caller owns the mips_fault trap+deliver step (dbt.c's
+ * EXIT_FAULT case), so a handled SIGSEGV is trapped exactly once and
+ * no stale duplicate stays queued.
  */
 int mips_hostfault_run(mips64_ctx_t *ctx, void *code, uint32_t *reasonp)
 {
@@ -517,7 +531,9 @@ int mips_hostfault_run(mips64_ctx_t *ctx, void *code, uint32_t *reasonp)
     }
     l4b_armed = 0;
     (void)l4b_fault_sig;
-    mips_fault(ctx, l4b_fault_addr);
+    ctx->llbit = 0U;
+    ctx->exit_reason = MIPS64_EXIT_FAULT;
+    ctx->exit_info = (uint32_t)l4b_fault_addr;
     if (reasonp != NULL) {
         *reasonp = ctx->exit_reason;
     }

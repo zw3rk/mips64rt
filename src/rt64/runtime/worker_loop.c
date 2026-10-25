@@ -11,6 +11,7 @@
 #include "loader.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 extern char **environ;
@@ -71,6 +72,9 @@ int mips64_worker_loop_run(const mips64_run_config_t *config, int guest_argc,
         if (rc != 0) {
             fprintf(stderr, "mips64rt: guest fault at pc=0x%llx (exit %d)\n",
                     (unsigned long long)ctx.pc, rc);
+            if (getenv("MIPS64RT_DUMPSTATE") != NULL) {
+                mips_dump_regs(&ctx, stderr);
+            }
             return 139;
         }
         return 0; /* unreachable: guest exit() ends the process via _Exit */

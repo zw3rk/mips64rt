@@ -527,9 +527,8 @@ int64_t mips_sc_waitid(mips64_ctx_t *ctx, uint64_t which, uint64_t pid,
     (void)want_pid;
     nohang = (opt & W_NOHANG_OPT) != 0U ? 1 : 0;
     nowait = (opt & W_NOWAIT_OPT) != 0U ? 1 : 0;
-    if ((opt & W_EXITED_OPT) != 0U) {
-        wflags |= WEXITED;
-    }
+    /* WEXITED is waitid-only: the host wait4 family rejects it with
+     * EINVAL, and reporting exited children is its default anyway. */
     if ((opt & W_UNTRACED_OPT) != 0U) {
         wflags |= WUNTRACED;
     }
@@ -568,10 +567,12 @@ int64_t mips_sc_waitid(mips64_ctx_t *ctx, uint64_t which, uint64_t pid,
             !mips_mem_ok(ctx, infop_va, 128U, MIPS_PROT_WRITE)) {
             return exec_ret(ctx, -(int64_t)EFAULT);
         }
-        /* MIPS N64/N32 siginfo: signo@0 code@4 errno@8, then the
-         * SIGCHLD cluster pid@12 uid@16 status@20 (rvrt wait.c
-         * offsets {0,4,8,16,20,24} are the RV64 12-vs-16 word shift;
-         * MIPS keeps signo/code/errno packed at 0/4/8). */
+        /* MIPS siginfo (musl, qemu-verified offsets): signo@0 code@4
+         * errno@8, then the SIGCHLD cluster at base+0/+4/+8 where
+         * base is 16 (N64: 8-byte pointer alignment) or 12 (N32:
+         * 4-byte pointers need no pad). */
+        uint64_t base_off = is_n32_ctx(ctx) ? 12U : 16U;
+
         rc = store_info_word(ctx, infop_va, 0, MIPS_SIGCHLD_NUM);
         if (rc == 0) {
             rc = store_info_word(ctx, infop_va, 4, cause);
@@ -580,20 +581,22 @@ int64_t mips_sc_waitid(mips64_ctx_t *ctx, uint64_t which, uint64_t pid,
             rc = store_info_word(ctx, infop_va, 8, 0U);
         }
         if (rc == 0) {
-            rc = store_info_word(ctx, infop_va, 12, (uint32_t)got);
+            rc = store_info_word(ctx, infop_va, base_off, (uint32_t)got);
         }
         if (rc == 0) {
-            rc = store_info_word(ctx, infop_va, 16, (uint32_t)uid);
+            rc = store_info_word(ctx, infop_va, base_off + 4U,
+                                 (uint32_t)uid);
         }
         if (rc == 0) {
-            rc = store_info_word(ctx, infop_va, 20, st);
+            rc = store_info_word(ctx, infop_va, base_off + 8U, st);
         }
         if (rc != 0) {
             return exec_ret(ctx, (int64_t)rc);
         }
         {
             uint8_t *p = (uint8_t *)mips64_guest_ptr(ctx, infop_va);
-            memset(p + 24, 0, 104);
+            memset(p + base_off + 12U, 0,
+                   (size_t)(128U - base_off - 12U));
         }
     }
     return exec_ret(ctx, 0);

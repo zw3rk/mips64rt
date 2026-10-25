@@ -284,9 +284,28 @@ int do_ll(mips64_ctx_t *ctx, uint64_t addr, unsigned rt)
     return 0;
 }
 
+/* Serialises the SC check-and-store across host threads sharing the
+ * guest reservation: without it two threads can both pass the
+ * llval compare between one thread's load and store and lose an
+ * increment. __atomic builtins need no init and stay out of the
+ * signal-delivery path (mips_fault never blocks on this lock). */
+static unsigned char sc_lock;
+
+static void sc_lock_acquire(void)
+{
+    while (__atomic_test_and_set(&sc_lock, __ATOMIC_ACQUIRE) != 0) {
+    }
+}
+
+static void sc_lock_release(void)
+{
+    __atomic_clear(&sc_lock, __ATOMIC_RELEASE);
+}
+
 int do_sc(mips64_ctx_t *ctx, uint64_t addr, unsigned rt)
 {
     uint64_t v = 0u;
+    uint64_t cur = 0u;
     int sc_ok = 0;
 
     if ((addr & 3u) != 0u) {
@@ -294,10 +313,23 @@ int do_sc(mips64_ctx_t *ctx, uint64_t addr, unsigned rt)
         return MIPS_FAULT;
     }
     if (ctx->llbit != 0u && ctx->lladdr == addr) {
-        if (guest_st32(ctx, addr, ctx->gpr[rt] & 0xFFFFFFFFu) != 0) {
+        /* Cross-thread atomicity without a global reservation table:
+         * the store commits only when the word still holds the
+         * LL-observed value (same-thread stores already cleared
+         * llbit; a foreign same-value write is benign). */
+        sc_lock_acquire();
+        if (guest_ld32(ctx, addr, &cur) != 0) {
+            sc_lock_release();
             return MIPS_FAULT;
         }
-        sc_ok = 1;
+        if (cur == ctx->llval) {
+            if (guest_st32(ctx, addr, ctx->gpr[rt] & 0xFFFFFFFFu) != 0) {
+                sc_lock_release();
+                return MIPS_FAULT;
+            }
+            sc_ok = 1;
+        }
+        sc_lock_release();
     } else if (guest_ld32(ctx, addr, &v) != 0) {
         return MIPS_FAULT;
     }
@@ -328,6 +360,7 @@ int do_lld(mips64_ctx_t *ctx, uint64_t addr, unsigned rt)
 int do_scd(mips64_ctx_t *ctx, uint64_t addr, unsigned rt)
 {
     uint64_t v = 0u;
+    uint64_t cur = 0u;
     int sc_ok = 0;
 
     if ((addr & 7u) != 0u) {
@@ -335,10 +368,20 @@ int do_scd(mips64_ctx_t *ctx, uint64_t addr, unsigned rt)
         return MIPS_FAULT;
     }
     if (ctx->llbit != 0u && ctx->lladdr == addr) {
-        if (guest_st64(ctx, addr, ctx->gpr[rt]) != 0) {
+        /* Same cross-thread value check as do_sc (64-bit lanes). */
+        sc_lock_acquire();
+        if (guest_ld64(ctx, addr, &cur) != 0) {
+            sc_lock_release();
             return MIPS_FAULT;
         }
-        sc_ok = 1;
+        if (cur == ctx->llval) {
+            if (guest_st64(ctx, addr, ctx->gpr[rt]) != 0) {
+                sc_lock_release();
+                return MIPS_FAULT;
+            }
+            sc_ok = 1;
+        }
+        sc_lock_release();
     } else if (guest_ld64(ctx, addr, &v) != 0) {
         return MIPS_FAULT;
     }

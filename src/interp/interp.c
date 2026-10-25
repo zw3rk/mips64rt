@@ -4,13 +4,11 @@
  * Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0
  *
- * Step-by-step oracle for the SPEC 2 integer subset: 32-bit ALU with
- * canonical sign-extension (E02), 64-bit D-ops, shifts/rotates,
- * DEXT/DINS/DSBH/DSHD/DCLO/DCLZ, MULT/DIV/DMULT/DDIV via hi/lo,
- * branches/jumps with delay slots and likely-annul, SYSCALL via the
- * L1c dispatcher, traps via mips_fault, LWU/LD/SD, LL/SC/LLD/SCD,
- * RDHWR/ulr alias, CACHE/PREF as NOP (memory ops live in unaligned.c,
- * COP1 moves in fpmove.c). FP arithmetic faults; reg 0 stays 0.
+ * Step-by-step SPEC 2 integer oracle: 32-bit ALU (E02 sign-extension),
+ * 64-bit D-ops, shifts/rotates, DEXT/DINS/BSHFL, MULT/DIV via hi/lo,
+ * delay-slot branches + likely-annul, SYSCALL (L1c), traps
+ * (mips_fault), LWU/LD/SD, LL/SC/LLD/SCD, RDHWR/ulr, CACHE/PREF as NOP
+ * (memory ops in unaligned.c, COP1 moves in fpmove.c); reg 0 stays 0.
  */
 
 #include <stdint.h>
@@ -21,7 +19,6 @@
 #include "interp/interp.h"
 
 static int exec_branch(mips64_ctx_t *ctx, uint64_t pc, const mips_dec_t *d);
-
 static int fault_at(mips64_ctx_t *ctx, uint64_t addr)
 {
     if (ctx->trace_enabled) {
@@ -30,7 +27,8 @@ static int fault_at(mips64_ctx_t *ctx, uint64_t addr)
                       (unsigned long long)addr);
     }
     mips_fault(ctx, addr);
-    return MIPS_FAULT;
+    /* RC4: a delivered signal leaves pc at the handler (return 2). */
+    return (ctx->exit_reason == MIPS64_EXIT_NONE) ? 2 : MIPS_FAULT;
 }
 
 /* Shared COP1/COP1X result mapping: 1/2 = BC1 run-stop/pc-final. */
@@ -60,11 +58,8 @@ static int fetch_decode(mips64_ctx_t *ctx, uint64_t pc, mips_dec_t *d)
     return 0;
 }
 
-/* SYSCALL: clears llbit; dispatcher owns $v0/$a3 writeback (including
- * legitimate nonzero guest results like brk addresses and byte counts).
- * The dispatcher's int64 return is opaque here: guest-visible errors are
- * already in $v0/$a3. Returns 0 (caller advances pc), 2 (dispatcher
- * moved pc: keep it), 1 (stop). */
+/* SYSCALL: clears llbit; dispatcher owns $v0/$a3 writeback. Returns 0
+ * (caller advances pc), 2 (dispatcher moved pc: keep it), 1 (stop). */
 static int exec_syscall(mips64_ctx_t *ctx)
 {
     uint64_t before = ctx->pc;
@@ -826,16 +821,14 @@ static int exec_branch(mips64_ctx_t *ctx, uint64_t pc, const mips_dec_t *d)
         interp_set_reg(ctx, link_rd, pc + 8u);
     }
     if (likely && !taken) {
-        /* The annulled slot is not executed and not even fetched: no
-         * fault can arise from pc+4 (phase-1.md; the RC1 gate steps a
-         * likely-annul across a PROT_NONE page). */
+        /* The annulled slot is never fetched: no fault can arise from
+         * pc+4 (RC1 gate steps likely-annul across PROT_NONE). */
         ctx->in_delay_slot = 0;
         ctx->pc = pc + 8u;
         ctx->next_pc = pc + 12u;
         return 0;
     }
-    /* SPEC 2.2: the slot runs with ctx->pc at the slot, so a fault there
-     * reports branch_pc = pc (slot - 4). */
+    /* SPEC 2.2: the slot runs with ctx->pc at the slot (branch_pc). */
     ctx->in_delay_slot = 1;
     ctx->pc = pc + 4u;
     {
@@ -881,6 +874,13 @@ int interp_step(mips64_ctx_t *ctx)
             ctx->next_pc = ctx->pc + 4u;
             rc = 0;
         }
+    }
+    /* RC4: direct MIPS_FAULT after a delivered signal (moved pc, exit
+     * NONE) resumes at the handler; fault_at already maps its own. */
+    if (rc == MIPS_FAULT && ctx->exit_reason == MIPS64_EXIT_NONE &&
+        ctx->pc != pc) {
+        ctx->next_pc = ctx->pc + 4u;
+        rc = 0;
     }
     if (rc == 0 && ctx->exit_reason != MIPS64_EXIT_NONE) {
         rc = 1;

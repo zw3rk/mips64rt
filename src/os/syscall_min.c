@@ -105,6 +105,30 @@ extern int64_t mips_sc_close_range(mips64_ctx_t *ctx, uint64_t first,
 extern int64_t mips_sc_vec(mips64_ctx_t *ctx, uint64_t fd, uint64_t iov_va,
                            uint64_t iovcnt, uint64_t off, int is_p,
                            int is_write);
+/* Phase 4 seams (lanes L4a/L4b/L4c). The (ctx, sp) signal seams read
+ * their arguments from the guest registers; sp is reserved. */
+extern int64_t mips_sc_rt_sigaction(mips64_ctx_t *ctx, uint64_t sp);
+extern int64_t mips_l4a_rt_sigprocmask(mips64_ctx_t *ctx, uint64_t sp);
+extern int64_t mips_sc_sigaltstack(mips64_ctx_t *ctx, uint64_t sp);
+extern int64_t mips_rt_sigreturn(mips64_ctx_t *ctx);
+extern int mips_signal_has_handler(int signo);
+extern int mips_raise_guest(mips64_ctx_t *ctx, int signo,
+                            uint64_t fault_addr);
+extern int64_t mips_sc_sig_syscall(mips64_ctx_t *ctx, uint64_t nr,
+                                   uint64_t a0, uint64_t a1, uint64_t a2,
+                                   uint64_t a3);
+extern int64_t mips_clone_full(mips64_ctx_t *ctx, uint64_t flags,
+                               uint64_t stack_va, uint64_t parent_tid_va,
+                               uint64_t tls_va, uint64_t child_tid_va);
+extern int64_t mips_futex_op(mips64_ctx_t *ctx, uint64_t uaddr, uint64_t op,
+                             uint64_t val, uint64_t timeout_va,
+                             uint64_t uaddr2, uint64_t val3);
+extern int64_t mips_sc_exec(mips64_ctx_t *ctx, uint64_t nr, uint64_t path_va,
+                            uint64_t argv_va, uint64_t envp_va, uint64_t a3,
+                            uint64_t a4);
+extern int64_t mips_sc_waitid(mips64_ctx_t *ctx, uint64_t which, uint64_t pid,
+                              uint64_t infop_va, uint64_t options,
+                              uint64_t rusage_va);
 extern int mips_mem_map(mips64_ctx_t *ctx, uint64_t va, uint64_t len,
                         uint32_t prot, const char *tag);
 extern int mips_mem_unmap(mips64_ctx_t *ctx, uint64_t va, uint64_t len);
@@ -439,32 +463,19 @@ static int64_t sc_uname(mips64_ctx_t *ctx, uint64_t va)
     return sc_ret(ctx, 0);
 }
 
-/* MIPS clone flags (Linux kernel ABI, arch-independent). Phase 1
- * supports only the fork-equivalent subset musl's fork() uses. */
-#define MIPS_CLONE_VM 0x100U
-#define MIPS_CLONE_FS 0x200U
-#define MIPS_CLONE_FILES 0x400U
-#define MIPS_CLONE_SIGHAND 0x800U
-#define MIPS_CLONE_PTRACE 0x2000U
-#define MIPS_CLONE_VFORK 0x4000U
-#define MIPS_CLONE_PARENT 0x8000U
-#define MIPS_CLONE_THREAD 0x10000U
-#define MIPS_CLONE_SYSVSEM 0x40000U
-#define MIPS_CLONE_SETTLS 0x80000U
-#define MIPS_CLONE_PARENT_SETTID 0x100000U
-#define MIPS_CLONE_CHILD_CLEARTID 0x200000U
-#define MIPS_CLONE_CHILD_SETTID 0x1000000U
-/* MIPS signal numbers (asm/signal.h) differ from asm-generic: SIGCHLD
- * is 18 on MIPS, not 17. musl's fork() passes it as clone's signal. */
-#define MIPS_SIGCHLD 18U
-#define MIPS_CLONE_SHARE_MASK \
-    (MIPS_CLONE_VM | MIPS_CLONE_FS | MIPS_CLONE_FILES | \
-     MIPS_CLONE_SIGHAND | MIPS_CLONE_PTRACE | MIPS_CLONE_VFORK | \
-     MIPS_CLONE_PARENT | MIPS_CLONE_THREAD | MIPS_CLONE_SYSVSEM | \
-     MIPS_CLONE_SETTLS)
+/* close(2): pass through to the host (RC4: the test's exec/pipe
+ * round-trip closes the write end so the reader sees EOF). */
+static int64_t sc_close(mips64_ctx_t *ctx, uint64_t fd)
+{
+    if (close((int)fd) != 0) {
+        return sc_ret(ctx, -(int64_t)errno);
+    }
+    return sc_ret(ctx, 0);
+}
 
 /* Plain fork(): every guest mapping is MAP_PRIVATE (COW), so host
- * fork() diverges parent and child with no extra work. */
+ * fork() diverges parent and child with no extra work. Full clone(2)
+ * (thread sharing included) is lane L4b's mips_clone_full. */
 static int64_t sc_fork(mips64_ctx_t *ctx)
 {
     pid_t pid = fork();
@@ -474,57 +485,6 @@ static int64_t sc_fork(mips64_ctx_t *ctx)
     }
     if (pid == 0) {
         return sc_ret(ctx, 0); /* child */
-    }
-    return sc_ret(ctx, (int64_t)pid); /* parent */
-}
-
-/* Minimal clone(): only the fork-equivalent form (SIGCHLD exit signal,
- * optional child-tid bookkeeping). Address-space or thread sharing is
- * Phase 4 (L4b) and reports ENOSYS. */
-static int64_t sc_clone(mips64_ctx_t *ctx, uint64_t flags,
-                        uint64_t parent_tid, uint64_t ctid)
-{
-    pid_t pid;
-
-    if ((flags & 0xFFU) != (uint64_t)MIPS_SIGCHLD) {
-        return sc_ret(ctx, -(int64_t)EINVAL);
-    }
-    if ((flags & (uint64_t)MIPS_CLONE_SHARE_MASK) != 0U) {
-        return sc_ret(ctx, -(int64_t)ENOSYS);
-    }
-    pid = fork();
-    if (pid < 0) {
-        return sc_ret(ctx, -(int64_t)errno);
-    }
-    if (pid == 0) {
-        int32_t tid;
-
-        if ((flags & (uint64_t)MIPS_CLONE_CHILD_CLEARTID) != 0U) {
-            ctx->clear_child_tid = ctid;
-        }
-        if ((flags & (uint64_t)MIPS_CLONE_CHILD_SETTID) != 0U &&
-            ctid != 0U) {
-            tid = (int32_t)getpid();
-            if ((ctid & 3U) != 0U ||
-                !mips_mem_ok(ctx, ctid, 4U, MIPS_PROT_WRITE)) {
-                mips_fault(ctx, ctid);
-                return sc_ret(ctx, -(int64_t)EFAULT);
-            }
-            /* guest_st32: endian-correct store (BE guests must see
-             * the scalar value, not host-native bytes). */
-            guest_st32(ctx, ctid, (uint64_t)(uint32_t)tid);
-        }
-        return sc_ret(ctx, 0); /* child */
-    }
-    if ((flags & (uint64_t)MIPS_CLONE_PARENT_SETTID) != 0U &&
-        parent_tid != 0U) {
-        int32_t tid = (int32_t)pid;
-
-        if ((parent_tid & 3U) != 0U ||
-            !mips_mem_ok(ctx, parent_tid, 4U, MIPS_PROT_WRITE)) {
-            return sc_ret(ctx, -(int64_t)EFAULT);
-        }
-        guest_st32(ctx, parent_tid, (uint64_t)(uint32_t)tid);
     }
     return sc_ret(ctx, (int64_t)pid); /* parent */
 }
@@ -560,7 +520,46 @@ static int64_t sc_wait4(mips64_ctx_t *ctx, uint64_t pid, uint64_t status_va,
     return sc_ret(ctx, (int64_t)ret);
 }
 
-int64_t mips_syscall(mips64_ctx_t *ctx)
+/* RC4: deliver the first queued signal with a live unblocked handler.
+ * The interrupted syscall already completed, so pc advances past it
+ * before the frame is built (sc_pc resumes after the syscall). Runs at
+ * the end of every mips_syscall; both engines observe the redirected pc
+ * via their pc-moved checks. */
+static void sc_deliver_pending(mips64_ctx_t *ctx)
+{
+    uint32_t i;
+
+    if (ctx == NULL || ctx->pend_count == 0U) {
+        return;
+    }
+    for (i = 0U; i < ctx->pend_count; i++) {
+        uint32_t slot = (ctx->pend_head + i) % 16U;
+        int signo = (int)ctx->pend_queue[slot].signo;
+        unsigned w;
+        uint64_t bit;
+
+        if (signo < 1 || signo > 128) {
+            continue;
+        }
+        if (mips_signal_has_handler(signo) == 0) {
+            continue;
+        }
+        w = (unsigned)(signo - 1) / 64U;
+        bit = (uint64_t)1U << ((unsigned)(signo - 1) % 64U);
+        if ((ctx->sig_blocked[w] & bit) != 0U) {
+            continue;
+        }
+        ctx->pc += 4U; /* syscall done; resume after it on sigreturn */
+        ctx->next_pc = ctx->pc + 4U;
+        if (mips_raise_guest(ctx, signo,
+                             ctx->pend_queue[slot].addr) == 0) {
+            return;
+        }
+        break;
+    }
+}
+
+static int64_t mips_syscall_inner(mips64_ctx_t *ctx)
 {
     uint64_t nr;
     uint64_t a0;
@@ -588,9 +587,18 @@ int64_t mips_syscall(mips64_ctx_t *ctx)
     if (nr == (uint64_t)(n32 ? MIPS64_NR32_exit : MIPS64_NR_exit) ||
         nr == (uint64_t)(n32 ? MIPS64_NR32_exit_group
                              : MIPS64_NR_exit_group)) {
-        /* Single-threaded Phase 1: exit() and exit_group() both end
-         * the process. The guest already ran its own exit handlers;
-         * the translator holds no buffered guest output. */
+        int is_group = (nr == (uint64_t)(n32 ? MIPS64_NR32_exit_group
+                                             : MIPS64_NR_exit_group));
+
+        /* RC4: raw exit(2) from a thread-group member ends only that
+         * thread (musl thread teardown relies on this; qemu-observed),
+         * while exit_group — or exit from the main thread — ends the
+         * process. The guest already ran its own exit handlers; the
+         * translator holds no buffered guest output. */
+        if (!is_group && ctx->is_thread_clone) {
+            mips_thread_exit(ctx, (int)(a0 & 0xFFU));
+            return sc_ret(ctx, 0); /* unreachable */
+        }
         if (getenv("MIPS64RT_DUMPSTATE") != NULL) {
             /* RC2 difftest: exit-state dump shared by both engines. */
             mips_dump_regs(ctx, stderr);
@@ -644,11 +652,9 @@ int64_t mips_syscall(mips64_ctx_t *ctx)
         return sc_fork(ctx);
     }
     if (nr == (uint64_t)(n32 ? MIPS64_NR32_clone : MIPS64_NR_clone)) {
-        /* RC1 integration: musl's fork() arrives here (a0 = flags,
-         * a1 = stack, a2 = parent_tid, a3 = child_tid). Only the
-         * fork-equivalent subset is served; thread sharing is ENOSYS
-         * until Phase 4 (L4b). */
-        return sc_clone(ctx, a0, a2, a3);
+        /* RC4: full clone(2) via lane L4b (thread-group sharing and
+         * the fork-equivalent subset alike). */
+        return mips_clone_full(ctx, a0, a1, a2, a3, a4);
     }
     if (nr == (uint64_t)(n32 ? MIPS64_NR32_wait4 : MIPS64_NR_wait4)) {
         /* RC1 integration: waitpid(2) is wait4 with NULL rusage. */
@@ -705,11 +711,46 @@ int64_t mips_syscall(mips64_ctx_t *ctx)
         return mips_sc_getrandom(ctx, a0, a1, a2);
     }
     if (nr == (uint64_t)(n32 ? MIPS64_NR32_futex : MIPS64_NR_futex)) {
-        return mips_sc_futex(ctx, a0, a1, a2, a3, a4, a5);
+        /* RC4: full futex(2) via lane L4b (shared-memory wait/wake). */
+        return mips_futex_op(ctx, a0, a1, a2, a3, a4, a5);
+    }
+    if (nr == (uint64_t)(n32 ? MIPS64_NR32_rt_sigaction
+                             : MIPS64_NR_rt_sigaction)) {
+        return mips_sc_rt_sigaction(ctx, ctx->gpr[MIPS64_REG_SP]);
     }
     if (nr == (uint64_t)(n32 ? MIPS64_NR32_rt_sigprocmask
                              : MIPS64_NR_rt_sigprocmask)) {
-        return mips_sc_rt_sigprocmask(ctx, a0, a1, a2, a3);
+        /* RC4: the lane L4a ctx-resident mask supersedes the Phase 2
+         * recorded mask (delivery now observes it). */
+        return mips_l4a_rt_sigprocmask(ctx, ctx->gpr[MIPS64_REG_SP]);
+    }
+    if (nr == (uint64_t)(n32 ? MIPS64_NR32_rt_sigreturn
+                             : MIPS64_NR_rt_sigreturn)) {
+        return mips_rt_sigreturn(ctx);
+    }
+    if (nr == (uint64_t)(n32 ? MIPS64_NR32_sigaltstack
+                             : MIPS64_NR_sigaltstack)) {
+        return mips_sc_sigaltstack(ctx, ctx->gpr[MIPS64_REG_SP]);
+    }
+    if (nr == (uint64_t)(n32 ? MIPS64_NR32_rt_sigpending
+                             : MIPS64_NR_rt_sigpending) ||
+        nr == (uint64_t)(n32 ? MIPS64_NR32_rt_sigtimedwait
+                             : MIPS64_NR_rt_sigtimedwait) ||
+        nr == (uint64_t)(n32 ? MIPS64_NR32_rt_sigqueueinfo
+                             : MIPS64_NR_rt_sigqueueinfo) ||
+        nr == (uint64_t)(n32 ? MIPS64_NR32_rt_tgsigqueueinfo
+                             : MIPS64_NR_rt_tgsigqueueinfo) ||
+        nr == (uint64_t)(n32 ? MIPS64_NR32_kill : MIPS64_NR_kill) ||
+        nr == (uint64_t)(n32 ? MIPS64_NR32_tkill : MIPS64_NR_tkill) ||
+        nr == (uint64_t)(n32 ? MIPS64_NR32_tgkill : MIPS64_NR_tgkill)) {
+        return mips_sc_sig_syscall(ctx, nr, a0, a1, a2, a3);
+    }
+    if (nr == (uint64_t)(n32 ? MIPS64_NR32_execve : MIPS64_NR_execve) ||
+        nr == (uint64_t)(n32 ? MIPS64_NR32_execveat : MIPS64_NR_execveat)) {
+        return mips_sc_exec(ctx, nr, a0, a1, a2, a3, a4);
+    }
+    if (nr == (uint64_t)(n32 ? MIPS64_NR32_waitid : MIPS64_NR_waitid)) {
+        return mips_sc_waitid(ctx, a0, a1, a2, a3, a4);
     }
     if (nr == (uint64_t)(n32 ? MIPS64_NR32_ioctl : MIPS64_NR_ioctl)) {
         return mips_sc_ioctl(ctx, a0, a1, a2);
@@ -759,6 +800,9 @@ int64_t mips_syscall(mips64_ctx_t *ctx)
     }
     if (nr == (uint64_t)(n32 ? MIPS64_NR32_dup3 : MIPS64_NR_dup3)) {
         return mips_sc_dup(ctx, a0, a1, a2, 2);
+    }
+    if (nr == (uint64_t)(n32 ? MIPS64_NR32_close : MIPS64_NR_close)) {
+        return sc_close(ctx, a0);
     }
     if (nr == (uint64_t)(n32 ? MIPS64_NR32_getpid : MIPS64_NR_getpid)) {
         return mips_sc_getid(ctx, 0);
@@ -810,4 +854,15 @@ int64_t mips_syscall(mips64_ctx_t *ctx)
         return mips_sc_vec(ctx, a0, a1, a2, a3, 1, 1);
     }
     return sc_ret(ctx, -(int64_t)ENOSYS);
+}
+
+/* Public dispatcher: the inner body above, then the RC4 pending-signal
+ * sweep (which may redirect pc into a handler; both engines treat the
+ * moved pc as final and resume there). */
+int64_t mips_syscall(mips64_ctx_t *ctx)
+{
+    int64_t rc = mips_syscall_inner(ctx);
+
+    sc_deliver_pending(ctx);
+    return rc;
 }

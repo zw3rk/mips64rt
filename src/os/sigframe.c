@@ -195,7 +195,13 @@ static int l4b_ensure_trampoline(mips64_ctx_t *ctx)
     uint32_t li;
     int rc;
 
-    if (mips_mem_ok(ctx, tramp, 8U, (uint32_t)MIPS_PROT_READ)) {
+    /* The N64 trampoline page sits inside the initial stack mapping
+     * (stack top 0xffffff0000, 8 MiB down): require EXEC, not just
+     * READ, or the early return leaves an unmapped stub whose fetch
+     * faults on handler return. The unmap splits the stack and punches
+     * a one-page guard hole; the map below installs the RX stub. */
+    if (mips_mem_ok(ctx, tramp, 8U, (uint32_t)(MIPS_PROT_READ |
+                                               MIPS_PROT_EXEC))) {
         return 0;
     }
     (void)mips_mem_unmap(ctx, page, MIPS64_PAGE_SIZE);
@@ -317,12 +323,13 @@ int mips_raise_guest(mips64_ctx_t *ctx, int signo, uint64_t fault_addr)
         return 1;
     }
     memset(f, 0, (size_t)size);
-    /* siginfo: signo@0 code@4 errno@8 addr@16 (8 bytes N64, 4 N32). */
+    /* siginfo: signo@0 code@4 errno@8, then addr at +16 (8 bytes
+     * N64) or +12 (4 bytes N32: 4-byte pointers need no pad). */
     putn(f + 24, (uint64_t)(uint32_t)signo, 4, be);
     putn(f + 28, (uint64_t)(uint32_t)code, 4, be);
     putn(f + 32, (uint64_t)(uint32_t)errnum, 4, be);
     if (n32) {
-        putn(f + 40, addr & UINT64_C(0xffffffff), 4, be);
+        putn(f + 36, addr & UINT64_C(0xffffffff), 4, be);
     } else {
         putn(f + 40, addr, 8, be);
     }
@@ -413,6 +420,9 @@ int mips_raise_guest(mips64_ctx_t *ctx, int signo, uint64_t fault_addr)
     ctx->gpr[MIPS64_REG_A1] = l4b_va(ctx, frame + 24U);
     ctx->gpr[MIPS64_REG_A2] = l4b_va(ctx, frame + 152U);
     ctx->gpr[MIPS64_REG_RA] = mips64_signal_trampoline_addr(n32);
+    /* PIC handlers recompute gp from $25 (mips32rt precedent): the
+     * kernel enters the handler with $25 = handler address. */
+    ctx->gpr[MIPS64_REG_T9] = act.handler;
     ctx->pc = l4b_va(ctx, act.handler);
     ctx->next_pc = ctx->pc + 4U;
     ctx->in_delay_slot = 0U;

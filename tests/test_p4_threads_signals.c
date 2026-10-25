@@ -468,6 +468,7 @@ static void do_exec_roundtrip(const char *tag, int use_waitid)
 		return;
 	}
 	P4_CHECK(name, 1);
+	fflush(stdout);
 	pid = fork();
 	snprintf(name, sizeof(name), "fork-%s", tag);
 	if (pid < 0) {
@@ -476,7 +477,6 @@ static void do_exec_roundtrip(const char *tag, int use_waitid)
 		close(fds[1]);
 		return;
 	}
-	P4_CHECK(name, 1);
 	if (pid == 0) {
 		close(fds[0]);
 		if (dup2(fds[1], STDOUT_FILENO) < 0) {
@@ -486,6 +486,7 @@ static void do_exec_roundtrip(const char *tag, int use_waitid)
 		child_exec_or_fallback();
 		_exit(127);
 	}
+	P4_CHECK(name, 1);
 	close(fds[1]);
 	for (;;) {
 		ssize_t n = read(fds[0], out + len, sizeof(out) - 1 - len);

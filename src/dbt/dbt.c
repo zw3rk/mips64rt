@@ -412,6 +412,34 @@ void mips64_dbt_trace(mips64_ctx_t *ctx, uint64_t pc, uint32_t word)
     (void)fprintf(stderr, "I %llx %x\n", (unsigned long long)pc, word);
 }
 
+/* RC4: run one compiled block under the L4b host-fault guard, so a
+ * compiled load/store to a PROT_NONE (or unmapped) guest page becomes
+ * a guest SIGSEGV — deliverable via the EXIT_FAULT case — instead of
+ * killing the translator with a host fault. mips_hostfault_run takes
+ * a void (*)(ctx); the trampoline below carries the (base, code) pair
+ * in a thread-local slot. The guard is installed once per dbt_run
+ * over the whole guest reservation (idempotent). */
+struct dbt_guarded_enter {
+    uint64_t base;
+    void *code;
+    long ex;
+};
+
+static _Thread_local struct dbt_guarded_enter dbt_ge;
+
+static void dbt_guarded_tramp(mips64_ctx_t *ctx)
+{
+    dbt_ge.ex = mips64_dbt_enter(ctx, dbt_ge.base, dbt_ge.code);
+}
+
+static void *dbt_tramp_ptr(void (*fn)(mips64_ctx_t *))
+{
+    void *p = NULL;
+
+    memcpy(&p, &fn, sizeof p);
+    return p;
+}
+
 /* A not-taken MIPS branch-likely annuls its delay slot: the word
  * at `end - 4` never executes, so the trace must skip it. Mirrors
  * the `likely` set in `ei_branch` (emit_int.c); COP1-likely declines
@@ -474,6 +502,25 @@ static void ras_update(mips64_ctx_t *ctx, unsigned info)
     }
 }
 
+/* RC4: effective address of the faulting word at pc (load/store with
+ * base+offset form; anything else reports pc itself). exit_info only
+ * carries the low 32 bits, so si_addr for a handled SIGSEGV is
+ * recomputed here from the decoded word and current regs. */
+static uint64_t dbt_fault_ea(mips64_ctx_t *ctx, uint64_t pc)
+{
+    uint32_t word = 0u;
+    mips_dec_t d;
+
+    if (mips_fetch(ctx, pc, &word) != 0) {
+        return pc;
+    }
+    mips_decode(word, &d);
+    if (d.op >= 0x20u && d.op <= 0x3Fu) {
+        return ctx->gpr[d.rs] + (uint64_t)(int64_t)d.simm;
+    }
+    return pc;
+}
+
 int dbt_run(mips64_ctx_t *ctx)
 {
     if (ctx == NULL)
@@ -523,7 +570,23 @@ int dbt_run(mips64_ctx_t *ctx)
                 return rc;
             continue;
         }
-        ex = mips64_dbt_enter(ctx, ctx->guest_base, code);
+        mips_hostfault_install((const void *)(uintptr_t)ctx->guest_base,
+                               ctx->task_size);
+        dbt_ge.base = ctx->guest_base;
+        dbt_ge.code = code;
+        dbt_ge.ex = MIPS64_DBT_EXIT_FAULT;
+        {
+            uint32_t reason = (uint32_t)MIPS64_EXIT_NONE;
+            int frc = mips_hostfault_run(ctx,
+                                         dbt_tramp_ptr(dbt_guarded_tramp),
+                                         &reason);
+
+            if (frc == MIPS_FAULT) {
+                ex = MIPS64_DBT_EXIT_FAULT;
+            } else {
+                ex = dbt_ge.ex;
+            }
+        }
         switch (ex) {
         /* All chaining flavors share the cpu.h BRANCH code (dbt.h):
          * one label covers FALLTHROUGH, DIRECT and INDIRECT. */
@@ -547,6 +610,13 @@ int dbt_run(mips64_ctx_t *ctx)
                 return rc;
             continue;
         case MIPS64_DBT_EXIT_FAULT:
+            /* RC4: every compiled load/store records its guest pc in
+             * the scratch slot before touching host memory, so a
+             * host-guard capture lands on the precise faulting word
+             * even though blocks never advance ctx->pc per insn. */
+            if (ctx->pad150 != 0u) {
+                ctx->pc = ctx->pad150;
+            }
             trace_block_exit(ctx, start, end, 0);
             /* The faulting insn is terminal: no `interp_step`
              * re-run prints it, so print its line here to match
@@ -556,6 +626,17 @@ int dbt_run(mips64_ctx_t *ctx)
 
                 if (mips_fetch(ctx, ctx->pc, &word) == 0)
                     mips64_dbt_trace(ctx, ctx->pc, word);
+            }
+            /* RC4: exactly one mips_fault trap per fault (inline
+             * epilogue faults and host-guard captures alike), so a
+             * handled SIGSEGV delivers exactly like interp (frame +
+             * handler pc) with no stale duplicate queued. */
+            if (ctx->exit_reason == MIPS64_EXIT_FAULT) {
+                mips_fault(ctx, dbt_fault_ea(ctx, ctx->pc));
+            }
+            if (ctx->exit_reason == MIPS64_EXIT_NONE) {
+                ctx->exit_info = 0u;
+                continue;
             }
             return (int)MIPS_FAULT;
         default:

@@ -373,13 +373,31 @@ int guest_mem_init(mips64_ctx_t *ctx)
     return 0;
 }
 
-/* Synchronous fault: records EXIT_FAULT (Phase 1; signals in Phase 4). */
+/* Synchronous fault: records EXIT_FAULT, after an RC4 signal-delivery
+ * attempt. Every execution fault traps SIGSEGV (11, identical on MIPS
+ * and asm-generic) with the full 64-bit VA; mips_trap delivers
+ * immediately to a live unblocked handler (frame built, pc at the
+ * handler). Delivery is observed as the trap moving pc: the fatal
+ * record is then skipped so both engines resume in the handler.
+ * Faults with no handler (all Phase 1/2 gates) record exactly as
+ * before. The trap owns delivery here (never raise a second time:
+ * the first delivery blocks the signal, so a re-raise would nest a
+ * bogus second frame and then overwrite the record with FAULT). */
 void mips_fault(mips64_ctx_t *ctx, uint64_t addr)
 {
+    uint64_t before;
+
     if (ctx == NULL) {
         return;
     }
     ctx->llbit = 0U; /* SPEC 2.2: any helper exit clears the LL bit */
+    before = ctx->pc;
+    mips_trap(ctx, 11, addr);
+    if (ctx->pc != before) {
+        ctx->exit_reason = MIPS64_EXIT_NONE;
+        ctx->exit_info = 0U;
+        return;
+    }
     ctx->exit_reason = MIPS64_EXIT_FAULT;
     ctx->exit_info = (uint32_t)addr;
     if (ctx->trace_enabled) {

@@ -27,6 +27,7 @@ BUILD := _build
 # RC2 integration wires the L2a static-libc layer, the L2b DBT core
 # (encoder, dispatcher, trampoline) and the L2c integer emitter.
 # RC3 integration adds the L3a FPU interpreter and L3b FP emitter.
+# RC4 integration adds the L4a signal, L4b thread/futex, L4c exec seams.
 BOOT_SRCS := src/main.c \
 	src/rt64/runtime/worker_loop.c \
 	src/rt64/linux/signal_core.c \
@@ -43,6 +44,11 @@ BOOT_SRCS := src/main.c \
 	src/os/syscalls_stat.c \
 	src/os/syscalls_sync.c \
 	src/os/syscalls_time.c \
+	src/os/sigact.c \
+	src/os/sigframe.c \
+	src/os/threads.c \
+	src/os/futex.c \
+	src/os/exec.c \
 	src/dbt/a64_emit.c \
 	src/dbt/dbt.c \
 	src/dbt/emit_int.c \
@@ -84,7 +90,7 @@ check: build check-line-limits
 	fi
 	@if [ -f tests/check_abi_invariants.c ]; then $(MAKE) check-abi-invariants; fi
 	@if [ -f tests/test_decode.c ]; then \
-		$(HOST_CC) -std=c11 -Werror=vla -pedantic -Wall -Wextra -Werror -Isrc tests/test_decode.c src/interp/decode.c src/os/mem.c -o $(BUILD)/test_decode && $(BUILD)/test_decode; \
+		$(HOST_CC) -std=c11 -Werror=vla -pedantic -Wall -Wextra -Werror -Isrc tests/test_decode.c src/interp/decode.c src/os/mem.c tests/stubs_signal.c -o $(BUILD)/test_decode && $(BUILD)/test_decode; \
 	fi
 
 check-line-limits:
