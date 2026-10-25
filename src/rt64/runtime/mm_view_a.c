@@ -577,7 +577,7 @@ int mips64_mm_view_mprotect(mips64_mm_view_t *view, mips64_family_guard_t *guard
         failure = 12;
     }
     uint64_t size = failure == 0 ?
-        (length + MIPS64_PAGE_SIZE - 1) & ~(MIPS64_PAGE_SIZE - 1) : 0;
+        (length + MIPS64_PAGE_SIZE - 1) & MIPS64_PAGE_MASK : 0;
     /* A non-wrapping range beyond the supported VA limit encounters a later
      * hole; any valid mapped prefix must still take effect before ENOMEM. */
     if (failure == 0 && size > UINT64_MAX - address)
@@ -685,7 +685,7 @@ int mips64_mm_view_munmap(mips64_mm_view_t *view, mips64_family_guard_t *guard,
         length > UINT64_MAX - (MIPS64_PAGE_SIZE - 1) || address >= limit) {
         *guest_result = UINT64_C(0) - 22; return 0;
     }
-    uint64_t size = (length + MIPS64_PAGE_SIZE - 1) & ~(MIPS64_PAGE_SIZE - 1);
+    uint64_t size = (length + MIPS64_PAGE_SIZE - 1) & MIPS64_PAGE_MASK;
     if (size > limit - address) {
         *guest_result = UINT64_C(0) - 22; return 0;
     }

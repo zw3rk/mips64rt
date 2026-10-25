@@ -171,11 +171,11 @@ int do_swr(mips64_ctx_t *ctx, uint64_t addr, uint64_t rtval)
     return store_bytes(ctx, pa, m, k, 3u);
 }
 
-/* LDL/LDR merge rules (E02 tables, manual-correct on every variant):
- * LDL always takes the right span mem[addr..pa+7], LDR the left span
- * mem[pa..addr]; BE places the right span high / left span low, LE
- * mirrors the placement so the canonical (0,7) pair composes the
- * natural-endian doubleword either way. */
+/* LDL/LDR merge rules (R4000/MIPS IV pseudocode, qemu-verified per endian):
+ * endian swaps the span, placement is fixed: LDL takes mem[pa..pa+k]
+ * on LE (mem[pa+k..pa+7] on BE) into HIGH rt, LDR takes mem[pa+k..pa+7]
+ * on LE (mem[pa..pa+k] on BE) into LOW rt; the LE canonical pair does
+ * not compose a full doubleword (architectural, matches qemu-LE). */
 int do_ldl(mips64_ctx_t *ctx, uint64_t addr, unsigned rt)
 {
     uint64_t pa = addr & ~UINT64_C(7);
@@ -192,8 +192,8 @@ int do_ldl(mips64_ctx_t *ctx, uint64_t addr, unsigned rt)
             v = set_pos64(v, 7u - (i - k), m[i]);
         }
     } else {
-        for (i = k; i < 8u; i++) {
-            v = set_pos64(v, i - k, m[i]);
+        for (i = 0u; i <= k; i++) {
+            v = set_pos64(v, (7u - k) + i, m[i]);
         }
     }
     interp_set_reg(ctx, rt, v);
@@ -216,15 +216,15 @@ int do_ldr(mips64_ctx_t *ctx, uint64_t addr, unsigned rt)
             v = set_pos64(v, k - i, m[i]);
         }
     } else {
-        for (i = 0u; i <= k; i++) {
-            v = set_pos64(v, 7u - (k - i), m[i]);
+        for (i = k; i < 8u; i++) {
+            v = set_pos64(v, i - k, m[i]);
         }
     }
     interp_set_reg(ctx, rt, v);
     return 0;
 }
 
-/* SDL/SDR store rules mirror the loads (same rt positions). */
+/* SDL/SDR store rules mirror the loads (same spans, inverse direction). */
 int do_sdl(mips64_ctx_t *ctx, uint64_t addr, uint64_t rtval)
 {
     uint64_t pa = addr & ~UINT64_C(7);
@@ -238,10 +238,10 @@ int do_sdl(mips64_ctx_t *ctx, uint64_t addr, uint64_t rtval)
         }
         return store_bytes(ctx, pa, m, k, 7u);
     }
-    for (i = k; i < 8u; i++) {
-        m[i] = (uint8_t)get_pos64(rtval, i - k);
+    for (i = 0u; i <= k; i++) {
+        m[i] = (uint8_t)get_pos64(rtval, (7u - k) + i);
     }
-    return store_bytes(ctx, pa, m, k, 7u);
+    return store_bytes(ctx, pa, m, 0u, k);
 }
 
 int do_sdr(mips64_ctx_t *ctx, uint64_t addr, uint64_t rtval)
@@ -257,10 +257,10 @@ int do_sdr(mips64_ctx_t *ctx, uint64_t addr, uint64_t rtval)
         }
         return store_bytes(ctx, pa, m, 0u, k);
     }
-    for (i = 0u; i <= k; i++) {
-        m[i] = (uint8_t)get_pos64(rtval, 7u - (k - i));
+    for (i = k; i < 8u; i++) {
+        m[i] = (uint8_t)get_pos64(rtval, i - k);
     }
-    return store_bytes(ctx, pa, m, 0u, k);
+    return store_bytes(ctx, pa, m, k, 7u);
 }
 
 /* LL/SC (E05): aligned word load arms the reservation; SC commits only

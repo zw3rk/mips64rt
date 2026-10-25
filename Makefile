@@ -28,7 +28,14 @@ BUILD := _build
 # layer, L2b the DBT); it is line-limit checked here, not yet linked.
 BOOT_SRCS := src/main.c \
 	src/rt64/runtime/worker_loop.c \
-	src/rt64/linux/signal_core.c
+	src/rt64/linux/signal_core.c \
+	src/interp/decode.c \
+	src/interp/interp.c \
+	src/interp/unaligned.c \
+	src/interp/fpmove.c \
+	src/os/mem.c \
+	src/os/syscall_min.c \
+	src/loader.c
 
 .PHONY: help build build-cross check check-line-limits check-abi-invariants clean
 
@@ -60,6 +67,9 @@ check: build check-line-limits
 		echo "check: skipping native --version/--help (host $$(uname -s)/$$(uname -m) cannot execute the aarch64-musl binary; use Docker)"; \
 	fi
 	@if [ -f tests/check_abi_invariants.c ]; then $(MAKE) check-abi-invariants; fi
+	@if [ -f tests/test_decode.c ]; then \
+		$(HOST_CC) -std=c11 -Werror=vla -pedantic -Wall -Wextra -Werror -Isrc tests/test_decode.c src/interp/decode.c src/os/mem.c -o $(BUILD)/test_decode && $(BUILD)/test_decode; \
+	fi
 
 check-line-limits:
 	@fail=0; \

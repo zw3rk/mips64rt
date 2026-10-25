@@ -9,11 +9,10 @@
  * classifiers are checked per word, and mips_fetch is exercised LE+BE
  * through a scratch guest_base window.
  *
- * NOTE (lane L1c owns this on master): src/os/mem.c is not on master
- * yet, so the static guest_mem_init stand-in below wires the scratch
- * window (guest_base/task_size, no regions). It shadows nothing — it
- * is file-local — and lane L1c's real guest_mem_init replaces this
- * role at RC1 merge time without touching this file's fetch checks.
+ * NOTE (RC1 integration): src/os/mem.c is on master, so this test
+ * links the real guest_mem_init against a scratch reservation window
+ * (guest_base overwritten below, no regions) and exercises the real
+ * TASK_SIZE bound in mips_fetch.
  */
 
 #include <stdint.h>
@@ -27,21 +26,18 @@
 static uint8_t fetch_window[0x3000];
 
 /*
- * Stand-in for lane L1c's guest_mem_init (see NOTE above): point the
- * Phase 1 reservation window at the scratch buffer. region_count stays
- * 0 so mips_fetch applies only the TASK_SIZE bound here. Non-static on
- * purpose: this TU never links lane L1c's src/os/mem.c; delete this
- * definition when the acceptance build starts appending mem.c.
+ * Point the Phase 1 reservation at the scratch buffer (see NOTE above):
+ * region_count stays 0 so mips_fetch applies only the TASK_SIZE bound
+ * here, through the real guest_mem_init from src/os/mem.c.
  */
-int guest_mem_init(mips64_ctx_t *ctx)
+static void use_scratch_window(mips64_ctx_t *ctx)
 {
-    if (ctx == NULL) {
-        return MIPS_FAULT;
+    if (guest_mem_init(ctx) != 0) {
+        printf("FAIL fetch: guest_mem_init failed\n");
+        return;
     }
     ctx->guest_base = (uint64_t)(uintptr_t)fetch_window;
-    ctx->task_size = mips_task_size(ctx);
     ctx->region_count = 0U;
-    return 0;
 }
 
 typedef struct {
@@ -426,6 +422,7 @@ static void check_fetch_regions(mips64_ctx_t *ctx)
     fetch_window[0x1fff] = 0x0cU;
     ctx->regions[0].start = 0x1000U;
     ctx->regions[0].end = 0x2000U;
+    ctx->regions[0].prot = MIPS_PROT_READ | MIPS_PROT_EXEC;
     ctx->region_count = 1U;
     if (mips_fetch(ctx, 0x1000U, &word) != 0 || word != 0x0c000000U) {
         printf("FAIL fetch-region: covered 0x1000 got 0x%08x\n", word);
@@ -441,6 +438,13 @@ static void check_fetch_regions(mips64_ctx_t *ctx)
     }
     if (mips_fetch(ctx, 0x2000U, &word) != MIPS_FAULT) {
         printf("FAIL fetch-region: end-exclusive 0x2000 did not fault\n");
+        failures++;
+    }
+    /* RC1: fetch requires PROT_EXEC, so a PROT_NONE page faults
+     * instead of trapping the host (branch-likely pageend probe). */
+    ctx->regions[0].prot = 0U;
+    if (mips_fetch(ctx, 0x1000U, &word) != MIPS_FAULT) {
+        printf("FAIL fetch-region: PROT_NONE 0x1000 did not fault\n");
         failures++;
     }
     ctx->region_count = 0U;
@@ -515,20 +519,14 @@ int main(void)
     /* Fetch checks over the scratch window (N64 LE/BE, then N32 bound). */
     memset(&ctx, 0, sizeof(ctx));
     ctx.is_n32 = 0U;
-    if (guest_mem_init(&ctx) != 0) {
-        printf("FAIL fetch: guest_mem_init stub failed\n");
-        failures++;
-    }
+    use_scratch_window(&ctx);
     check_fetch_le(&ctx);
     check_fetch_be(&ctx);
     check_fetch_faults(&ctx);
     check_fetch_regions(&ctx);
     memset(&ctx, 0, sizeof(ctx));
     ctx.is_n32 = 1U;
-    if (guest_mem_init(&ctx) != 0) {
-        printf("FAIL fetch: guest_mem_init stub failed (n32)\n");
-        failures++;
-    }
+    use_scratch_window(&ctx);
     check_fetch_le(&ctx);
     check_fetch_faults(&ctx);
 
@@ -539,6 +537,6 @@ int main(void)
     printf("DECODE: all %lu cases + %lu classifier checks passed\n",
         (unsigned long)N_CASES, (unsigned long)N_CLASS);
     printf("FETCH: LE+BE window, misalign/limit/region faults passed\n");
-    printf("GUEST_MEM_INIT: local stub (lane L1c src/os/mem.c not on master)\n");
+    printf("GUEST_MEM_INIT: real src/os/mem.c reservation (RC1)\n");
     return 0;
 }

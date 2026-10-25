@@ -552,7 +552,7 @@ bool mips64_space_find_hole(const mips64_space_t *space, uint64_t start, uint64_
         size % MIPS64_PAGE_SIZE != 0 || start < MIPS64_PAGE_SIZE ||
         start > UINT64_MAX - (MIPS64_PAGE_SIZE - 1))
         return false;
-    uint64_t candidate = (start + MIPS64_PAGE_SIZE - 1) & ~(MIPS64_PAGE_SIZE - 1);
+    uint64_t candidate = (start + MIPS64_PAGE_SIZE - 1) & MIPS64_PAGE_MASK;
     size_t first = mips64_space_page_position(space, candidate);
     for (size_t i = first; i < space->count; ++i) {
         if (candidate >= space->limit || size > space->limit - candidate)
@@ -671,7 +671,7 @@ bool mips64_space_remap(mips64_space_t *space, uint64_t source, uint64_t old_siz
     uint64_t start = address;
     size_t remaining = size;
     while (remaining != 0) {
-        uint64_t base = address & ~(MIPS64_PAGE_SIZE - 1);
+        uint64_t base = address & MIPS64_PAGE_MASK;
         size_t position = mips64_space_page_position(space, base);
         if (position == space->count || space->pages[position].address != base)
             return mips64_space_fail(space, address, MIPS64_FAULT_UNMAPPED);
@@ -690,7 +690,7 @@ bool mips64_space_remap(mips64_space_t *space, uint64_t source, uint64_t old_siz
     address = start;
     remaining = size;
     while (remaining != 0) {
-        uint64_t base = address & ~(MIPS64_PAGE_SIZE - 1);
+        uint64_t base = address & MIPS64_PAGE_MASK;
         mips64_backing_t *backing = space->pages[mips64_space_page_position(space, base)].backing;
         if (backing->bus_fault)
             return mips64_space_fail(space, address, MIPS64_FAULT_BUS);
@@ -750,7 +750,7 @@ bool mips64_space_read(mips64_space_t *space, uint64_t address, void *bytes,
         return false;
     unsigned char *out = bytes;
     while (size != 0) {
-        uint64_t base = address & ~(MIPS64_PAGE_SIZE - 1);
+        uint64_t base = address & MIPS64_PAGE_MASK;
         size_t position = mips64_space_page_position(space, base);
         size_t offset = (size_t)(address - base);
         size_t amount = (size_t)MIPS64_PAGE_SIZE - offset;
@@ -796,7 +796,7 @@ bool mips64_space_read(mips64_space_t *space, uint64_t address, void *bytes,
     uint64_t cursor = address;
     size_t remaining = size, used = 0;
     while (remaining != 0) {
-        uint64_t base = cursor & ~(MIPS64_PAGE_SIZE - 1);
+        uint64_t base = cursor & MIPS64_PAGE_MASK;
         mips64_backing_t *backing = space->pages[mips64_space_page_position(space, base)].backing;
         size_t offset = (size_t)(cursor - base);
         size_t amount = (size_t)MIPS64_PAGE_SIZE - offset;

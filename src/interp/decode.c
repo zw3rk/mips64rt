@@ -11,8 +11,9 @@
  * result is host-endian independent (mips_is_be selects the guest byte
  * order). It reports MIPS_FAULT on a null context, a misaligned pc, a
  * pc outside TASK_SIZE, or a pc not covered by any recorded region
- * (when lane L1c has recorded regions; with no regions — e.g. unit
- * tests over a scratch window — only the TASK_SIZE bound applies).
+ * with execute permission (when lane L1c has recorded regions; with
+ * no regions — e.g. unit tests over a scratch window — only the
+ * TASK_SIZE bound applies).
  */
 
 #include "interp/decode.h"
@@ -41,10 +42,15 @@ void mips_decode(uint32_t word, mips_dec_t *d)
 }
 
 /*
- * True when [pc, pc+4) lies inside a recorded guest region. With no
- * regions recorded (region_count == 0, e.g. a scratch window in a unit
- * test) every in-range pc is fetchable; lane L1c records the mapped
- * regions at RC1 and gaps then fault here instead of trapping the host.
+ * True when [pc, pc+4) lies inside a recorded guest region with
+ * execute permission. With no regions recorded (region_count == 0,
+ * e.g. a scratch window in a unit test) every in-range pc is
+ * fetchable; lane L1c records the mapped regions at RC1 and gaps
+ * then fault here instead of trapping the host. The EXEC check is
+ * load-bearing: fetching a PROT_NONE page (branch-likely pageend
+ * probe) must report MIPS_FAULT before the host memcpy touches a
+ * host-PROT_NONE mapping and delivers a host SIGSEGV to the
+ * translator itself.
  */
 static int fetch_covered(const mips64_ctx_t *ctx, uint64_t pc)
 {
@@ -55,7 +61,7 @@ static int fetch_covered(const mips64_ctx_t *ctx, uint64_t pc)
     }
     for (i = 0; i < ctx->region_count; i++) {
         if (ctx->regions[i].start <= pc && pc + 4U <= ctx->regions[i].end) {
-            return 1;
+            return (ctx->regions[i].prot & MIPS_PROT_EXEC) != 0U;
         }
     }
     return 0;

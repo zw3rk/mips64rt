@@ -178,7 +178,8 @@
 #define MIPS64_S3_DINSM 0x05U
 #define MIPS64_S3_DINSU 0x06U
 #define MIPS64_S3_DINS  0x07U
-#define MIPS64_S3_BSHFL 0x20U /* sa picks WSBH/SEB/SEH/DSBH/DSHD (L1b) */
+#define MIPS64_S3_BSHFL 0x20U /* sa picks WSBH/SEB/SEH (L1b) */
+#define MIPS64_S3_DSBH  0x24U /* sa 2 = DSBH, sa 5 = DSHD (L1b) */
 #define MIPS64_S3_RDHWR 0x3bU
 
 /* COP0 selectors (op == MIPS64_OP_COP0, rs field; rs == 16 uses funct). */

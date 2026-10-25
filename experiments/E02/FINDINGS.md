@@ -135,11 +135,16 @@ loads the remainder `mem[8..9]`
 `9 = 2+7`). On LE the same-address spans likewise mirror correctly,
 but the `(0,7)` pair and both stores diverge as recorded above
 (load pair returns a rotated mix, the store scatters outside
-`[X..X+7]`). Whether this is a qemu-LE-only defect or also true of
-silicon is **UNVERIFIED**. Consequence for DBT work: do not treat
-qemu-LE as the oracle for `LDL`/`LDR`/`SDL`/`SDR` codegen; verify
-against the BE oracle or the interpreter's byte-order model, and
-re-check on hardware when available.
+`[X..X+7]`). **RC1 update: VERIFIED architectural, not a qemu-LE
+defect.** The Phase-1 interpreter, written independently from the
+MIPS IV pseudocode (endian-swapped spans, fixed placement), now
+reproduces qemu-LE byte-identically (64-cell parametric proof plus
+the P1 gate, where oracle and interpreter record the same LE
+P1-FAILs). The endianness swaps which span each half covers, so no
+LE engine reconstructs the word from a canonical pair. Consequence
+for DBT work stands: either engine is a valid LE oracle (they
+agree); re-check on silicon remains welcome but is no longer
+blocking.
 
 ## Instruction encodings (confirmed in objdump, identical LE/BE words)
 

@@ -39,15 +39,12 @@
 #define MAP_NORESERVE 0
 #endif
 
-/* Guest prot bits (Linux asm-generic, shared with the MIPS N64/N32
- * target): read/write/exec. */
-#define MIPS_PROT_READ 1U
-#define MIPS_PROT_WRITE 2U
-#define MIPS_PROT_EXEC 4U
+/* Guest prot bits live frozen in core/cpu.h (POSIX numbering); the
+ * loader translates ELF p_flags (opposite corners) at map time. */
 
 static uint64_t page_up(uint64_t v)
 {
-    return (v + (MIPS64_PAGE_SIZE - 1U)) & ~(MIPS64_PAGE_SIZE - 1U);
+    return (v + (MIPS64_PAGE_SIZE - 1U)) & MIPS64_PAGE_MASK;
 }
 
 /* Guest prot bits to host prot bits. PROT_EXEC is never granted: guest
@@ -421,6 +418,7 @@ int guest_st8(mips64_ctx_t *ctx, uint64_t va, uint64_t val)
     }
     b = (uint8_t)(val & 0xFFU);
     memcpy(mips64_guest_ptr(ctx, va), &b, 1U);
+    ctx->llbit = 0U; /* E05: any ordinary store clears the reservation */
     return 0;
 }
 
@@ -471,6 +469,7 @@ int guest_st16(mips64_ctx_t *ctx, uint64_t va, uint64_t val)
         b[1] = (uint8_t)((val >> 8) & 0xFFU);
     }
     memcpy(mips64_guest_ptr(ctx, va), b, 2U);
+    ctx->llbit = 0U; /* E05: any ordinary store clears the reservation */
     return 0;
 }
 
@@ -527,6 +526,7 @@ int guest_st32(mips64_ctx_t *ctx, uint64_t va, uint64_t val)
         b[3] = (uint8_t)((val >> 24) & 0xFFU);
     }
     memcpy(mips64_guest_ptr(ctx, va), b, 4U);
+    ctx->llbit = 0U; /* E05: any ordinary store clears the reservation */
     return 0;
 }
 
@@ -595,5 +595,6 @@ int guest_st64(mips64_ctx_t *ctx, uint64_t va, uint64_t val)
         b[7] = (uint8_t)((val >> 56) & 0xFFU);
     }
     memcpy(mips64_guest_ptr(ctx, va), b, 8U);
+    ctx->llbit = 0U; /* E05: any ordinary store clears the reservation */
     return 0;
 }

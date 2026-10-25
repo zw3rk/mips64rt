@@ -58,9 +58,19 @@ static int fetch_decode(mips64_ctx_t *ctx, uint64_t pc, mips_dec_t *d)
 static int exec_syscall(mips64_ctx_t *ctx)
 {
     uint64_t before = ctx->pc;
+    uint64_t nr = ctx->gpr[MIPS64_REG_V0];
 
     ctx->llbit = 0;
     (void)mips_syscall(ctx);
+    if (ctx->trace_enabled) {
+        (void)fprintf(stderr, "S %llu a0=%llx a1=%llx a2=%llx -> v0=%llx a3=%llu\n",
+                      (unsigned long long)nr,
+                      (unsigned long long)ctx->gpr[MIPS64_REG_A0],
+                      (unsigned long long)ctx->gpr[MIPS64_REG_A1],
+                      (unsigned long long)ctx->gpr[MIPS64_REG_A2],
+                      (unsigned long long)ctx->gpr[MIPS64_REG_V0],
+                      (unsigned long long)ctx->gpr[MIPS64_REG_A3]);
+    }
     if (ctx->exit_reason != MIPS64_EXIT_NONE) {
         return 1;
     }
@@ -488,7 +498,7 @@ static int exec_special3(mips64_ctx_t *ctx, uint64_t cur_pc,
     case 0x05u: /* DINSM: pos = sa (0..31), msb = rd + 32 (32..63) */
     case 0x06u: /* DINSU: pos = sa + 32, msb = rd + 32 (32..63) */
     case 0x07u: { /* DINS: pos = sa, msb = rd (0..31) */
-        unsigned pos = (d->sa & 31u) + ((d->funct == 0x07u) ? 0u : 32u);
+        unsigned pos = (d->sa & 31u) + ((d->funct == 0x06u) ? 32u : 0u);
         unsigned msb = (d->rd & 31u) + ((d->funct == 0x07u) ? 0u : 32u);
 
         if (msb < pos) {
@@ -505,7 +515,25 @@ static int exec_special3(mips64_ctx_t *ctx, uint64_t cur_pc,
     }
     case 0x20u: /* BSHFL: source is rt (rs is unused, always $0). */
         switch (d->sa) {
-        case 1u: { /* DSBH: swap bytes within each halfword */
+        case 2u: /* WSBH: swap bytes within each halfword of low word */
+            interp_set_reg(ctx, d->rd,
+                           interp_sext32(((rt & 0x00FF00FFu) << 8) |
+                                         ((rt & 0xFF00FF00u) >> 8)));
+            return 0;
+        case 16u: /* SEB */
+            interp_set_reg(ctx, d->rd,
+                           (uint64_t)(int64_t)(int8_t)(rt & 0xFFu));
+            return 0;
+        case 24u: /* SEH */
+            interp_set_reg(ctx, d->rd,
+                           (uint64_t)(int64_t)(int16_t)(rt & 0xFFFFu));
+            return 0;
+        default:
+            return fault_at(ctx, cur_pc);
+        }
+    case 0x24u: /* DSBH/DSHD: source is rt (rs is unused, always $0). */
+        switch (d->sa) {
+        case 2u: { /* DSBH: swap bytes within each halfword */
             uint64_t v = rt;
             uint64_t out = 0u;
             unsigned h;
@@ -519,23 +547,12 @@ static int exec_special3(mips64_ctx_t *ctx, uint64_t cur_pc,
             interp_set_reg(ctx, d->rd, out);
             return 0;
         }
-        case 2u: /* WSBH: swap bytes within each halfword of low word */
+        case 5u: /* DSHD: mirror halfword order across the doubleword */
             interp_set_reg(ctx, d->rd,
-                           interp_sext32(((rt & 0x00FF00FFu) << 8) |
-                                         ((rt & 0xFF00FF00u) >> 8)));
-            return 0;
-        case 3u: /* DSHD: swap halfwords within each word */
-            interp_set_reg(ctx, d->rd,
-                           ((rt & UINT64_C(0xFFFF0000FFFF0000)) >> 16) |
-                               ((rt & UINT64_C(0x0000FFFF0000FFFF)) << 16));
-            return 0;
-        case 16u: /* SEB */
-            interp_set_reg(ctx, d->rd,
-                           (uint64_t)(int64_t)(int8_t)(rt & 0xFFu));
-            return 0;
-        case 24u: /* SEH */
-            interp_set_reg(ctx, d->rd,
-                           (uint64_t)(int64_t)(int16_t)(rt & 0xFFFFu));
+                           ((rt & UINT64_C(0xFFFF)) << 48) |
+                               ((rt & UINT64_C(0xFFFF0000)) << 16) |
+                               ((rt >> 16) & UINT64_C(0xFFFF0000)) |
+                               ((rt >> 48) & UINT64_C(0xFFFF)));
             return 0;
         default:
             return fault_at(ctx, cur_pc);
@@ -616,17 +633,14 @@ static int exec_simple(mips64_ctx_t *ctx, uint64_t cur_pc, const mips_dec_t *d)
         interp_set_reg(ctx, d->rt,
                        ctx->gpr[d->rs] < (uint64_t)(int64_t)d->simm ? 1u : 0u);
         return 0;
-    case 0x0Cu: /* ANDI */
-        interp_set_reg(ctx, d->rt,
-                       interp_sext32((uint32_t)ctx->gpr[d->rs] & d->uimm));
+    case 0x0Cu: /* ANDI: rs AND zero-extended imm (clears high bits) */
+        interp_set_reg(ctx, d->rt, ctx->gpr[d->rs] & (uint64_t)d->uimm);
         return 0;
-    case 0x0Du: /* ORI */
-        interp_set_reg(ctx, d->rt,
-                       interp_sext32((uint32_t)ctx->gpr[d->rs] | d->uimm));
+    case 0x0Du: /* ORI: rs OR zero-extended imm (preserves high bits) */
+        interp_set_reg(ctx, d->rt, ctx->gpr[d->rs] | (uint64_t)d->uimm);
         return 0;
-    case 0x0Eu: /* XORI */
-        interp_set_reg(ctx, d->rt,
-                       interp_sext32((uint32_t)ctx->gpr[d->rs] ^ d->uimm));
+    case 0x0Eu: /* XORI: rs XOR zero-extended imm (preserves high bits) */
+        interp_set_reg(ctx, d->rt, ctx->gpr[d->rs] ^ (uint64_t)d->uimm);
         return 0;
     case 0x0Fu: /* LUI */
         interp_set_reg(ctx, d->rt, interp_sext32(d->uimm << 16));

@@ -230,7 +230,7 @@ static int mmap_pages(mips64_mm_view_t *view, mips64_family_guard_t *guard,
     else if (length > UINT64_MAX - (MIPS64_PAGE_SIZE - 1))
         failure = 12;
     uint64_t size = failure == 0 ?
-        (length + MIPS64_PAGE_SIZE - 1) & ~(MIPS64_PAGE_SIZE - 1) : 0;
+        (length + MIPS64_PAGE_SIZE - 1) & MIPS64_PAGE_MASK : 0;
     uint64_t limit = view->space->limit;
     if (failure == 0 && size > limit)
         failure = 12;
@@ -255,7 +255,7 @@ static int mmap_pages(mips64_mm_view_t *view, mips64_family_guard_t *guard,
             }
         }
     } else {
-        address &= ~(MIPS64_PAGE_SIZE - 1);
+        address &= MIPS64_PAGE_MASK;
         uint64_t found = 0;
         bool hint = address >= MIPS64_PAGE_SIZE && address < limit && size <= limit - address &&
             mips64_space_find_hole(view->space, address, size, &found) && found == address;
@@ -416,8 +416,8 @@ int mips64_mm_view_brk(mips64_mm_view_t *view, mips64_family_guard_t *guard,
     if (address == previous || address < minimum || address >= limit || previous == 0) {
         *guest_result = previous; return 0;
     }
-    uint64_t old_end = (previous + MIPS64_PAGE_SIZE - 1) & ~(MIPS64_PAGE_SIZE - 1);
-    uint64_t new_end = (address + MIPS64_PAGE_SIZE - 1) & ~(MIPS64_PAGE_SIZE - 1);
+    uint64_t old_end = (previous + MIPS64_PAGE_SIZE - 1) & MIPS64_PAGE_MASK;
+    uint64_t new_end = (address + MIPS64_PAGE_SIZE - 1) & MIPS64_PAGE_MASK;
     bool growing = new_end > old_end;
     if ((new_end < old_end && !overlaps(&view->applied, new_end, old_end)) ||
         (growing && (new_end > limit - MIPS64_PAGE_SIZE ||
@@ -443,7 +443,7 @@ int mips64_mm_view_brk(mips64_mm_view_t *view, mips64_family_guard_t *guard,
     mips64_mm_view_plan_t plan = {0};
     int result = -1, saved = 0;
     if (growing) {
-        uint64_t anchor = (minimum + MIPS64_PAGE_SIZE - 1) & ~(MIPS64_PAGE_SIZE - 1);
+        uint64_t anchor = (minimum + MIPS64_PAGE_SIZE - 1) & MIPS64_PAGE_MASK;
         mips64_vma_t vma = {old_end, new_end, state.brk_id, old_end - anchor, 3, 7, MIPS64_VMA_BRK};
         if (!mips64_family_backing_install(view->backing, &fresh)) { saved = EIO; goto done; }
         if (!mips64_family_backing_stage_anonymous(view->backing, &fresh, old_end, new_end - old_end, 3)) {

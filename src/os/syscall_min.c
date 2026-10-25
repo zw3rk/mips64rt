@@ -6,9 +6,11 @@
  *
  * Implements the Phase 1 subset per SPEC 2.2 and the phase-1 lane card:
  * exit, exit_group, read, write, brk, mmap, munmap, mprotect, uname,
- * set_tid_address. Dual numbers from src/os/syscall_nr.h (N64 base 5000,
- * N32 base 6000) selected by ctx->is_n32. Unknown syscalls report
- * -ENOSYS with $a3=1.
+ * set_tid_address, plus the RC1 test-harness minimum: fork, the
+ * fork-equivalent clone subset musl's fork() uses, and wait4 with NULL
+ * rusage (full clone/threads/signals stay Phase 4, lane L4b). Dual
+ * numbers from src/os/syscall_nr.h (N64 base 5000, N32 base 6000)
+ * selected by ctx->is_n32. Unknown syscalls report -ENOSYS with $a3=1.
  *
  * N64/N32 convention (E01 FINDINGS): the number arrives in $v0, args
  * 1..6 in $a0..$a5 (full 64-bit registers, no O32 stack slots, no
@@ -42,6 +44,7 @@
 #include <sys/mman.h>
 #include <sys/types.h>
 #include <sys/utsname.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 /* Region helpers owned by src/os/mem.c (lane L1c). */
@@ -155,7 +158,7 @@ static int64_t sc_write(mips64_ctx_t *ctx, uint64_t fd, uint64_t buf,
 static int64_t sc_brk(mips64_ctx_t *ctx, uint64_t addr)
 {
     uint64_t aligned;
-    uint64_t total;
+    uint64_t have;
     int rc;
 
     if (addr == 0U || addr == ctx->brk_curr) {
@@ -171,24 +174,28 @@ static int64_t sc_brk(mips64_ctx_t *ctx, uint64_t addr)
     if (ctx->brk_base == 0U) {
         return sc_ret(ctx, (int64_t)ctx->brk_curr);
     }
-    aligned = (addr + (MIPS64_PAGE_SIZE - 1U)) & ~(MIPS64_PAGE_SIZE - 1U);
+    aligned = (addr + (MIPS64_PAGE_SIZE - 1U)) & MIPS64_PAGE_MASK;
     if (aligned < addr) {
         return sc_ret(ctx, -(int64_t)ENOMEM);
     }
-    total = aligned - ctx->brk_base;
-    if (total > ctx->task_size || ctx->brk_base > ctx->task_size - total) {
+    if (aligned > ctx->task_size) {
         return sc_ret(ctx, -(int64_t)ENOMEM);
     }
-    rc = mips_mem_map(ctx, ctx->brk_base, total,
-                      MIPS_PROT_READ | MIPS_PROT_WRITE, "heap");
-    if (rc == -EEXIST) {
-        /* The heap record already covers the growth (loader-adjacent
-         * segments or a repeat call): just move the mark. */
-        ctx->brk_curr = addr;
-        return sc_ret(ctx, (int64_t)ctx->brk_curr);
-    }
-    if (rc != 0) {
-        return sc_ret(ctx, (int64_t)rc);
+    /* RC1 integration: map only the not-yet-mapped extension. */
+    have = ctx->brk_curr > ctx->brk_base ?
+           ((ctx->brk_curr + (MIPS64_PAGE_SIZE - 1U)) &
+            MIPS64_PAGE_MASK) : ctx->brk_base;
+    if (aligned > have) {
+        rc = mips_mem_map(ctx, have, aligned - have,
+                          MIPS_PROT_READ | MIPS_PROT_WRITE, "heap");
+        if (rc == -EEXIST &&
+            !mips_mem_ok(ctx, have, aligned - have,
+                         MIPS_PROT_READ | MIPS_PROT_WRITE)) {
+            return sc_ret(ctx, -(int64_t)ENOMEM);
+        }
+        if (rc != 0 && rc != -EEXIST) {
+            return sc_ret(ctx, -(int64_t)rc);
+        }
     }
     ctx->brk_curr = addr;
     return sc_ret(ctx, (int64_t)ctx->brk_curr);
@@ -231,7 +238,7 @@ static uint64_t pick_hole(mips64_ctx_t *ctx, uint64_t hint, uint64_t size)
     uint64_t va;
 
     if (hint != 0U) {
-        va = hole_from(ctx, hint & ~(MIPS64_PAGE_SIZE - 1U), size);
+        va = hole_from(ctx, hint & MIPS64_PAGE_MASK, size);
         if (va != 0U) {
             return va;
         }
@@ -255,7 +262,7 @@ static int64_t sc_mmap(mips64_ctx_t *ctx, uint64_t addr, uint64_t len,
     if (len == 0U || (prot & ~(uint64_t)7U) != 0U) {
         return sc_ret(ctx, -(int64_t)EINVAL);
     }
-    size = (len + (MIPS64_PAGE_SIZE - 1U)) & ~(MIPS64_PAGE_SIZE - 1U);
+    size = (len + (MIPS64_PAGE_SIZE - 1U)) & MIPS64_PAGE_MASK;
     if (size == 0U || size > ctx->task_size) {
         return sc_ret(ctx, -(int64_t)ENOMEM);
     }
@@ -264,7 +271,7 @@ static int64_t sc_mmap(mips64_ctx_t *ctx, uint64_t addr, uint64_t len,
         return sc_ret(ctx, -(int64_t)EINVAL);
     }
     if ((flags & MIPS_MAP_FIXED) != 0U) {
-        va = addr & ~(MIPS64_PAGE_SIZE - 1U);
+        va = addr & MIPS64_PAGE_MASK;
         if (va + size < va || va + size > ctx->task_size) {
             return sc_ret(ctx, -(int64_t)EINVAL);
         }
@@ -277,7 +284,7 @@ static int64_t sc_mmap(mips64_ctx_t *ctx, uint64_t addr, uint64_t len,
             return sc_ret(ctx, (int64_t)rc);
         }
     } else if ((flags & MIPS_MAP_FIXED_NOREPLACE) != 0U && addr != 0U) {
-        va = addr & ~(MIPS64_PAGE_SIZE - 1U);
+        va = addr & MIPS64_PAGE_MASK;
         if (va + size < va || va + size > ctx->task_size) {
             return sc_ret(ctx, -(int64_t)EINVAL);
         }
@@ -377,6 +384,127 @@ static int64_t sc_uname(mips64_ctx_t *ctx, uint64_t va)
     return sc_ret(ctx, 0);
 }
 
+/* MIPS clone flags (Linux kernel ABI, arch-independent). Phase 1
+ * supports only the fork-equivalent subset musl's fork() uses. */
+#define MIPS_CLONE_VM 0x100U
+#define MIPS_CLONE_FS 0x200U
+#define MIPS_CLONE_FILES 0x400U
+#define MIPS_CLONE_SIGHAND 0x800U
+#define MIPS_CLONE_PTRACE 0x2000U
+#define MIPS_CLONE_VFORK 0x4000U
+#define MIPS_CLONE_PARENT 0x8000U
+#define MIPS_CLONE_THREAD 0x10000U
+#define MIPS_CLONE_SYSVSEM 0x40000U
+#define MIPS_CLONE_SETTLS 0x80000U
+#define MIPS_CLONE_PARENT_SETTID 0x100000U
+#define MIPS_CLONE_CHILD_CLEARTID 0x200000U
+#define MIPS_CLONE_CHILD_SETTID 0x1000000U
+/* MIPS signal numbers (asm/signal.h) differ from asm-generic: SIGCHLD
+ * is 18 on MIPS, not 17. musl's fork() passes it as clone's signal. */
+#define MIPS_SIGCHLD 18U
+#define MIPS_CLONE_SHARE_MASK \
+    (MIPS_CLONE_VM | MIPS_CLONE_FS | MIPS_CLONE_FILES | \
+     MIPS_CLONE_SIGHAND | MIPS_CLONE_PTRACE | MIPS_CLONE_VFORK | \
+     MIPS_CLONE_PARENT | MIPS_CLONE_THREAD | MIPS_CLONE_SYSVSEM | \
+     MIPS_CLONE_SETTLS)
+
+/* Plain fork(): every guest mapping is MAP_PRIVATE (COW), so host
+ * fork() diverges parent and child with no extra work. */
+static int64_t sc_fork(mips64_ctx_t *ctx)
+{
+    pid_t pid = fork();
+
+    if (pid < 0) {
+        return sc_ret(ctx, -(int64_t)errno);
+    }
+    if (pid == 0) {
+        return sc_ret(ctx, 0); /* child */
+    }
+    return sc_ret(ctx, (int64_t)pid); /* parent */
+}
+
+/* Minimal clone(): only the fork-equivalent form (SIGCHLD exit signal,
+ * optional child-tid bookkeeping). Address-space or thread sharing is
+ * Phase 4 (L4b) and reports ENOSYS. */
+static int64_t sc_clone(mips64_ctx_t *ctx, uint64_t flags,
+                        uint64_t parent_tid, uint64_t ctid)
+{
+    pid_t pid;
+
+    if ((flags & 0xFFU) != (uint64_t)MIPS_SIGCHLD) {
+        return sc_ret(ctx, -(int64_t)EINVAL);
+    }
+    if ((flags & (uint64_t)MIPS_CLONE_SHARE_MASK) != 0U) {
+        return sc_ret(ctx, -(int64_t)ENOSYS);
+    }
+    pid = fork();
+    if (pid < 0) {
+        return sc_ret(ctx, -(int64_t)errno);
+    }
+    if (pid == 0) {
+        int32_t tid;
+
+        if ((flags & (uint64_t)MIPS_CLONE_CHILD_CLEARTID) != 0U) {
+            ctx->clear_child_tid = ctid;
+        }
+        if ((flags & (uint64_t)MIPS_CLONE_CHILD_SETTID) != 0U &&
+            ctid != 0U) {
+            tid = (int32_t)getpid();
+            if ((ctid & 3U) != 0U ||
+                !mips_mem_ok(ctx, ctid, 4U, MIPS_PROT_WRITE)) {
+                mips_fault(ctx, ctid);
+                return sc_ret(ctx, -(int64_t)EFAULT);
+            }
+            /* guest_st32: endian-correct store (BE guests must see
+             * the scalar value, not host-native bytes). */
+            guest_st32(ctx, ctid, (uint64_t)(uint32_t)tid);
+        }
+        return sc_ret(ctx, 0); /* child */
+    }
+    if ((flags & (uint64_t)MIPS_CLONE_PARENT_SETTID) != 0U &&
+        parent_tid != 0U) {
+        int32_t tid = (int32_t)pid;
+
+        if ((parent_tid & 3U) != 0U ||
+            !mips_mem_ok(ctx, parent_tid, 4U, MIPS_PROT_WRITE)) {
+            return sc_ret(ctx, -(int64_t)EFAULT);
+        }
+        guest_st32(ctx, parent_tid, (uint64_t)(uint32_t)tid);
+    }
+    return sc_ret(ctx, (int64_t)pid); /* parent */
+}
+
+/* wait4(): waitpid with a guest status word. The wait status is a plain
+ * int with the kernel layout on every arch, so it stores unconverted.
+ * Non-NULL rusage is Phase 4 and reports ENOSYS. */
+static int64_t sc_wait4(mips64_ctx_t *ctx, uint64_t pid, uint64_t status_va,
+                        uint64_t options, uint64_t rusage_va)
+{
+    int status = 0;
+    pid_t ret;
+
+    if (rusage_va != 0U) {
+        return sc_ret(ctx, -(int64_t)ENOSYS);
+    }
+    if (status_va != 0U &&
+        ((status_va & 3U) != 0U ||
+         !mips_mem_ok(ctx, status_va, 4U, MIPS_PROT_WRITE))) {
+        return sc_ret(ctx, -(int64_t)EFAULT);
+    }
+    ret = waitpid((pid_t)(int64_t)pid, status_va != 0U ? &status : NULL,
+                  (int)(options & 0xFFFFFFFFU));
+    if (ret < 0) {
+        return sc_ret(ctx, -(int64_t)errno);
+    }
+    if (status_va != 0U) {
+        /* The wait status is a plain int with the kernel layout on
+         * every arch, but the bytes must follow guest endianness:
+         * a BE LW over host-native bytes reads garbage. */
+        guest_st32(ctx, status_va, (uint64_t)(uint32_t)status);
+    }
+    return sc_ret(ctx, (int64_t)ret);
+}
+
 int64_t mips_syscall(mips64_ctx_t *ctx)
 {
     uint64_t nr;
@@ -429,7 +557,7 @@ int64_t mips_syscall(mips64_ctx_t *ctx)
         if (a1 == 0U) {
             return sc_ret(ctx, -(int64_t)EINVAL);
         }
-        rc = mips_mem_unmap(ctx, a0 & ~(MIPS64_PAGE_SIZE - 1U), a1);
+        rc = mips_mem_unmap(ctx, a0 & MIPS64_PAGE_MASK, a1);
         if (rc != 0) {
             return sc_ret(ctx, (int64_t)rc);
         }
@@ -441,7 +569,7 @@ int64_t mips_syscall(mips64_ctx_t *ctx)
         if (a1 == 0U || (a2 & ~(uint64_t)7U) != 0U) {
             return sc_ret(ctx, -(int64_t)EINVAL);
         }
-        rc = mips_mem_protect(ctx, a0 & ~(MIPS64_PAGE_SIZE - 1U), a1,
+        rc = mips_mem_protect(ctx, a0 & MIPS64_PAGE_MASK, a1,
                               (uint32_t)(a2 & 7U));
         if (rc != 0) {
             return sc_ret(ctx, (int64_t)rc);
@@ -450,6 +578,22 @@ int64_t mips_syscall(mips64_ctx_t *ctx)
     }
     if (nr == (uint64_t)(n32 ? MIPS64_NR32_uname : MIPS64_NR_uname)) {
         return sc_uname(ctx, a0);
+    }
+    if (nr == (uint64_t)(n32 ? MIPS64_NR32_fork : MIPS64_NR_fork)) {
+        /* RC1 integration: the P1 gate forks children for fault
+         * tests (full clone(2) is Phase 4, lane L4b). */
+        return sc_fork(ctx);
+    }
+    if (nr == (uint64_t)(n32 ? MIPS64_NR32_clone : MIPS64_NR_clone)) {
+        /* RC1 integration: musl's fork() arrives here (a0 = flags,
+         * a1 = stack, a2 = parent_tid, a3 = child_tid). Only the
+         * fork-equivalent subset is served; thread sharing is ENOSYS
+         * until Phase 4 (L4b). */
+        return sc_clone(ctx, a0, a2, a3);
+    }
+    if (nr == (uint64_t)(n32 ? MIPS64_NR32_wait4 : MIPS64_NR_wait4)) {
+        /* RC1 integration: waitpid(2) is wait4 with NULL rusage. */
+        return sc_wait4(ctx, a0, a1, a2, a3);
     }
     if (nr == (uint64_t)(n32 ? MIPS64_NR32_set_tid_address
                              : MIPS64_NR_set_tid_address)) {
@@ -460,6 +604,15 @@ int64_t mips_syscall(mips64_ctx_t *ctx)
         /* Single-threaded Phase 1: pid is the tid (real tids in
          * Phase 4). E06: the N64 number is 5212, the N32 number 6213. */
         return sc_ret(ctx, (int64_t)getpid());
+    }
+    if (nr == (uint64_t)(n32 ? MIPS64_NR32_set_thread_area
+                             : MIPS64_NR_set_thread_area)) {
+        /* RC1 integration (mips32rt precedent): glibc static startup
+         * installs its TLS/TCB address here before touching thread
+         * variables. E06: N64 5242 / N32 6246; rdhwr $29 reads it
+         * back via ctx->ulr. */
+        ctx->ulr = a0;
+        return sc_ret(ctx, 0);
     }
     return sc_ret(ctx, -(int64_t)ENOSYS);
 }

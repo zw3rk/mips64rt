@@ -15,9 +15,11 @@
  * MANUAL-correct (BE-consistent) E02 values, RDHWR/$29 with a
  * set_thread_area round-trip, LWU, an unaligned-LW fault in a
  * child (exit 139, suite survives), and a raw write+exit path.
- * Unaligned-pair note (E02): qemu-LE swaps the address roles, so
- * canonical pairs print P1-FAIL under the LE oracles (recorded
- * honestly) while the interpreter prints P1-PASS.
+ * Unaligned-pair note (RC1 integration): the LE canonical pairs
+ * cannot compose a full word (architectural LE asymmetry — the
+ * endianness swaps which span each half covers, so no LE engine
+ * reconstructs the word). Both the oracle and the interpreter record
+ * the same P1-FAILs there, and LE parity holds including the FAILs.
  *
  * Protocol: "P1-PASS <name>" (no values: interp/qemu lines match),
  * "P1-FAIL <name> got=.. want=..", "P1-INFO ..." observations, and
@@ -508,8 +510,9 @@ static void t_llsc(void)
 
 /* LWL/LWR/SWL/SWR at all four alignments. Canonical pairs: lwl X +
  * lwr X+3 loads mem[X..X+3] in memory order; swl X + swr X+3
- * deposits the value there. Byte-exact on BE; the LE oracle swaps
- * the address roles (E02), so LE prints record the defect honestly. */
+ * deposits the value there. Byte-exact on BE; on LE the pairs are
+ * architecturally unable to compose the word (see the header note),
+ * so both oracle and interpreter record the same P1-FAILs. */
 static volatile uint8_t g_w32[24] __attribute__((aligned(8)));
 
 static uint32_t memord32(const volatile uint8_t *x)

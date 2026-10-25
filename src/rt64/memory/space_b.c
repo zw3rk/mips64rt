@@ -17,7 +17,7 @@ static bool prepare_write(mips64_space_t *space, uint64_t address,
     bool touches_shared = false;
     size_t touched_pages = 0;
     while (remaining != 0) {
-        uint64_t base = cursor & ~(MIPS64_PAGE_SIZE - 1);
+        uint64_t base = cursor & MIPS64_PAGE_MASK;
         mips64_page_t *page = &space->pages[mips64_space_page_position(space, base)];
         size_t offset = (size_t)(cursor - base);
         size_t amount = (size_t)MIPS64_PAGE_SIZE - offset;
@@ -62,7 +62,7 @@ bool mips64_space_cow_file_page(mips64_space_t *space, uint64_t address)
 {
     if (space == NULL || !mips64_space_validate_access(space, address, 1, MIPS64_MEM_WRITE))
         return false;
-    uint64_t base = address & ~(MIPS64_PAGE_SIZE - 1);
+    uint64_t base = address & MIPS64_PAGE_MASK;
     mips64_backing_t *backing = space->pages[mips64_space_page_position(space, base)].backing;
     if (backing->file == NULL || backing->private_cow)
         return true;
@@ -115,7 +115,7 @@ mips64_copyout_t *mips64_space_copyout_prepare(mips64_space_t *space, uint64_t a
                count * sizeof(*copyout->touches));
     }
     for (size_t i = 0; i < count; ++i) {
-        uint64_t base = (address & ~(MIPS64_PAGE_SIZE - 1)) + (uint64_t)i * MIPS64_PAGE_SIZE;
+        uint64_t base = (address & MIPS64_PAGE_MASK) + (uint64_t)i * MIPS64_PAGE_SIZE;
         mips64_page_t *page = &space->pages[mips64_space_page_position(space, base)];
         if (!mips64_backing_retain(page->backing)) {
             (void)mips64_space_fail(space, base, MIPS64_FAULT_INTERNAL);
@@ -340,7 +340,7 @@ static bool write_prepared_bytes(mips64_space_t *space, uint64_t address,
     uint64_t cursor = address;
     size_t remaining = size;
     while (remaining != 0) {
-        uint64_t base = cursor & ~(MIPS64_PAGE_SIZE - 1);
+        uint64_t base = cursor & MIPS64_PAGE_MASK;
         mips64_backing_t *backing = space->pages[mips64_space_page_position(space, base)].backing;
         size_t offset = (size_t)(cursor - base);
         size_t amount = (size_t)MIPS64_PAGE_SIZE - offset;
@@ -360,7 +360,7 @@ static bool write_prepared_bytes(mips64_space_t *space, uint64_t address,
     }
     const unsigned char *in = bytes;
     while (size != 0) {
-        uint64_t base = address & ~(MIPS64_PAGE_SIZE - 1);
+        uint64_t base = address & MIPS64_PAGE_MASK;
         size_t position = mips64_space_page_position(space, base);
         size_t offset = (size_t)(address - base);
         size_t amount = (size_t)MIPS64_PAGE_SIZE - offset;
@@ -542,7 +542,7 @@ bool mips64_space_atomic(mips64_space_t *space, const mips64_atomic_request_t *r
                               MIPS64_MEM_READ | MIPS64_MEM_WRITE;
     if (!mips64_space_validate_access(space, request->address, request->width, permission))
         return false;
-    uint64_t base = request->address & ~(MIPS64_PAGE_SIZE - 1);
+    uint64_t base = request->address & MIPS64_PAGE_MASK;
     mips64_page_t *page = &space->pages[mips64_space_page_position(space, base)];
     size_t offset = (size_t)(request->address - base);
     size_t granule = offset / MIPS64_RESERVATION_GRANULE;

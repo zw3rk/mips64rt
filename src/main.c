@@ -32,6 +32,7 @@
 #define MIPS64RT_ELFCLASS32 1u
 #define MIPS64RT_ELFCLASS64 2u
 #define MIPS64RT_ELFDATA2LSB 1u
+#define MIPS64RT_ELFDATA2MSB 2u
 #define MIPS64RT_EM_MIPS 8u
 #define MIPS64RT_ET_EXEC 2u
 #define MIPS64RT_ET_DYN 3u
@@ -94,18 +95,28 @@ static int admit_elf(const char *path, int *is_n32)
     if (ehdr[0] != MIPS64RT_ELF_MAGIC0 || ehdr[1] != MIPS64RT_ELF_MAGIC1 ||
         ehdr[2] != MIPS64RT_ELF_MAGIC2 || ehdr[3] != MIPS64RT_ELF_MAGIC3 ||
         (ehdr[4] != MIPS64RT_ELFCLASS64 && ehdr[4] != MIPS64RT_ELFCLASS32) ||
-        ehdr[5] != MIPS64RT_ELFDATA2LSB) {
+        (ehdr[5] != MIPS64RT_ELFDATA2LSB &&
+         ehdr[5] != MIPS64RT_ELFDATA2MSB)) {
         errno = ENOEXEC;
         return -1;
     }
-    if (ehdr[18] != MIPS64RT_EM_MIPS || ehdr[19] != 0) {
-        errno = ENOEXEC;
-        return -1;
-    }
-    if ((ehdr[16] != MIPS64RT_ET_EXEC && ehdr[16] != MIPS64RT_ET_DYN) ||
-        ehdr[17] != 0) {
-        errno = ENOEXEC;
-        return -1;
+    /* RC1 integration: e_type/e_machine follow the file's byte order
+     * (BE files store 8 as 00 08); the loader revalidates fully. */
+    {
+        int be = ehdr[5] == MIPS64RT_ELFDATA2MSB;
+        unsigned et = be ? ((unsigned)ehdr[16] << 8 | (unsigned)ehdr[17]) :
+                           ((unsigned)ehdr[16] | (unsigned)ehdr[17] << 8);
+        unsigned em = be ? ((unsigned)ehdr[18] << 8 | (unsigned)ehdr[19]) :
+                           ((unsigned)ehdr[18] | (unsigned)ehdr[19] << 8);
+
+        if (em != MIPS64RT_EM_MIPS) {
+            errno = ENOEXEC;
+            return -1;
+        }
+        if (et != MIPS64RT_ET_EXEC && et != MIPS64RT_ET_DYN) {
+            errno = ENOEXEC;
+            return -1;
+        }
     }
     *is_n32 = ehdr[4] == MIPS64RT_ELFCLASS32;
     return 0;

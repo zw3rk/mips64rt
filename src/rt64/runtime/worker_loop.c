@@ -1,10 +1,18 @@
 /* Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0
+ *
+ * RC1 integration (coordinator): dispatch to the Phase 1 loader +
+ * reference interpreter. The dbt engine arrives in Phase 2.
  */
 #include "runtime/worker_loop.h"
 
+#include "interp/interp.h"
+#include "loader.h"
+
 #include <stdio.h>
 #include <string.h>
+
+extern char **environ;
 
 mips64_engine_t mips64_engine_from_name(const char *name, bool *ok)
 {
@@ -39,9 +47,32 @@ int mips64_worker_loop_run(const mips64_run_config_t *config, int guest_argc,
         fputs("mips64rt: --difftest requires the dbt engine\n", stderr);
         return 2;
     }
-    /* Guest execution lands in Phase 1 (interp) / Phase 2 (dbt). */
-    fprintf(stderr, "mips64rt: cannot execute '%s' yet (engine=%s): "
-            "Phase 0 bootstrap only supports --version/--help\n",
-            guest_argv[0], mips64_engine_name(config->engine));
-    return 2;
+    if (config->engine == MIPS64_ENGINE_DBT) {
+        fprintf(stderr, "mips64rt: cannot execute '%s' with engine=dbt: "
+                "the AArch64 translator arrives in Phase 2\n", guest_argv[0]);
+        return 2;
+    }
+    {
+        /* Single guest thread in Phase 1: one static context (large
+         * region table; Phase 4 moves contexts per thread). */
+        static mips64_ctx_t ctx;
+        int rc;
+
+        mips_loader_init_ctx(&ctx);
+        if (mips_load_elf(&ctx, guest_argv[0], guest_argv, environ) != 0) {
+            fprintf(stderr, "mips64rt: cannot load '%s'\n", guest_argv[0]);
+            return 1;
+        }
+        /* Flags after the load: mips_load_elf re-initialises the context. */
+        ctx.engine = MIPS64_ENGINE_INTERP;
+        ctx.trace_enabled = config->trace;
+        ctx.difftest_enabled = config->difftest;
+        rc = interp_run(&ctx);
+        if (rc != 0) {
+            fprintf(stderr, "mips64rt: guest fault at pc=0x%llx (exit %d)\n",
+                    (unsigned long long)ctx.pc, rc);
+            return 139;
+        }
+        return 0; /* unreachable: guest exit() ends the process via _Exit */
+    }
 }

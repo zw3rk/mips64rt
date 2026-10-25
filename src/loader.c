@@ -17,7 +17,11 @@
  * envp/auxv incl. AT_PHDR/AT_ENTRY, AT_UID/AT_EUID/AT_GID/AT_EGID,
  * AT_CLKTCK=100) is built at the per-ABI stack top with the native
  * word size (8 bytes N64, 4 bytes N32) in guest byte order.
+ *
+ * RC1 integration: expose _POSIX_C_SOURCE so musl sees clock_gettime
+ * under strict -std=c11 (same pattern as src/main.c).
  */
+#define _POSIX_C_SOURCE 200809L
 
 #include "loader.h"
 
@@ -589,14 +593,26 @@ int mips_load_elf(mips64_ctx_t *ctx, const char *path, char **argv,
         page_off = va & (MIPS64_PAGE_SIZE - 1U);
         map_va = va - page_off;
         map_len = (ph.memsz + page_off + (MIPS64_PAGE_SIZE - 1U)) &
-                  ~(MIPS64_PAGE_SIZE - 1U);
+                  MIPS64_PAGE_MASK;
         if (map_len == 0U || map_va + map_len < map_va ||
             map_va + map_len > ctx->task_size) {
             close(fd);
             errno = ENOEXEC;
             return -1;
         }
-        prot = ph.flags & 7U;
+        /* RC1 integration: ELF p_flags number the corners oppositely
+         * to MIPS_PROT_* (PF_R=4 vs PROT_READ=1, PF_X=1 vs PROT_EXEC=4);
+         * translate explicitly, never by masking. */
+        prot = 0U;
+        if ((ph.flags & MIPS_PF_R) != 0U) {
+            prot |= MIPS_PROT_READ;
+        }
+        if ((ph.flags & MIPS_PF_W) != 0U) {
+            prot |= MIPS_PROT_WRITE;
+        }
+        if ((ph.flags & MIPS_PF_X) != 0U) {
+            prot |= MIPS_PROT_EXEC;
+        }
         /* Map writable for the fill; final protection is enforced
          * below once the segment body is in place. */
         rc = mips_mem_map(ctx, map_va, map_len, prot | MIPS_PROT_WRITE,
@@ -655,7 +671,7 @@ int mips_load_elf(mips64_ctx_t *ctx, const char *path, char **argv,
     ctx->elf_base = bias;
     ctx->elf_entry = entry;
     ctx->brk_base = (seg_end + (MIPS64_PAGE_SIZE - 1U)) &
-                    ~(MIPS64_PAGE_SIZE - 1U);
+                    MIPS64_PAGE_MASK;
     ctx->brk_curr = ctx->brk_base;
     if (build_stack(ctx, argc, argv, envp, phdr, eh.is64 ? 56U : 32U,
                       (uint64_t)eh.phnum, entry, path) != 0) {

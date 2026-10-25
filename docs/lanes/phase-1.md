@@ -18,10 +18,11 @@ time (no block formation in Phase 1). `LL`/`SC`/`LLD`/`SCD`: `llbit`/
 `lladdr`/`llval` per SPEC 2.2 and E05; any helper/syscall clears `llbit`.
 Unaligned `LW`/`SW`/`LD`/`SD` fault (`mips_fault`); `LWL`/`LWR`/`SWL`/`SWR`
 and `LDL`/`LDR`/`SDL`/`SDR` compose bytes via `guest_ld8`/`guest_st8`
-per the E02 tables — manual-correct (BE-consistent) semantics on all four
-variants, even though `qemu-mips64el`/`qemu-mipsn32el` implement the LE
-pair with swapped address roles (RC-E adjudication in
-`experiments/E02/FINDINGS.md`). N64/N32 syscall convention per SPEC 2.2
+per the E02 tables as corrected at RC1 — the MIPS IV pseudocode with
+endian-swapped spans and fixed placement (see `experiments/E02/FINDINGS.md`).
+On BE the canonical pair round-trips; on LE it architecturally cannot
+compose a full word, and both oracle and interpreter record the same
+`P1-FAIL`s (LE parity holds including the FAILs). N64/N32 syscall convention per SPEC 2.2
 and E01 (6 register args in `$a0..$a5`, `$a3` error flag, bases
 5000/6000). COP1 data movement (`LWC1`/`SWC1`/`LDC1`/`SDC1`/`MFC1`/`MTC1`/
 `CFC1`/`CTC1`, no arithmetic) is integer-adjacent and required for static
@@ -146,11 +147,12 @@ lands with Phase 4/6 and keeps `guest_base` as the process window base.
      runs each under its qemu (`qemu-mips64el`/`qemu-mipsn32el`/
      `qemu-mips64`/`qemu-mipsn32`) with `timeout --kill-after=30s 60s`,
      captures stdout+exit into `tests/p1_golden_{n64le,n32le,n64be,n32be}.txt`.
-     KNOWN: the two LE canonical-pair check lines FAIL under
-     `qemu-mips64el`/`qemu-mipsn32el` (qemu-LE oracle defect, RC-E
-     adjudication) — the goldens record qemu's actual output honestly and
-     the RC1 gate treats exactly those two lines per LE golden as a
-     documented divergence (interp prints the manual-correct PASS).
+     KNOWN: the ten LE unaligned-pair check lines FAIL under
+     `qemu-mips64el`/`qemu-mipsn32el` — RC1 verified this architectural
+     (the interpreter reproduces qemu-LE byte-identically), not an
+     oracle defect. The goldens record qemu's actual output honestly
+     and the RC1 gate requires the interpreter to reproduce the same
+     FAILs (parity holds including the FAILs).
 - **Acceptance Command**:
   ```sh
   sh tests/run_p1_isa.sh && test -s tests/p1_golden_n64le.txt && test -s tests/p1_golden_n32le.txt && test -s tests/p1_golden_n64be.txt && test -s tests/p1_golden_n32be.txt
@@ -161,8 +163,24 @@ lands with Phase 4/6 and keeps `guest_base` as the process window base.
 ## RC1 outcome (coordinator integration)
 
 `tests/rc1_interp_check.sh` is the durable gate: rebuilds the translator,
-builds all four guests, runs each under `--interp`, and requires exit 0,
-`P1-RESULT: PASS`, zero `FAIL` lines, and every golden `PASS` line present
-except the two documented LE canonical-pair divergences (interp prints the
-manual-correct value where `qemu-mips64el`/`qemu-mipsn32el` print the
-oracle-defect value). Container cleaned afterwards.
+builds all four guests, runs each under `--interp`, and compares against
+the committed qemu goldens. BE variants must be byte-identical with exit
+0 (`P1-RESULT: PASS`, 134/134). LE variants must be byte-identical with
+the golden's own exit (1: the oracle itself records the 10
+architecturally-unsatisfiable unaligned LE checks as `P1-FAIL`, and so
+does the interpreter — LE parity holds including the FAILs).
+Two signal-dependent tests are filtered from the byte comparison with a
+tripwire (exactly 2 worker fault lines per variant), deferred to Phase 4
+per the mips32rt RC1 precedent: `unaligned-lw-child-faults` (qemu runs
+the guest handler, exit 139; the Phase-1 engine has no delivery) and the
+`pageend` INFOs (no verdict). The decisive annul proof
+(`likely-annul-skips-protnone`) needs no delivery and stays in parity.
+RC1 integration fixes on master: `ANDI` zero-extends while
+`ORI`/`XORI` preserve high bits; SPECIAL3 `DSBH`/`DSHD` funct `0x24`;
+`DINSM` pos `= sa`; LE `LDL`/`LDR`/`SDL`/`SDR` rewritten per the MIPS IV
+pseudocode (verified against qemu on a 64-cell table); `llbit` cleared by
+every ordinary store; fork plus the fork-equivalent `clone` subset
+(MIPS `SIGCHLD` is 18, not 17) plus `wait4` with endian-correct status
+for the child-test harness; instruction fetch requires `PROT_EXEC`
+(PROT_NONE fetch faults cleanly instead of trapping the host).
+Container cleaned afterwards.

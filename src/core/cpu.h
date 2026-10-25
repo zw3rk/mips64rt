@@ -256,6 +256,26 @@ static inline void mips64_spin_unlock(_Atomic uint32_t *lock)
 /* Fault sentinel for guest memory helpers (Phase 1, lane L1c). */
 #define MIPS_FAULT (-1)
 
+/*
+ * Guest protection flags (POSIX numbering: READ=1, WRITE=2, EXEC=4) used
+ * in mips64_region_t.prot and every mips_mem_* entry point. ELF p_flags
+ * use the opposite corner numbering (PF_X=1, PF_W=2, PF_R=4); the loader
+ * translates with MIPS_PF_* (src/loader.c), never by masking p_flags
+ * directly (RC1 integration fix).
+ */
+#define MIPS_PROT_READ  1U
+#define MIPS_PROT_WRITE 2U
+#define MIPS_PROT_EXEC  4U
+
+/*
+ * 64-bit page mask (RC1 integration fix): ~(4096U - 1U) alone is a
+ * 32-bit constant (0xFFFFF000) that zero-extends and clears the high
+ * 32 address bits. Every page-rounding site must use this mask so N64
+ * addresses above 4 GiB survive (brk_base was truncated to 0x200B6000
+ * before this fix).
+ */
+#define MIPS64_PAGE_MASK (~(UINT64_C(4096) - UINT64_C(1)))
+
 /* Guest VA -> host pointer under the Phase 1 reservation model:
  * guest_base + va. va is never truncated: N64 VAs use the full 64 bits,
  * N32 VAs fit in 32 bits but are still carried in uint64_t. */
@@ -281,12 +301,12 @@ static inline uint64_t mips_task_size(const mips64_ctx_t *ctx)
 
 static inline uint64_t mips64_page_down(uint64_t x)
 {
-    return x & ~(MIPS64_PAGE_SIZE - 1U);
+    return x & MIPS64_PAGE_MASK;
 }
 
 static inline uint64_t mips64_page_up(uint64_t x)
 {
-    return (x + (MIPS64_PAGE_SIZE - 1U)) & ~(MIPS64_PAGE_SIZE - 1U);
+    return (x + (MIPS64_PAGE_SIZE - 1U)) & MIPS64_PAGE_MASK;
 }
 
 /* Decoded MIPS64r2 instruction (word already in host byte order). */

@@ -38,7 +38,7 @@ static bool round_length(uint64_t length, uint64_t *rounded)
 {
     if (length == 0 || length > UINT64_MAX - (MIPS64_PAGE_SIZE - 1))
         return false;
-    *rounded = (length + MIPS64_PAGE_SIZE - 1) & ~(MIPS64_PAGE_SIZE - 1);
+    *rounded = (length + MIPS64_PAGE_SIZE - 1) & MIPS64_PAGE_MASK;
     return true;
 }
 
@@ -224,7 +224,7 @@ static uint64_t mmap_pages(mips64_linux_memory_t *memory, uint64_t address,
         if ((flags & G_MAP_NOREPLACE) != 0 && !hole(memory, address, size))
             return error(17);
     } else {
-        address &= ~(MIPS64_PAGE_SIZE - 1);
+        address &= MIPS64_PAGE_MASK;
         if (!hole(memory, address, size)) {
             uint64_t base = mmap_search_base(memory->space);
             uint64_t start = base < memory->space->limit ? base : MIPS64_PAGE_SIZE;
