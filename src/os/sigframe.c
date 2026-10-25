@@ -540,9 +540,14 @@ void mips_trap(mips64_ctx_t *ctx, int signo, uint64_t addr)
     if (ctx == NULL || !l4b_signo_valid(signo)) {
         return;
     }
-    if (signo == L4B_SIGSEGV || signo == L4B_SIGILL ||
-        signo == L4B_SIGFPE || signo == L4B_SIGTRAP ||
-        signo == L4B_SIGBUS) {
+    if (signo == L4B_SIGSEGV) {
+        /* Linux si_code: an address inside a recorded mapping is a
+         * protection fault (SEGV_ACCERR); outside any mapping it is
+         * unmapped (SEGV_MAPERR). PROT_NONE pages stay mapped, so
+         * they report ACCERR like the kernel. */
+        code = mips_mem_ok(ctx, addr, 1U, 0U) ? 2 : 1;
+    } else if (signo == L4B_SIGILL || signo == L4B_SIGFPE ||
+               signo == L4B_SIGTRAP || signo == L4B_SIGBUS) {
         code = 1;
     } else {
         code = L4B_SI_KERNEL;
