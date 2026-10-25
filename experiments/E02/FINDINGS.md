@@ -194,3 +194,32 @@ cd experiments/E02 && ./run.sh   # needs mips64el/mips64 gcc + qemu-mips64el/qem
 binaries print `E02-RESULT: FAIL` with the exact divergent values
 above — that FAIL is the recorded qemu-LE finding, not a probe bug.
 Nothing else in this lane is UNVERIFIED except silicon behavior.
+
+## RC-E adjudication (coordinator, independent minimal-asm re-test)
+
+The LE `E02-RESULT: FAIL` was re-tested by the coordinator with an
+independent naked-asm probe (`ldl`/`ldr`/`sdl`/`sdr` only, no compiler
+idiom): `X = wbuf+11` (`Xmod8=3`), `Y = X+7`, bytes `X..X+7 =
+ab ac ad ae af b0 b1 b2`, value `V = 0x0102030405060708` for stores.
+
+| Test | N64LE/N32LE (`qemu-mips64el`/`qemu-mipsn32el`) | N64BE/N32BE (`qemu-mips64`/`qemu-mipsn32`) |
+|---|---|---|
+| Canonical load pair `LDL 0(X)` + `LDR 0(Y)` | `0xabaab7b6b5b4b3b2` MISMATCH | `0xabacadaeafb0b1b2` MATCH (manual-correct) |
+| Mirrored load pair `LDL 0(Y)` + `LDR 0(X)` | `0xb2b1b0afaeadacab` = manual-correct LE value | `0xb2b3b4b5a8a9aaab` (expected mirror, not canonical) |
+| Canonical store pair `SDL 0(X)` + `SDR 0(Y)` of `V` | MISMATCH (bytes at `X..X+7` wrong) | `01 02 03 04 05 06 07 08` MATCH |
+| Mirrored store pair | `08 07 06 05 04 03 02 01` = manual-correct LE value | (expected mirror) |
+
+Ruling: the lane probe is vindicated — the canonical `(0,7)` idiom is
+the documented endian-independent sequence (MIPS64R2 Vol II, `LDL`:
+the same instruction pair addresses an unaligned doubleword on either
+endianness), and `qemu-mips64`/`qemu-mipsn32` agree with the manual on
+both ABIs. `qemu-mips64el`/`qemu-mipsn32el` implement `LDL`/`LDR` (and
+`SDL`/`SDR`) with the two address roles swapped, so the mirrored
+sequence yields the manual-correct value on LE. This is a qemu-user LE
+oracle defect, not a probe bug; silicon behavior remains UNVERIFIED.
+
+Consequence for `mips64rt`: `src/interp/` and `src/dbt/` implement
+manual-correct (BE-consistent) unaligned semantics. The LE
+canonical-pair idiom is verified against the manual + the BE oracle +
+LE-mirror equivalence, never against the `qemu-mips64el` canonical
+idiom. Phase 1 `tests/test_p1_isa.c` encodes this rule.
