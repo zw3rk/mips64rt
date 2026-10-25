@@ -36,6 +36,7 @@
 
 #include "os/host_args.c"
 #include "os/mem.c"
+#include "os/mem_table.c"
 #include "rt64/aot/sha256.c"
 #include "rt64/aot/identity.c"
 #include "rt64/runtime/family_broker.c"

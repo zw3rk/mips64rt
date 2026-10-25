@@ -1,7 +1,7 @@
 # H3 — Instrumented CoreMark: `interp` vs `dbt` (Phase 7 lane H3)
 
 Gate status: **GREEN** (coordinator follow-up, see below) —
-`dbt` median 81.11 it/s vs `interp` median 33.53 it/s (2.42x) with
+`dbt` median 64.15 it/s vs `interp` median 28.29 it/s (2.27x) with
 all CRCs byte-identical to the oracle, 33/33 checks pass. Original
 lane finding was RED (`dbt` 0.47x `interp`); the deficit was fixed
 in `src/dbt/dbt.c` + `src/os/threads.c` on `master`.
@@ -98,10 +98,10 @@ Re-measured `sh tests/coremark/run_coremark.sh` on `master`
 | engine | median | range |
 | --- | --- | --- |
 | `qemu-mips64el` (oracle) | 1048.63 | — |
-| `--interp` | 33.53 | 29.31–34.62 |
-| `--dbt` | 81.11 | 78.84–96.00 |
+| `--interp` | 28.29 | 27.19–38.75 |
+| `--dbt` | 64.15 | 54.52–108.85 |
 
-`dbt` is 2.42x `interp`; ranges disjoint in the fast direction.
+`dbt` is 2.27x `interp`; ranges disjoint in the fast direction.
 `H3-SUMMARY pass=33 fail=0`, `H3-RESULT: PASS`.
 
 ## Reproduce

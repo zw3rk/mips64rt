@@ -86,6 +86,7 @@ timeout --kill-after=30s 200s $NIX_GCC -static-pie -fPIE \
 	src/interp/fp_cvt.c \
 	src/interp/fp_ps.c \
 	src/os/mem.c \
+	src/os/mem_table.c \
 	src/os/syscall_min.c \
 	src/os/syscalls.c \
 	src/os/syscalls_stat.c \

@@ -81,8 +81,8 @@ Write `docs/lanes/phase-6.md` and run lanes `L6a..L6b`:
 
 ### Phase 7 — Hardening (`SMC`, `libc-test`, LTP Syscall Subset, Instrumented CoreMark, C++17) (`RC-H`)
 Write `docs/lanes/phase-7.md` and run concurrent hardening lanes `H1..H4`:
-- [ ] **Lane `H1` (`tests/test_h1_smc.c`)**: Self-modifying code & W^X verification (rewrite guest instructions on stack/heap/anon mmap, flush cache, re-execute in `dbt`).
-- [ ] **Lane `H2` (`docs/h2-report.md`)**: Run target `libc-test` (math, string, pthread, sig, functional) and LTP syscall subset; commit `docs/h2-report.md` with machine-enforced pass/skip/fail assertions (`0` unexpected failures).
-- [ ] **Lane `H3` (`docs/h3-coremark.md`)**: Follow the mandatory 6-step performance loop (`AGENTS.md`: Instrument -> Measure -> Hypothesise -> Fix -> Measure again -> Validate) on CoreMark and commit `docs/h3-coremark.md` demonstrating verified `dbt > interp` throughput.
-- [ ] **Lane `H4` (`tests/test_h4_cxx17.cc`)**: Compile and verify a C++17 binary exercising `try`/`catch` stack unwinding across signal/call frames, `dynamic_cast` RTTI, `std::thread`, and `thread_local` destructors.
-- [ ] **Gate `RC-H`**: All `H1..H4` artifacts and tests pass on `master`; `make check` and `make check-line-limits` pass with a clean git tree.
+- [x] **Lane `H1` (`tests/test_h1_smc.c`)**: Self-modifying code & W^X verification (rewrite guest instructions on stack/heap/anon mmap, flush cache, re-execute in `dbt`). Gate 12/12 on all four variants x both engines.
+- [x] **Lane `H2` (`docs/h2-report.md`)**: Run target `libc-test` (math, string, pthread, sig, functional) and LTP syscall subset; commit `docs/h2-report.md` with machine-enforced pass/skip/fail assertions (`0` unexpected failures). Gate 78/18/0 re-verified on the final tree.
+- [x] **Lane `H3` (`docs/h3-coremark.md`)**: Follow the mandatory 6-step performance loop (`AGENTS.md`: Instrument -> Measure -> Hypothesise -> Fix -> Measure again -> Validate) on CoreMark and commit `docs/h3-coremark.md` demonstrating verified `dbt > interp` throughput. Gate 33/33, `dbt` 2.27x `interp` (64.15 vs 28.29 it/s).
+- [x] **Lane `H4` (`tests/test_h4_cxx17.cc`)**: Compile and verify a C++17 binary exercising `try`/`catch` stack unwinding across signal/call frames, `dynamic_cast` RTTI, `std::thread`, and `thread_local` destructors. Gate 12/12 incl. contended `std::mutex` (blocked on a shared-table translator fix, green after).
+- [x] **Gate `RC-H`**: All `H1..H4` artifacts and tests pass on `master`; `make check` and `make check-line-limits` pass with a clean git tree.
