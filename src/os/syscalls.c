@@ -42,6 +42,12 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+/* Lane L5a: fold the /proc/self TU in the same way (its feature-test
+ * macros precede every system header here as well). The Makefile is
+ * frozen, so src/os/proc.c cannot become its own TU; the public
+ * mips_proc_* entry points live here instead. */
+#include "os/proc.c"
+
 /* linux/close_range.h values (arch-independent); this toolchain's
  * headers predate the macros, so define them when missing. */
 #ifndef CLOSE_RANGE_UNSHARE
@@ -246,6 +252,16 @@ int64_t mips_sc_openat(mips64_ctx_t *ctx, uint64_t dirfd, uint64_t path_va,
     if (rc < 0) {
         return l2a_ret(ctx, rc);
     }
+    /* Lane L5a: /proc/self/<name> serves guest-accurate content from
+     * translator state (see src/os/proc.c); anything else falls
+     * through to the host. */
+    {
+        long procfd = mips_proc_open(path, flags);
+
+        if (procfd >= 0 || procfd < -1) {
+            return l2a_ret(ctx, (int64_t)procfd);
+        }
+    }
     rc = map_open_flags(flags, L2A_OPEN_ALLOWED, &hflags);
     if (rc != 0) {
         return l2a_ret(ctx, rc);
@@ -428,6 +444,14 @@ int64_t mips_sc_readlinkat(mips64_ctx_t *ctx, uint64_t dirfd,
 
     if (rc < 0) {
         return l2a_ret(ctx, rc);
+    }
+    /* Lane L5a: readlink of /proc/self/exe reports the guest path. */
+    {
+        long linkn = mips_proc_readlink(path, buf_va, size);
+
+        if (linkn != -1) {
+            return l2a_ret(ctx, (int64_t)linkn);
+        }
     }
     p = guest_range(ctx, buf_va, size, 1);
     if (size != 0U && p == NULL) {
