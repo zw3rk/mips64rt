@@ -50,25 +50,10 @@
 #define FP_FCC0_BIT 23u
 #define FP_RM_MASK  3u
 
-/* Legacy default quiet NaNs (E04-observed 0.0/0.0 results). */
-#define FP_DEFNAN_S 0x7FBFFFFFu
-#define FP_DEFNAN_D UINT64_C(0x7FF7FFFFFFFFFFFF)
+/* Default quiet NaNs: see fp.h (shared with fp_cvt.c). */
+/* MIPS CVT/round funct field values: see fp.h (shared with fp_cvt.c). */
 
-/* MIPS CVT/round funct field values (destination selectors). */
-#define FP_FN_ROUND_L 0x08u
-#define FP_FN_TRUNC_L 0x09u
-#define FP_FN_CEIL_L  0x0Au
-#define FP_FN_FLOOR_L 0x0Bu
-#define FP_FN_ROUND_W 0x0Cu
-#define FP_FN_TRUNC_W 0x0Du
-#define FP_FN_CEIL_W  0x0Eu
-#define FP_FN_FLOOR_W 0x0Fu
-#define FP_FN_CVT_S   0x20u
-#define FP_FN_CVT_D   0x21u
-#define FP_FN_CVT_W   0x24u
-#define FP_FN_CVT_L   0x25u
-
-static uint64_t fp_d_bits(double x)
+uint64_t fp_d_bits(double x)
 {
     uint64_t u = 0u;
 
@@ -76,7 +61,7 @@ static uint64_t fp_d_bits(double x)
     return u;
 }
 
-static double fp_bits_d(uint64_t u)
+double fp_bits_d(uint64_t u)
 {
     double x = 0.0;
 
@@ -84,7 +69,7 @@ static double fp_bits_d(uint64_t u)
     return x;
 }
 
-static uint32_t fp_f_bits(float x)
+uint32_t fp_f_bits(float x)
 {
     uint32_t u = 0u;
 
@@ -92,7 +77,7 @@ static uint32_t fp_f_bits(float x)
     return u;
 }
 
-static float fp_bits_f(uint32_t u)
+float fp_bits_f(uint32_t u)
 {
     float x = 0.0f;
 
@@ -100,7 +85,7 @@ static float fp_bits_f(uint32_t u)
     return x;
 }
 
-static unsigned fp_rm(const mips64_ctx_t *ctx)
+unsigned fp_rm(const mips64_ctx_t *ctx)
 {
     return ctx->fcsr & FP_RM_MASK;
 }
@@ -128,14 +113,58 @@ static void fp_set_cc(mips64_ctx_t *ctx, unsigned cc, unsigned v)
     }
 }
 
+/* Nonzero iff the raw lane bits are a signalling NaN under the legacy
+ * MIPS (pre-nan2008) convention: all-ones exponent, nonzero mantissa,
+ * top mantissa bit SET. 0x7FC00000 signals (crafted P3 case, V set);
+ * the default 0x7FBFFFFF is quiet and propagates flag-free. Only SNaN
+ * inputs raise V on quiet propagation (P3 suite, qemu-blessed). */
+int fp_issn_s(uint32_t u)
+{
+    return ((u & 0x7F800000u) == 0x7F800000u) &&
+        ((u & 0x007FFFFFu) != 0u) && ((u & 0x00400000u) != 0u);
+}
+
+int fp_issn_d(uint64_t u)
+{
+    return ((u & UINT64_C(0x7FF0000000000000)) ==
+            UINT64_C(0x7FF0000000000000)) &&
+        ((u & UINT64_C(0x000FFFFFFFFFFFFF)) != 0u) &&
+        ((u & UINT64_C(0x0008000000000000)) != 0u);
+}
+
+/* Set FCSR cause + sticky flag for exception e (FP_EXC_*). Traps are
+ * out of scope until Phase 4 signals: bits are set unconditionally,
+ * never delivered. */
+void fp_raise(mips64_ctx_t *ctx, unsigned e)
+{
+    if (e > (unsigned)FP_EXC_V) {
+        return;
+    }
+    ctx->fcsr |= (1u << (12u + e)) | (1u << (2u + e));
+}
+
+/* Flag a finished finite result rf against its exact value q: overflow
+ * to infinity raises O (+I, matching the hardware FPSR pair the DBT
+ * merges), any other mismatch raises I. U is never set (RC3 limitation,
+ * identical in both engines). */
+void fp_inexact(mips64_ctx_t *ctx, long double rf, long double q)
+{
+    if ((isinf(rf) != 0) && (isinf(q) == 0)) {
+        fp_raise(ctx, (unsigned)FP_EXC_O);
+        fp_raise(ctx, (unsigned)FP_EXC_I);
+    } else if (rf != q) {
+        fp_raise(ctx, (unsigned)FP_EXC_I);
+    }
+}
+
 /* S-format FPR write: low 32 bits replaced, upper lane preserved (FR=1,
  * the fpmove.c LWC1/MTC1 discipline). */
-static void fp_put_s(mips64_ctx_t *ctx, unsigned fd, uint32_t v)
+void fp_put_s(mips64_ctx_t *ctx, unsigned fd, uint32_t v)
 {
     ctx->fpr[fd] = (ctx->fpr[fd] & UINT64_C(0xFFFFFFFF00000000)) | v;
 }
 
-static void fp_put_d(mips64_ctx_t *ctx, unsigned fd, uint64_t v)
+void fp_put_d(mips64_ctx_t *ctx, unsigned fd, uint64_t v)
 {
     ctx->fpr[fd] = v;
 }
@@ -144,7 +173,7 @@ static void fp_put_d(mips64_ctx_t *ctx, unsigned fd, uint64_t v)
  * value q (quad, exactly computed) under rounding mode rm. Returns r
  * unchanged for RN or when r already matches q. Overflow/underflow land
  * here naturally: r = +-Inf or +-0 is compared against the finite q. */
-static double fp_adj_d(double r, long double q, unsigned rm)
+double fp_adj_d(double r, long double q, unsigned rm)
 {
     long double lr;
 
@@ -165,7 +194,7 @@ static double fp_adj_d(double r, long double q, unsigned rm)
     }
 }
 
-static float fp_adj_f(float r, long double q, unsigned rm)
+float fp_adj_f(float r, long double q, unsigned rm)
 {
     long double lr;
 
@@ -220,7 +249,7 @@ static double fp_sqrt_adj(double r, double x, unsigned rm)
 
 /* Round quad q to an integer, ties to even. The caller range-checks
  * first, so q - truncl(q) is exact and the halfway case is detectable. */
-static long double fp_rne_q(long double q)
+long double fp_rne_q(long double q)
 {
     long double lo = truncl(q);
     long double d = q - lo;
@@ -268,13 +297,28 @@ static int fp_arith(mips64_ctx_t *ctx, const mips_dec_t *d, unsigned is_s)
             fp_put_d(ctx, fd, ctx->fpr[fs] ^ (UINT64_C(1) << 63));
             return 0;
         case 0x04u: /* SQRT.D */
-            if (isnan(a) || a < 0.0) {
+            if (isnan(a)) {
                 fp_put_d(ctx, fd, FP_DEFNAN_D);
+                if (fp_issn_d(ctx->fpr[fs]) != 0) {
+                    fp_raise(ctx, (unsigned)FP_EXC_V);
+                }
+                return 0;
+            }
+            if (a < 0.0) {
+                fp_put_d(ctx, fd, FP_DEFNAN_D);
+                fp_raise(ctx, (unsigned)FP_EXC_V);
                 return 0;
             }
             r = sqrt(a);
-            fp_put_d(ctx, fd, fp_d_bits(fp_sqrt_adj(r, a, rm)));
-            return 0;
+            {
+                double rf = fp_sqrt_adj(r, a, rm);
+
+                fp_put_d(ctx, fd, fp_d_bits(rf));
+                if ((long double)rf * (long double)rf != (long double)a) {
+                    fp_raise(ctx, (unsigned)FP_EXC_I);
+                }
+                return 0;
+            }
         case 0x00u: /* ADD.D */
         case 0x01u: /* SUB.D */
         case 0x02u: /* MUL.D */
@@ -285,6 +329,10 @@ static int fp_arith(mips64_ctx_t *ctx, const mips_dec_t *d, unsigned is_s)
         }
         if (isnan(a) || isnan(b)) {
             fp_put_d(ctx, fd, FP_DEFNAN_D);
+            if (fp_issn_d(ctx->fpr[fs]) != 0 ||
+                fp_issn_d(ctx->fpr[ft]) != 0) {
+                fp_raise(ctx, (unsigned)FP_EXC_V);
+            }
             return 0;
         }
         switch (d->funct) {
@@ -292,6 +340,7 @@ static int fp_arith(mips64_ctx_t *ctx, const mips_dec_t *d, unsigned is_s)
             if (isinf(a) && isinf(b) &&
                 ((signbit(a) != 0) != (signbit(b) != 0))) {
                 fp_put_d(ctx, fd, FP_DEFNAN_D);
+                fp_raise(ctx, (unsigned)FP_EXC_V);
                 return 0;
             }
             r = a + b;
@@ -301,6 +350,7 @@ static int fp_arith(mips64_ctx_t *ctx, const mips_dec_t *d, unsigned is_s)
             if (isinf(a) && isinf(b) &&
                 ((signbit(a) != 0) == (signbit(b) != 0))) {
                 fp_put_d(ctx, fd, FP_DEFNAN_D);
+                fp_raise(ctx, (unsigned)FP_EXC_V);
                 return 0;
             }
             r = a - b;
@@ -309,6 +359,7 @@ static int fp_arith(mips64_ctx_t *ctx, const mips_dec_t *d, unsigned is_s)
         case 0x02u:
             if ((a == 0.0 && isinf(b)) || (isinf(a) && b == 0.0)) {
                 fp_put_d(ctx, fd, FP_DEFNAN_D);
+                fp_raise(ctx, (unsigned)FP_EXC_V);
                 return 0;
             }
             r = a * b;
@@ -323,12 +374,14 @@ static int fp_arith(mips64_ctx_t *ctx, const mips_dec_t *d, unsigned is_s)
         if (d->funct == 0x03u) {
             if ((a == 0.0 && b == 0.0) || (isinf(a) && isinf(b))) {
                 fp_put_d(ctx, fd, FP_DEFNAN_D);
+                fp_raise(ctx, (unsigned)FP_EXC_V);
                 return 0;
             }
             if (b == 0.0) {
                 int sx = (signbit(a) != 0) != (signbit(b) != 0);
 
                 fp_put_d(ctx, fd, fp_d_bits(sx ? -INFINITY : INFINITY));
+                fp_raise(ctx, (unsigned)FP_EXC_Z);
                 return 0;
             }
             r = a / b;
@@ -347,21 +400,23 @@ static int fp_arith(mips64_ctx_t *ctx, const mips_dec_t *d, unsigned is_s)
                 if (b < 0.0) {
                     err = -err;
                 }
-                if (rm == 0u) {
-                    fp_put_d(ctx, fd, fp_d_bits(r));
-                } else if (rm == 1u) {
-                    fp_put_d(ctx, fd, fp_d_bits(
-                        (((r > 0.0) && err > 0) ||
-                         ((r < 0.0) && err < 0)) ?
-                        nextafter(r, 0.0) : r));
-                } else if (rm == 2u) {
-                    fp_put_d(ctx, fd, fp_d_bits(
-                        (err < 0) ? nextafter(r, INFINITY) : r));
-                } else {
-                    fp_put_d(ctx, fd, fp_d_bits(
-                        (err > 0) ? nextafter(r, -INFINITY) : r));
+                {
+                    double rf = r;
+
+                    if (rm == 1u) {
+                        rf = (((r > 0.0) && err > 0) ||
+                            ((r < 0.0) && err < 0)) ?
+                            nextafter(r, 0.0) : r;
+                    } else if (rm == 2u) {
+                        rf = (err < 0) ? nextafter(r, INFINITY) : r;
+                    } else if (rm == 3u) {
+                        rf = (err > 0) ? nextafter(r, -INFINITY) : r;
+                    }
+                    fp_put_d(ctx, fd, fp_d_bits(rf));
+                    fp_inexact(ctx, (long double)rf,
+                        (long double)a / (long double)b);
+                    return 0;
                 }
-                return 0;
             }
         }
         /* Exact-zero cancellation in round-down mode yields -0 (IEEE:
@@ -381,8 +436,13 @@ static int fp_arith(mips64_ctx_t *ctx, const mips_dec_t *d, unsigned is_s)
                 return 0;
             }
         }
-        fp_put_d(ctx, fd, fp_d_bits(fp_adj_d(r, q, rm)));
-        return 0;
+        {
+            double rf = fp_adj_d(r, q, rm);
+
+            fp_put_d(ctx, fd, fp_d_bits(rf));
+            fp_inexact(ctx, (long double)rf, q);
+            return 0;
+        }
     }
     {
         float a = fp_bits_f((uint32_t)ctx->fpr[fs]);
@@ -401,13 +461,28 @@ static int fp_arith(mips64_ctx_t *ctx, const mips_dec_t *d, unsigned is_s)
             fp_put_s(ctx, fd, ((uint32_t)ctx->fpr[fs]) ^ 0x80000000u);
             return 0;
         case 0x04u: /* SQRT.S */
-            if (isnan(a) || a < 0.0f) {
+            if (isnan(a)) {
                 fp_put_s(ctx, fd, FP_DEFNAN_S);
+                if (fp_issn_s((uint32_t)ctx->fpr[fs]) != 0) {
+                    fp_raise(ctx, (unsigned)FP_EXC_V);
+                }
+                return 0;
+            }
+            if (a < 0.0f) {
+                fp_put_s(ctx, fd, FP_DEFNAN_S);
+                fp_raise(ctx, (unsigned)FP_EXC_V);
                 return 0;
             }
             r = sqrtf(a);
-            fp_put_s(ctx, fd, fp_f_bits(fp_sqrt_adj_f(r, a, rm)));
-            return 0;
+            {
+                float rf = fp_sqrt_adj_f(r, a, rm);
+
+                fp_put_s(ctx, fd, fp_f_bits(rf));
+                if ((long double)rf * (long double)rf != (long double)a) {
+                    fp_raise(ctx, (unsigned)FP_EXC_I);
+                }
+                return 0;
+            }
         case 0x00u:
         case 0x01u:
         case 0x02u:
@@ -418,6 +493,10 @@ static int fp_arith(mips64_ctx_t *ctx, const mips_dec_t *d, unsigned is_s)
         }
         if (isnan(a) || isnan(b)) {
             fp_put_s(ctx, fd, FP_DEFNAN_S);
+            if (fp_issn_s((uint32_t)ctx->fpr[fs]) != 0 ||
+                fp_issn_s((uint32_t)ctx->fpr[ft]) != 0) {
+                fp_raise(ctx, (unsigned)FP_EXC_V);
+            }
             return 0;
         }
         switch (d->funct) {
@@ -425,6 +504,7 @@ static int fp_arith(mips64_ctx_t *ctx, const mips_dec_t *d, unsigned is_s)
             if (isinf(a) && isinf(b) &&
                 ((signbit(a) != 0) != (signbit(b) != 0))) {
                 fp_put_s(ctx, fd, FP_DEFNAN_S);
+                fp_raise(ctx, (unsigned)FP_EXC_V);
                 return 0;
             }
             r = a + b;
@@ -434,6 +514,7 @@ static int fp_arith(mips64_ctx_t *ctx, const mips_dec_t *d, unsigned is_s)
             if (isinf(a) && isinf(b) &&
                 ((signbit(a) != 0) == (signbit(b) != 0))) {
                 fp_put_s(ctx, fd, FP_DEFNAN_S);
+                fp_raise(ctx, (unsigned)FP_EXC_V);
                 return 0;
             }
             r = a - b;
@@ -442,6 +523,7 @@ static int fp_arith(mips64_ctx_t *ctx, const mips_dec_t *d, unsigned is_s)
         case 0x02u:
             if ((a == 0.0f && isinf(b)) || (isinf(a) && b == 0.0f)) {
                 fp_put_s(ctx, fd, FP_DEFNAN_S);
+                fp_raise(ctx, (unsigned)FP_EXC_V);
                 return 0;
             }
             r = a * b;
@@ -455,12 +537,14 @@ static int fp_arith(mips64_ctx_t *ctx, const mips_dec_t *d, unsigned is_s)
         if (d->funct == 0x03u) {
             if ((a == 0.0f && b == 0.0f) || (isinf(a) && isinf(b))) {
                 fp_put_s(ctx, fd, FP_DEFNAN_S);
+                fp_raise(ctx, (unsigned)FP_EXC_V);
                 return 0;
             }
             if (b == 0.0f) {
                 int sx = (signbit(a) != 0) != (signbit(b) != 0);
 
                 fp_put_s(ctx, fd, fp_f_bits(sx ? -INFINITY : INFINITY));
+                fp_raise(ctx, (unsigned)FP_EXC_Z);
                 return 0;
             }
             r = a / b;
@@ -477,21 +561,23 @@ static int fp_arith(mips64_ctx_t *ctx, const mips_dec_t *d, unsigned is_s)
                 if (b < 0.0f) {
                     err = -err;
                 }
-                if (rm == 0u) {
-                    fp_put_s(ctx, fd, fp_f_bits(r));
-                } else if (rm == 1u) {
-                    fp_put_s(ctx, fd, fp_f_bits(
-                        (((r > 0.0f) && err > 0) ||
-                         ((r < 0.0f) && err < 0)) ?
-                        nextafterf(r, 0.0f) : r));
-                } else if (rm == 2u) {
-                    fp_put_s(ctx, fd, fp_f_bits(
-                        (err < 0) ? nextafterf(r, INFINITY) : r));
-                } else {
-                    fp_put_s(ctx, fd, fp_f_bits(
-                        (err > 0) ? nextafterf(r, -INFINITY) : r));
+                {
+                    float rf = r;
+
+                    if (rm == 1u) {
+                        rf = (((r > 0.0f) && err > 0) ||
+                            ((r < 0.0f) && err < 0)) ?
+                            nextafterf(r, 0.0f) : r;
+                    } else if (rm == 2u) {
+                        rf = (err < 0) ? nextafterf(r, INFINITY) : r;
+                    } else if (rm == 3u) {
+                        rf = (err > 0) ? nextafterf(r, -INFINITY) : r;
+                    }
+                    fp_put_s(ctx, fd, fp_f_bits(rf));
+                    fp_inexact(ctx, (long double)rf,
+                        (long double)a / (long double)b);
+                    return 0;
                 }
-                return 0;
             }
         }
         if (q == 0.0L && rm == 3u) {
@@ -509,185 +595,14 @@ static int fp_arith(mips64_ctx_t *ctx, const mips_dec_t *d, unsigned is_s)
                 return 0;
             }
         }
-        fp_put_s(ctx, fd, fp_f_bits(fp_adj_f(r, q, rm)));
-        return 0;
-    }
-}
-
-/* Integer-destination conversion: CVT.W/L (current FCSR RM) and
- * ROUND/TRUNC/CEIL/FLOOR.W/L (fixed modes). q is the exact source value.
- * Out-of-range/NaN/Inf saturate to the MIPS indefinite values, with no
- * FCSR update. */
-static int fp_to_int(mips64_ctx_t *ctx, unsigned fd, long double q,
-                     unsigned funct)
-{
-    int is64 = (funct == FP_FN_ROUND_L || funct == FP_FN_TRUNC_L ||
-                funct == FP_FN_CEIL_L || funct == FP_FN_FLOOR_L ||
-                funct == FP_FN_CVT_L);
-    long double t;
-    unsigned mode = fp_rm(ctx);
-
-    switch (funct) {
-    case FP_FN_ROUND_W:
-    case FP_FN_ROUND_L:
-        t = fp_rne_q(q);
-        break;
-    case FP_FN_TRUNC_W:
-    case FP_FN_TRUNC_L:
-        t = truncl(q);
-        break;
-    case FP_FN_CEIL_W:
-    case FP_FN_CEIL_L:
-        t = ceill(q);
-        break;
-    case FP_FN_FLOOR_W:
-    case FP_FN_FLOOR_L:
-        t = floorl(q);
-        break;
-    default: /* CVT.W / CVT.L: current rounding mode */
-        switch (mode) {
-        case 1u:
-            t = truncl(q);
-            break;
-        case 2u:
-            t = ceill(q);
-            break;
-        case 3u:
-            t = floorl(q);
-            break;
-        default:
-            t = fp_rne_q(q);
-            break;
-        }
-        break;
-    }
-    if (is64) {
-        if (isnan(q) || q >= 0x1p63L || q < -0x1p63L) {
-            fp_put_d(ctx, fd, UINT64_C(0x7FFFFFFFFFFFFFFF));
-            return 0;
-        }
-        fp_put_d(ctx, fd, (uint64_t)(int64_t)t);
-        return 0;
-    }
-    if (isnan(q) || q >= 0x1p31L || q < -0x1p31L) {
-        fp_put_s(ctx, fd, 0x7FFFFFFFu);
-        return 0;
-    }
-    fp_put_s(ctx, fd, (uint32_t)(int32_t)t);
-    return 0;
-}
-
-/* CVT.S/D destination from an S/D/W/L source lane. NaN sources yield the
- * default quiet NaN of the destination format. */
-static int fp_cvt_sd(mips64_ctx_t *ctx, const mips_dec_t *d, unsigned is_s)
-{
-    unsigned fd = d->sa;
-    unsigned fs = d->rd;
-    unsigned rm = fp_rm(ctx);
-
-    if (d->funct == FP_FN_CVT_S) {
-        float r;
-
-        if (is_s) { /* CVT.S.S: lane copy */
-            fp_put_d(ctx, fd, ctx->fpr[fs]);
-            return 0;
-        }
         {
-            double x = fp_bits_d(ctx->fpr[fs]);
+            float rf = fp_adj_f(r, q, rm);
 
-            if (isnan(x)) {
-                fp_put_s(ctx, fd, FP_DEFNAN_S);
-                return 0;
-            }
-            r = (float)x;
-            fp_put_s(ctx, fd, fp_f_bits(fp_adj_f(r, (long double)x, rm)));
+            fp_put_s(ctx, fd, fp_f_bits(rf));
+            fp_inexact(ctx, (long double)rf, q);
             return 0;
         }
     }
-    if (d->funct == FP_FN_CVT_D) {
-        if (is_s) {
-            float x = fp_bits_f((uint32_t)ctx->fpr[fs]);
-
-            if (isnan(x)) {
-                fp_put_d(ctx, fd, FP_DEFNAN_D);
-                return 0;
-            }
-            fp_put_d(ctx, fd, fp_d_bits((double)x));
-            return 0;
-        }
-        fp_put_d(ctx, fd, ctx->fpr[fs]);
-        return 0;
-    }
-    if (d->funct == FP_FN_CVT_W || d->funct == FP_FN_CVT_L) {
-        long double q;
-
-        if (is_s) {
-            float x = fp_bits_f((uint32_t)ctx->fpr[fs]);
-
-            if (isnan(x)) {
-                if (d->funct == FP_FN_CVT_L) {
-                    fp_put_d(ctx, fd, UINT64_C(0x7FFFFFFFFFFFFFFF));
-                } else {
-                    fp_put_s(ctx, fd, 0x7FFFFFFFu);
-                }
-                return 0;
-            }
-            q = (long double)x;
-        } else {
-            double x = fp_bits_d(ctx->fpr[fs]);
-
-            if (isnan(x)) {
-                if (d->funct == FP_FN_CVT_L) {
-                    fp_put_d(ctx, fd, UINT64_C(0x7FFFFFFFFFFFFFFF));
-                } else {
-                    fp_put_s(ctx, fd, 0x7FFFFFFFu);
-                }
-                return 0;
-            }
-            q = (long double)x;
-        }
-        return fp_to_int(ctx, fd, q, d->funct);
-    }
-    return MIPS_FAULT;
-}
-
-/* CVT.S/D destination from a W/L integer source lane. */
-static int fp_cvt_wl(mips64_ctx_t *ctx, const mips_dec_t *d, unsigned is_l)
-{
-    unsigned fd = d->sa;
-    unsigned fs = d->rd;
-    unsigned rm = fp_rm(ctx);
-
-    if (d->funct == FP_FN_CVT_S) {
-        float r;
-
-        if (is_l) {
-            int64_t v = (int64_t)ctx->fpr[fs];
-
-            r = (float)v;
-            fp_put_s(ctx, fd, fp_f_bits(fp_adj_f(r, (long double)v, rm)));
-            return 0;
-        }
-        {
-            int32_t v = (int32_t)ctx->fpr[fs];
-
-            r = (float)v;
-            fp_put_s(ctx, fd, fp_f_bits(fp_adj_f(r, (long double)v, rm)));
-            return 0;
-        }
-    }
-    if (d->funct == FP_FN_CVT_D) {
-        if (is_l) {
-            int64_t v = (int64_t)ctx->fpr[fs];
-            double r = (double)v;
-
-            fp_put_d(ctx, fd, fp_d_bits(fp_adj_d(r, (long double)v, rm)));
-            return 0;
-        }
-        fp_put_d(ctx, fd, fp_d_bits((double)(int32_t)ctx->fpr[fs]));
-        return 0;
-    }
-    return MIPS_FAULT;
 }
 
 /* S/D arithmetic + conversion dispatch (fmt S/D in d->rs). */
@@ -727,8 +642,8 @@ static int fp_fmt_sd(mips64_ctx_t *ctx, const mips_dec_t *d)
     default:
         break;
     }
-    if ((d->funct & 0x3Cu) == 0x30u) {
-        unsigned cond = ((d->word & 3u) << 2) | ((d->word >> 6) & 3u);
+    if ((d->funct & 0x30u) == 0x30u) {
+        unsigned cond = d->funct & 0xFu;
         unsigned cc = (d->word >> 8) & 7u;
         unsigned l;
         unsigned e;
@@ -774,7 +689,7 @@ static int fp_fmt_sd(mips64_ctx_t *ctx, const mips_dec_t *d)
             res = (u == 0u && l != 0u) ? 1u : 0u;
             break;
         case 0x05u: /* ULT */
-        case 0x0Fu: /* NGE */
+        case 0x0Du: /* NGE */
             res = (u != 0u || l != 0u) ? 1u : 0u;
             break;
         case 0x06u: /* OLE */
@@ -782,11 +697,14 @@ static int fp_fmt_sd(mips64_ctx_t *ctx, const mips_dec_t *d)
             res = (u == 0u && (l != 0u || e != 0u)) ? 1u : 0u;
             break;
         case 0x07u: /* ULE */
-        case 0x0Du: /* NGT */
+        case 0x0Fu: /* NGT */
             res = (u != 0u || l != 0u || e != 0u) ? 1u : 0u;
             break;
         default:
             break;
+        }
+        if ((u != 0u) && ((cond & 8u) != 0u)) {
+            fp_raise(ctx, (unsigned)FP_EXC_V);
         }
         fp_set_cc(ctx, cc, res);
         return 0;
@@ -810,8 +728,8 @@ static int fp_fmt_wl(mips64_ctx_t *ctx, const mips_dec_t *d)
 static int fp_branch(mips64_ctx_t *ctx, uint64_t cur_pc, const mips_dec_t *d)
 {
     unsigned cc = ((unsigned)d->rt >> 2u) & 7u;
-    unsigned tf = ((unsigned)d->rt >> 1u) & 1u;
-    unsigned likely = (unsigned)d->rt & 1u;
+    unsigned likely = ((unsigned)d->rt >> 1u) & 1u;
+    unsigned tf = (unsigned)d->rt & 1u;
     uint64_t off = (uint64_t)((int64_t)d->simm * 4);
     uint64_t target = cur_pc + 4u + off;
     int taken = (fp_get_cc(ctx, cc) == tf);
@@ -854,6 +772,8 @@ int fp_cop1(mips64_ctx_t *ctx, uint64_t cur_pc, const mips_dec_t *d)
         return 0;
     case 0x08u: /* BC1F/BC1FL/BC1T/BC1TL */
         return fp_branch(ctx, cur_pc, d);
+    case 0x16u: /* PS: paired-single lanes */
+        return fp_ps_cop1(ctx, cur_pc, d);
     case 0x10u: /* S */
     case 0x11u: /* D */
         return fp_fmt_sd(ctx, d);

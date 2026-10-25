@@ -26,6 +26,7 @@ BUILD := _build
 # Phase 2 binary: CLI + engine dispatch + interp + AArch64 DBT.
 # RC2 integration wires the L2a static-libc layer, the L2b DBT core
 # (encoder, dispatcher, trampoline) and the L2c integer emitter.
+# RC3 integration adds the L3a FPU interpreter and L3b FP emitter.
 BOOT_SRCS := src/main.c \
 	src/rt64/runtime/worker_loop.c \
 	src/rt64/linux/signal_core.c \
@@ -33,6 +34,9 @@ BOOT_SRCS := src/main.c \
 	src/interp/interp.c \
 	src/interp/unaligned.c \
 	src/interp/fpmove.c \
+	src/interp/fp.c \
+	src/interp/fp_cvt.c \
+	src/interp/fp_ps.c \
 	src/os/mem.c \
 	src/os/syscall_min.c \
 	src/os/syscalls.c \
@@ -45,6 +49,7 @@ BOOT_SRCS := src/main.c \
 	src/dbt/emit_enc.c \
 	src/dbt/emit_alu.c \
 	src/dbt/emit_mem.c \
+	src/dbt/emit_fp.c \
 	src/dbt/trampoline_a64.S \
 	src/loader.c
 

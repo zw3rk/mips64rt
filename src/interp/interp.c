@@ -17,6 +17,7 @@
 #include <stdio.h>
 
 #include "core/cpu.h"
+#include "interp/fp.h"
 #include "interp/interp.h"
 
 static int exec_branch(mips64_ctx_t *ctx, uint64_t pc, const mips_dec_t *d);
@@ -30,6 +31,15 @@ static int fault_at(mips64_ctx_t *ctx, uint64_t addr)
     }
     mips_fault(ctx, addr);
     return MIPS_FAULT;
+}
+
+/* Shared COP1/COP1X result mapping: 1/2 = BC1 run-stop/pc-final. */
+static int cop_rc(mips64_ctx_t *ctx, uint64_t cur_pc, int rc)
+{
+    if (rc == 1 || rc == 2) {
+        return rc;
+    }
+    return (rc != 0) ? fault_at(ctx, cur_pc) : 0;
 }
 
 /* Fetch and decode the word at pc; fault when the fetcher did not. */
@@ -105,7 +115,6 @@ static void mul_s64(uint64_t a, uint64_t b, uint64_t *hi, uint64_t *lo)
     int neg_b = (int64_t)b < 0;
     uint64_t h;
     uint64_t l;
-
     mul_u64(neg_a ? (0u - a) : a, neg_b ? (0u - b) : b, &h, &l);
     if (neg_a != neg_b) {
         /* 128-bit two's-complement negate of h:l. */
@@ -700,28 +709,22 @@ static int exec_simple(mips64_ctx_t *ctx, uint64_t cur_pc, const mips_dec_t *d)
         /* fpmove_mem records mapping faults itself; just propagate. */
         return fpmove_mem(ctx, d);
     case 0x11u: /* COP1 via fpmove.c+fp.c (1/2 = BC1 run-stop/pc-final) */
-    {
-        int rc = fpmove_cop1(ctx, d);
-
-        if (rc == 1 || rc == 2) {
-            return rc;
-        }
-        return (rc != 0) ? fault_at(ctx, cur_pc) : 0;
-    }
+        return cop_rc(ctx, cur_pc, fpmove_cop1(ctx, d));
+    case 0x13u: /* COP1X fused multiply-add (fp_ps.c) */
+        return cop_rc(ctx, cur_pc, fp_cop1x(ctx, cur_pc, d));
     case 0x2Fu: /* CACHE */
     case 0x33u: /* PREF */
         return 0;
-    default: /* COP2/COP1X, MIPS64-only, reserved */
+    default: /* COP2, MIPS64-only, reserved (COP1X handled above) */
         return fault_at(ctx, cur_pc);
     }
 }
 
-/* Control transfer with delay slot: link (ra = pc+8) first; likely
- * not-taken annuls the slot with no fetch and no fault; otherwise the
- * slot runs with in_delay_slot = 1 and a fault there keeps pc at the
- * slot (SPEC 2.2). A branch in the slot is undefined; the inner one
- * wins. Cross-page branches step one instruction at a time: the interp
- * always does (no block formation in Phase 1). */
+/* Delay slot: link (ra = pc+8) first; likely-not-taken annuls the slot
+ * with no fetch and no fault, else the slot runs with in_delay_slot = 1
+ * and a fault there keeps pc at the slot (SPEC 2.2). A branch in the
+ * slot is undefined; the inner one wins. The interp always steps one
+ * instruction at a time (no block formation in Phase 1). */
 static int exec_branch(mips64_ctx_t *ctx, uint64_t pc, const mips_dec_t *d)
 {
     uint64_t rs = ctx->gpr[d->rs];

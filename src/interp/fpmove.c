@@ -24,7 +24,7 @@
 /* Best-effort MIPS64R2 FIR for CFC1 $0 (read-only ID register); revisit
  * against qemu-mips64el/qemu-mips64 in Phase 3 (E03). Only CFC1 $0/$31
  * observability matters for Phase 1. */
-#define MIPS64RT_FIR_MIPS64R2 0x00839300u
+#define MIPS64RT_FIR_MIPS64R2 0x007f0000u
 
 /* Byte i (0 = lowest guest address) of a 32/64-bit FPR lane. */
 static uint32_t lane_byte_u32(uint64_t v, unsigned i, int be)
@@ -166,6 +166,14 @@ int fpmove_cop1(mips64_ctx_t *ctx, const mips_dec_t *d)
         ctx->fpr[fs] = (ctx->fpr[fs] & UINT64_C(0xFFFFFFFF00000000)) |
             (ctx->gpr[rt] & UINT64_C(0xFFFFFFFF));
         return 0;
+    case 0x03u: /* MFHC1: upper 32 bits, sign-extended */
+        interp_set_reg(ctx, rt,
+            interp_sext32((uint32_t)(ctx->fpr[fs] >> 32u)));
+        return 0;
+    case 0x07u: /* MTHC1: upper 32 bits from GPR low word */
+        ctx->fpr[fs] = (ctx->fpr[fs] & UINT64_C(0xFFFFFFFF)) |
+            ((uint64_t)(uint32_t)ctx->gpr[rt] << 32u);
+        return 0;
     case 0x02u: /* CFC1: $31 = FCSR, $0 = FIR (read-only ID). */
         if (fs == 31u) {
             interp_set_reg(ctx, rt, (uint64_t)ctx->fcsr);
@@ -188,6 +196,7 @@ int fpmove_cop1(mips64_ctx_t *ctx, const mips_dec_t *d)
     case 0x01u: /* DMFC1: full 64-bit lane to GPR */
     case 0x05u: /* DMTC1: full 64-bit lane from GPR */
     case 0x08u: /* BC1F/BC1FL/BC1T/BC1TL (any cc) */
+    case 0x16u: /* PS: paired-single lanes (fp_ps.c) */
     case 0x10u: /* S: arithmetic, converts, compares */
     case 0x11u: /* D: arithmetic, converts, compares */
     case 0x14u: /* W: CVT.S.W / CVT.D.W source */
