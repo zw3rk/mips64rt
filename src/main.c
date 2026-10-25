@@ -37,6 +37,29 @@
 #define MIPS64RT_ET_EXEC 2u
 #define MIPS64RT_ET_DYN 3u
 
+/* Exit-state dump for the RC2 difftest (frozen cpu.h contract, shared
+ * by both engines; the L2d harness sets MIPS64RT_DUMPSTATE=1). */
+void mips_dump_regs(const mips64_ctx_t *ctx, FILE *out)
+{
+    unsigned i;
+
+    if (ctx == NULL || out == NULL) {
+        return;
+    }
+    (void)fprintf(out, "REGS pc=%016llx hi=%016llx lo=%016llx\n",
+                  (unsigned long long)ctx->pc,
+                  (unsigned long long)ctx->hi,
+                  (unsigned long long)ctx->lo);
+    for (i = 0; i < 32U; i += 4U) {
+        (void)fprintf(out, "REGS r%02u=%016llx r%02u=%016llx "
+                      "r%02u=%016llx r%02u=%016llx\n",
+                      i, (unsigned long long)ctx->gpr[i],
+                      i + 1U, (unsigned long long)ctx->gpr[i + 1U],
+                      i + 2U, (unsigned long long)ctx->gpr[i + 2U],
+                      i + 3U, (unsigned long long)ctx->gpr[i + 3U]);
+    }
+}
+
 static void usage(FILE *output)
 {
     fputs("Usage: mips64rt [OPTION]... PROGRAM [ARGS]...\n"
@@ -55,7 +78,9 @@ static void usage(FILE *output)
           "\n"
           "Environment:\n"
           "  MIPS64RT_ENGINE=interp|dbt\n"
-          "             default engine when neither --interp nor --dbt is given\n",
+          "             default engine when neither --interp nor --dbt is given\n"
+          "  MIPS64RT_DUMPSTATE=1\n"
+          "             dump registers to stderr at guest exit (difftest)\n",
           output);
 }
 

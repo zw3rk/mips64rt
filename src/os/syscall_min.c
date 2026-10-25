@@ -536,6 +536,10 @@ int64_t mips_syscall(mips64_ctx_t *ctx)
         /* Single-threaded Phase 1: exit() and exit_group() both end
          * the process. The guest already ran its own exit handlers;
          * the translator holds no buffered guest output. */
+        if (getenv("MIPS64RT_DUMPSTATE") != NULL) {
+            /* RC2 difftest: exit-state dump shared by both engines. */
+            mips_dump_regs(ctx, stderr);
+        }
         _Exit((int)(a0 & 0xFFU));
         return sc_ret(ctx, 0); /* unreachable */
     }
