@@ -31,6 +31,10 @@
 
 #include "dbt/emit_int.h"
 
+/* Lane L3b FP entry point (src/dbt/emit_fp.c): 0 emitted, nonzero for
+ * unknown words (dispatcher falls back to interp_step). */
+int ef_emit_fp(a64_emit_t *e, const mips_dec_t *d, uint64_t pc, int slot);
+
 /* ---- Guest state access ($0 reads as XZR, writes are dropped) ---- */
 
 void ei_gld(a64_emit_t *e, unsigned tmp, unsigned r)
@@ -168,6 +172,8 @@ static int ei_is_control(const mips_dec_t *d)
         }
     case 0x00u: /* JR / JALR */
         return d->funct == 0x08u || d->funct == 0x09u;
+    case 0x11u: /* COP1 BC1T/BC1F/likely (lane L3b; no other COP1 moves) */
+        return d->rs == 0x08u ? 1 : 0;
     default:
         return 0;
     }
@@ -186,6 +192,11 @@ static int ei_branch(a64_emit_t *e, const mips_dec_t *d, const mips_dec_t *s,
     int link = 0;
     int indirect = 0;
     int has_cond = 1;
+    /* Lane L3b: BC1 sources the condition from the FCSR FCC bit instead
+     * of a GPR compare (rt = cc<<2 | likely<<1 | tf). */
+    int fpcond = 0;
+    unsigned fccbit = 23u;
+    unsigned tf = 0u;
     size_t t;
 
     switch (d->op) {
@@ -269,6 +280,19 @@ static int ei_branch(a64_emit_t *e, const mips_dec_t *d, const mips_dec_t *s,
         indirect = 1;
         has_cond = 0;
         break;
+    case 0x11u: /* COP1 BC1T/BC1F/BC1TL/BC1FL (lane L3b) */
+        if (d->rs != 0x08u) {
+            return 1;
+        }
+        tf = d->rt & 1u;
+        likely = (int)((d->rt >> 1) & 1u);
+        fpcond = 1;
+        if (((d->rt >> 2) & 7u) == 0u) {
+            fccbit = 23u;
+        } else {
+            fccbit = 24u + ((d->rt >> 2) & 7u);
+        }
+        break;
     default:
         return 1;
     }
@@ -305,20 +329,31 @@ static int ei_branch(a64_emit_t *e, const mips_dec_t *d, const mips_dec_t *s,
         return 0;
     }
     if (has_cond != 0) {
-        ei_gld(e, EI_A, d->rs);
-        if (d->op == 0x04u || d->op == 0x05u || d->op == 0x14u ||
-            d->op == 0x15u) {
-            ei_gld(e, EI_B, d->rt);
-            ei_cmp(e, 0, EI_A, EI_B);
+        if (fpcond != 0) {
+            /* BC1: condition is the FCSR FCC bit (lane L3b). */
+            ei_ldr(e, 1, EI_A, EI_CTX, MIPS64_CTX_FCSR_OFFSET);
         } else {
-            ei_cmp(e, 0, EI_A, EI_XZR);
+            ei_gld(e, EI_A, d->rs);
+            if (d->op == 0x04u || d->op == 0x05u || d->op == 0x14u ||
+                d->op == 0x15u) {
+                ei_gld(e, EI_B, d->rt);
+                ei_cmp(e, 0, EI_A, EI_B);
+            } else {
+                ei_cmp(e, 0, EI_A, EI_XZR);
+            }
         }
     }
     if (link != 0) {
         ei_mov64(e, EI_T, pc + 8u);
         ei_gst(e, EI_T, MIPS64_REG_RA);
     }
-    t = has_cond != 0 ? ei_bcc(e, cc) : (size_t)-1;
+    if (has_cond != 0 && fpcond != 0) {
+        /* BC1T: taken when the FCC bit is set (tbnz); BC1F: taken
+         * when clear (tbz). Same 19-bit patch shape as b.cond. */
+        t = ei_tbz(e, (int)tf, EI_A, fccbit);
+    } else {
+        t = has_cond != 0 ? ei_bcc(e, cc) : (size_t)-1;
+    }
     if (likely != 0) {
         /* Not-taken likely: skip the slot with no fetch. */
         ei_exit_at(e, pc + 8u, MIPS64_EXIT_BRANCH);
@@ -396,6 +431,9 @@ static int ei_one(a64_emit_t *e, const mips_dec_t *d, uint64_t pc, int be,
     case 0x10u: /* COP0 */
         r = ei_cop(e, d, pc, slot);
         break;
+    case 0x11u: /* COP1 (lane L3b): arithmetic/CVT/compare via emit_fp.c */
+        r = ef_emit_fp(e, d, pc, slot);
+        break;
     case 0x1Au: /* LDL */
         r = ei_unaligned(e, d, pc, 1, 1, be, be != 0 ? 0 : 3, 0, 56u);
         break;
@@ -446,7 +484,8 @@ static int ei_one(a64_emit_t *e, const mips_dec_t *d, uint64_t pc, int be,
     case 0x33u: /* PREF */
         r = 0;
         break;
-    default: /* COP1/COP1X/COP2/JALX/FP memory/unknown: EXIT_UNDEF */
+    default: /* COP1X/COP2/JALX/FP memory/unknown: EXIT_UNDEF
+                * (COP1 has its own case above and never reaches here). */
         if (slot == 0) {
             ei_exit_undef(e, pc);
             r = 2;
