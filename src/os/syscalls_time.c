@@ -1,0 +1,111 @@
+/*
+ * src/os/syscalls_time.c — Static-libc clock family (lane L2a).
+ *
+ * Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * clock_gettime (+ the N32 clock_gettime64 glibc uses for it),
+ * nanosleep (+ clock_nanosleep, which is what glibc nanosleep lowers
+ * to, and its N32 time64 companion). N32 clock/nanosleep take the
+ * 8-byte {s32, s32} timespec, the time64 companions the 16-byte one
+ * (both verified live under qemu). Shared helpers (l2a_ret, putn,
+ * getn, guest_range) live in src/os/syscalls.c.
+ */
+#define _GNU_SOURCE
+
+#include "core/cpu.h"
+
+#include "os/syscall_nr.h"
+
+#include <errno.h>
+#include <stdint.h>
+#include <time.h>
+
+/* Shared helpers owned by src/os/syscalls.c. */
+extern int64_t l2a_ret(mips64_ctx_t *ctx, int64_t raw);
+extern void putn(uint8_t *p, uint64_t v, unsigned n, int be);
+extern uint64_t getn(const uint8_t *p, unsigned n, int be);
+extern uint8_t *guest_range(mips64_ctx_t *ctx, uint64_t va, uint64_t len,
+                            int write);
+
+#define L2A_NSEC_PER_SEC 1000000000L
+
+/* Guest timespec transfer in either layout. */
+static int64_t xfer_ts(mips64_ctx_t *ctx, uint64_t va, int is64,
+                       struct timespec *ts, int write)
+{
+    uint8_t *p = guest_range(ctx, va, is64 ? 16U : 8U, write);
+    int be;
+
+    if (p == NULL) {
+        return -(int64_t)EFAULT;
+    }
+    be = ctx->is_be != 0U;
+    if (!write) {
+        if (is64) {
+            ts->tv_sec = (time_t)getn(p, 8, be);
+            ts->tv_nsec = (long)getn(p + 8, 8, be);
+        } else {
+            ts->tv_sec = (time_t)(int32_t)getn(p, 4, be);
+            ts->tv_nsec = (long)(int32_t)getn(p + 4, 4, be);
+        }
+        return 0;
+    }
+    if (is64) {
+        putn(p, (uint64_t)(int64_t)ts->tv_sec, 8, be);
+        putn(p + 8, (uint64_t)(int64_t)ts->tv_nsec, 8, be);
+    } else {
+        putn(p, (uint64_t)(uint32_t)(int32_t)ts->tv_sec, 4, be);
+        putn(p + 4, (uint64_t)(uint32_t)(int32_t)ts->tv_nsec, 4, be);
+    }
+    return 0;
+}
+
+int64_t mips_sc_clock_gettime(mips64_ctx_t *ctx, uint64_t clk,
+                              uint64_t ts_va, int is64)
+{
+    struct timespec ts;
+
+    if (clock_gettime((clockid_t)(int)clk, &ts) != 0) {
+        return l2a_ret(ctx, -(int64_t)errno);
+    }
+    if (xfer_ts(ctx, ts_va, is64, &ts, 1) != 0) {
+        return l2a_ret(ctx, -(int64_t)EFAULT);
+    }
+    return l2a_ret(ctx, 0);
+}
+
+int64_t mips_sc_nanosleep(mips64_ctx_t *ctx, uint64_t clk, uint64_t req_va,
+                          uint64_t rem_va, int is64, int use_clock)
+{
+    struct timespec rq;
+    struct timespec rm;
+    struct timespec *remp = NULL;
+    int64_t rc;
+
+    /* The kernel validates both pointers before sleeping. */
+    if (xfer_ts(ctx, req_va, is64, &rq, 0) != 0) {
+        return l2a_ret(ctx, -(int64_t)EFAULT);
+    }
+    if (rem_va != 0U) {
+        if (guest_range(ctx, rem_va, is64 ? 16U : 8U, 1) == NULL) {
+            return l2a_ret(ctx, -(int64_t)EFAULT);
+        }
+        remp = &rm;
+    }
+    if (rq.tv_nsec < 0 || rq.tv_nsec >= L2A_NSEC_PER_SEC) {
+        return l2a_ret(ctx, -(int64_t)EINVAL);
+    }
+    /* Relative sleep only; TIMER_ABSTIME waits for Phase 4. */
+    rc = use_clock ? (int64_t)clock_nanosleep((clockid_t)(int)clk, 0, &rq,
+                                              remp) :
+                     (int64_t)nanosleep(&rq, remp);
+    if (rc != 0) {
+        rc = -(int64_t)errno;
+        if (remp != NULL && errno == EINTR) {
+            (void)xfer_ts(ctx, rem_va, is64, remp, 1);
+        }
+        return l2a_ret(ctx, rc);
+    }
+    return l2a_ret(ctx, 0);
+}
