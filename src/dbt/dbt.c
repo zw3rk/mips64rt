@@ -141,7 +141,7 @@ typedef struct {
     uint64_t pc;
     dbt_block_t blk;   /* frozen shape: pc/end/code/len/smc_version */
     uint64_t epoch;    /* `dbt_smc_epoch` at compile time */
-    uint32_t *snap;    /* malloc'd copy of the covered guest words */
+    uint8_t *snap;     /* malloc'd copy of the covered guest bytes */
     int fallback;      /* set: run `interp_step`, never native code */
 } dbt_entry_t;
 
@@ -192,13 +192,17 @@ static void ibtc_insert(mips64_ctx_t *ctx, uint64_t guest, void *host)
 }
 
 /* Snapshot match for one cache entry: a single cover check plus a
- * host-side memcmp of the covered guest words. Same detection power
+ * host-side memcmp of the covered guest bytes. Same detection power
  * as the old per-word fetch+hash (any clobbering plain store
  * retires the translation), at one lock acquisition and no fetch
  * calls: the per-entry O(block) scan with per-word overhead is what
- * kept `dbt` below `interp` on branch-heavy code (lane H3). Returns
- * 0 when the range is not fully readable (lookup miss: the
- * dispatcher retranslates, and `interp` raises the guest fault). */
+ * kept `dbt` below `interp` on branch-heavy code (lane H3). The
+ * snapshot holds raw host bytes (not decoded words), so the compare
+ * is endianness-neutral: a word compare would pass on LE and fail on
+ * BE forever, recompiling every block until the RX mappings exhaust
+ * the container (lane H4 n32be-dbt SIGKILL). Returns 0 when the
+ * range is not fully readable (lookup miss: the dispatcher
+ * retranslates, and `interp` raises the guest fault). */
 static int dbt_snap_match(mips64_ctx_t *ctx, const dbt_entry_t *e)
 {
     uint64_t len;
@@ -313,7 +317,6 @@ int dbt_compile(mips64_ctx_t *ctx, uint64_t pc)
 {
     static uint32_t staging[MIPS64_DBT_STAGING_WORDS];
     mips_dec_t insns[MIPS64_DBT_MAX_INSNS];
-    uint32_t raw[MIPS64_DBT_MAX_INSNS];
     dbt_entry_t *slot;
     uint64_t start_page;
     uint64_t cur;
@@ -350,7 +353,6 @@ int dbt_compile(mips64_ctx_t *ctx, uint64_t pc)
         mips_decode(word, d);
         if (is_fp_coproc(d))
             return compile_decline(ctx, pc);
-        raw[n] = word;
         n++;
         cur += 4u;
         if (is_bare_ender(d) || mips_is_trap(d))
@@ -370,7 +372,6 @@ int dbt_compile(mips64_ctx_t *ctx, uint64_t pc)
             mips_decode(word, s);
             if (is_fp_coproc(s))
                 return compile_decline(ctx, pc);
-            raw[n] = word;
             n++;
             cur += 4u;
             break;
@@ -385,17 +386,17 @@ int dbt_compile(mips64_ctx_t *ctx, uint64_t pc)
         return compile_decline(ctx, pc);
     {
         void *host = dbt_code_publish((const uint8_t *)staging, out_len);
-        size_t words = (size_t)(out_end - pc) / 4u;
-        uint32_t *snap = NULL;
+        size_t len = (size_t)(out_end - pc);
+        uint8_t *snap = NULL;
 
         if (host == NULL)
             return 1; /* Resource exhaustion: retry later, cache nothing. */
-        if (words == 0u || words > MIPS64_DBT_MAX_INSNS)
+        if (len == 0u || len > (size_t)MIPS64_DBT_MAX_INSNS * 4u)
             return compile_decline(ctx, pc);
-        snap = (uint32_t *)malloc(words * sizeof *snap);
+        snap = (uint8_t *)malloc(len);
         if (snap == NULL)
             return 1; /* Retry later, cache nothing. */
-        memcpy(snap, raw, words * sizeof *snap);
+        memcpy(snap, mips64_guest_ptr(ctx, pc), len);
         dbt_snap_drop(slot);
         slot->used = 1;
         slot->pc = pc;
