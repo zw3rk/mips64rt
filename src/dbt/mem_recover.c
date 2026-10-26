@@ -166,7 +166,7 @@ static int dbt_resolve_delay_target(mips64_ctx_t *ctx, uint64_t branch_pc,
         return MIPS_FAULT;
     }
     mips_decode(bw, &b);
-    if (!mips_is_branch(&b)) {
+    if (!mips_has_delay_slot(&b)) {
         /* The "branch" is not one: fall through past the slot. */
         *target = branch_pc + 8u;
         return 0;
@@ -455,22 +455,6 @@ int dbt_mem_recover(mips64_ctx_t *ctx, const dbt_mem_site_t *site,
             mips_soft_tlb_fill(ctx, base);
             if (p1 != p0) {
                 mips_soft_tlb_fill(ctx, base + len - 1u);
-            }
-        }
-        {
-            mips_soft_tlb_entry_t *tlb =
-                (mips_soft_tlb_entry_t *)mips_soft_tlb_base(ctx);
-
-            if (tlb == NULL ||
-                tlb[p0 & MIPS64_SOFT_TLB_INDEX_MASK].write_tag !=
-                    (p0 << 12) ||
-                (p1 != p0 &&
-                 tlb[p1 & MIPS64_SOFT_TLB_INDEX_MASK].write_tag !=
-                     (p1 << 12))) {
-                ctx->pc = slot_pc;
-                dbt_trace_fault_prefix(ctx, block_pc, slot_pc);
-                mips_fault(ctx, base);
-                return 2;
             }
         }
     }

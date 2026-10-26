@@ -189,6 +189,9 @@ static void *l4b_entry(void *arg)
     if (slot != NULL && (slot->child_flags & L4B_CLONE_CHILD_SETTID) != 0U) {
         l4b_store_tid(child, slot->child_tid_va, (uint32_t)tid);
     }
+    /* Claim the quiescence slot up front so a pure-compute worker
+     * that never syscalls is still visible to preemption. */
+    mips_qs_register(child);
     (void)interp_run(child);
     mips_thread_exit(child, 0);
     return NULL;
@@ -595,14 +598,17 @@ int mips_hostfault_run(mips64_ctx_t *ctx, void *code, uint32_t *reasonp)
     ctx->exit_reason = MIPS64_EXIT_FAULT;
     ctx->exit_info = (uint32_t)l4b_fault_addr;
     /* Rev4 precise-pc channel: resolve the captured host pc to the
-     * faulting guest pc and report it through the scratch slot (the
-     * dispatcher's EXIT_FAULT case picks it up). Unresolvable pcs
-     * leave the slot alone for the legacy decode-at-pc path. */
+     * faulting guest pc and report it in ctx->pc directly (the
+     * dispatcher's EXIT_FAULT case reads pc as-is). Unresolvable pcs
+     * leave pc alone for the legacy decode-at-pc path. The scratch
+     * slot is not used: it doubles as the unaligned shift park, and
+     * a stale shift would masquerade as a fault pc. */
     if (l4b_fault_host_pc != 0U) {
         uint64_t gpc = 0U;
 
         if (dbt_host_pc_to_guest(l4b_fault_host_pc, &gpc) != 0) {
-            ctx->pad150 = gpc;
+            ctx->pc = gpc;
+            ctx->next_pc = gpc + 4u;
         }
     }
     if (reasonp != NULL) {

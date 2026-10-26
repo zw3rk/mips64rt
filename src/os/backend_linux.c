@@ -11,8 +11,11 @@
  * Pure C11 + pthread mutex; no Linux-only calls, so the same logic
  * compiles under the aarch64-musl cross compiler and natively.
  */
-
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 #include "os/backend.h"
+#include "os/quiesce.h"
 #include "vm/vm_pages.h"
 
 #include <pthread.h>
@@ -35,6 +38,31 @@ typedef struct {
 
 static u0_slot_t u0_slots[U0_MAX_SLOTS];
 static pthread_mutex_t u0_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static _Thread_local int u0_preempt_depth;
+static _Thread_local sigset_t u0_preempt_saved;
+
+/* Registry lock with preemption blocked (see quiesce.h): the
+ * mutator's TLB invalidation takes this mutex, so a peer parked
+ * holding it would deadlock the transaction. Depth-counted for
+ * the nested slot_for/fill pairing. */
+static void u0_lock(void)
+{
+    if (u0_preempt_depth == 0) {
+        mips_qs_block_preempt(&u0_preempt_saved);
+    }
+    u0_preempt_depth++;
+    (void)pthread_mutex_lock(&u0_mu);
+}
+
+static void u0_unlock(void)
+{
+    (void)pthread_mutex_unlock(&u0_mu);
+    u0_preempt_depth--;
+    if (u0_preempt_depth == 0) {
+        mips_qs_unblock_preempt(&u0_preempt_saved);
+    }
+}
 
 static void u0_invalidate(mips_soft_tlb_entry_t *tlb)
 {
@@ -59,10 +87,10 @@ static u0_slot_t *u0_slot_for(const mips64_ctx_t *ctx, int create)
     if (ctx == NULL) {
         return NULL;
     }
-    (void)pthread_mutex_lock(&u0_mu);
+    (void)u0_lock();
     for (i = 0; i < U0_MAX_SLOTS; i++) {
         if (u0_slots[i].used && u0_slots[i].key == ctx) {
-            (void)pthread_mutex_unlock(&u0_mu);
+            (void)u0_unlock();
             return &u0_slots[i];
         }
         if (!u0_slots[i].used && free_slot == NULL) {
@@ -77,7 +105,7 @@ static u0_slot_t *u0_slot_for(const mips64_ctx_t *ctx, int create)
         free_slot->target = 0U;
         u0_invalidate(free_slot->tlb);
     }
-    (void)pthread_mutex_unlock(&u0_mu);
+    (void)u0_unlock();
     return (create != 0) ? free_slot : NULL;
 }
 
@@ -98,9 +126,9 @@ void mips_fixade_set(mips64_ctx_t *ctx, int on)
     u0_slot_t *s = u0_slot_for(ctx, 1);
 
     if (s != NULL) {
-        (void)pthread_mutex_lock(&u0_mu);
+        (void)u0_lock();
         s->fixade = (on != 0) ? 1 : 0;
-        (void)pthread_mutex_unlock(&u0_mu);
+        (void)u0_unlock();
     }
 }
 
@@ -144,10 +172,10 @@ void mips_delay_target_set(mips64_ctx_t *ctx, uint64_t va)
     u0_slot_t *s = u0_slot_for(ctx, 1);
 
     if (s != NULL) {
-        (void)pthread_mutex_lock(&u0_mu);
+        (void)u0_lock();
         s->has_target = 1;
         s->target = va;
-        (void)pthread_mutex_unlock(&u0_mu);
+        (void)u0_unlock();
     }
 }
 
@@ -158,13 +186,13 @@ int mips_delay_target_get(const mips64_ctx_t *ctx, uint64_t *va)
     if (s == NULL || va == NULL) {
         return 0;
     }
-    (void)pthread_mutex_lock(&u0_mu);
+    (void)u0_lock();
     if (s->has_target == 0) {
-        (void)pthread_mutex_unlock(&u0_mu);
+        (void)u0_unlock();
         return 0;
     }
     *va = s->target;
-    (void)pthread_mutex_unlock(&u0_mu);
+    (void)u0_unlock();
     return 1;
 }
 
@@ -173,10 +201,10 @@ void mips_delay_target_clear(mips64_ctx_t *ctx)
     u0_slot_t *s = u0_slot_for(ctx, 0);
 
     if (s != NULL) {
-        (void)pthread_mutex_lock(&u0_mu);
+        (void)u0_lock();
         s->has_target = 0;
         s->target = 0U;
-        (void)pthread_mutex_unlock(&u0_mu);
+        (void)u0_unlock();
     }
 }
 
@@ -214,7 +242,7 @@ void mips_soft_tlb_fill(mips64_ctx_t *ctx, uint64_t va)
     vpn = va >> 12;
     page = vpn << 12;
     e = &s->tlb[vpn & MIPS64_SOFT_TLB_INDEX_MASK];
-    (void)pthread_mutex_lock(&u0_mu);
+    (void)u0_lock();
     /* The write gate fires here: write_tag is populated only for
      * region-writable pages that also pass the page-state gate (no
      * COW-clean/file page, no translated code, no LL reservation).
@@ -235,7 +263,7 @@ void mips_soft_tlb_fill(mips64_ctx_t *ctx, uint64_t va)
         e->write_tag = UINT64_MAX;
     }
     e->flags_reserved = 0U;
-    (void)pthread_mutex_unlock(&u0_mu);
+    (void)u0_unlock();
 }
 
 void mips_soft_tlb_invalidate(mips64_ctx_t *ctx)
@@ -243,9 +271,9 @@ void mips_soft_tlb_invalidate(mips64_ctx_t *ctx)
     u0_slot_t *s = u0_slot_for(ctx, 0);
 
     if (s != NULL) {
-        (void)pthread_mutex_lock(&u0_mu);
+        (void)u0_lock();
         u0_invalidate(s->tlb);
-        (void)pthread_mutex_unlock(&u0_mu);
+        (void)u0_unlock();
     }
 }
 
@@ -253,13 +281,13 @@ void mips_soft_tlb_invalidate_all(void)
 {
     size_t i;
 
-    (void)pthread_mutex_lock(&u0_mu);
+    (void)u0_lock();
     for (i = 0; i < U0_MAX_SLOTS; i++) {
         if (u0_slots[i].used) {
             u0_invalidate(u0_slots[i].tlb);
         }
     }
-    (void)pthread_mutex_unlock(&u0_mu);
+    (void)u0_unlock();
 }
 
 size_t mips_host_page_size(void)
@@ -334,11 +362,11 @@ void mips_backend_state_reset(mips64_ctx_t *ctx)
     u0_slot_t *s = u0_slot_for(ctx, 1);
 
     if (s != NULL) {
-        (void)pthread_mutex_lock(&u0_mu);
+        (void)u0_lock();
         s->fixade = MIPS_FIXADE_DEFAULT;
         s->has_target = 0;
         s->target = 0U;
         u0_invalidate(s->tlb);
-        (void)pthread_mutex_unlock(&u0_mu);
+        (void)u0_unlock();
     }
 }

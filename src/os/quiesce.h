@@ -34,11 +34,42 @@
 
 #include "core/cpu.h"
 
+#include <pthread.h>
+#include <signal.h>
+
 /* Worker states (see the transaction above). */
 #define MIPS_QS_RUNNING 0
 #define MIPS_QS_LEASE 1
 #define MIPS_QS_PARKED 2
 #define MIPS_QS_MUTATING 3
+
+/* Reserved preemption signal: a real-time slot clear of NPTL's own
+ * (32, 33) on Linux, SIGUSR2 where no RT range exists. Blocked
+ * nowhere; the translator owns it on both hosts. */
+#if defined(__linux__)
+#define QS_PREEMPT_SIG (SIGRTMIN + 3)
+#else
+#define QS_PREEMPT_SIG SIGUSR2
+#endif
+
+/* Block the preempt signal around short critical sections whose
+ * locks the mutator needs (mem_table, backend registry, page
+ * table). A peer parked while holding one of those would deadlock
+ * the transaction: the mutator blocks on the lock while the holder
+ * spins for the commit. Save/restore pairs nest properly. */
+static inline void mips_qs_block_preempt(sigset_t *old)
+{
+    sigset_t set;
+
+    (void)sigemptyset(&set);
+    (void)sigaddset(&set, QS_PREEMPT_SIG);
+    (void)pthread_sigmask(SIG_BLOCK, &set, old);
+}
+
+static inline void mips_qs_unblock_preempt(const sigset_t *old)
+{
+    (void)pthread_sigmask(SIG_SETMASK, old, NULL);
+}
 
 /* Lease a syscall's memory accesses (wraps mips_syscall; recursive
  * lease depth is per worker). NULL ctx is a no-op. */
@@ -60,5 +91,10 @@ void mips_qs_abort(mips64_ctx_t *ctx);
 /* Drop a dead worker's slot (thread teardown; also releases any
  * lease the exiting thread still held). NULL ctx is a no-op. */
 void mips_qs_unregister(mips64_ctx_t *ctx);
+
+/* Claim the calling thread's slot eagerly (worker start, thread
+ * entry) so pure-compute workers that never syscall are still
+ * visible to preemption. Idempotent; NULL ctx is a no-op. */
+void mips_qs_register(mips64_ctx_t *ctx);
 
 #endif /* MIPS64RT_OS_QUIESCE_H */

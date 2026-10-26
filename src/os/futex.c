@@ -273,6 +273,12 @@ static long l4f_host(uint32_t *uaddr, int op, int val,
 }
 #endif
 
+/* Quiescence lease hooks (src/os/quiesce.c): a blocking wait
+ * must not hold the dispatch lease, or a concurrent VM mutation
+ * stalls forever on a thread that is not touching memory. */
+extern void mips_qs_lease_enter(mips64_ctx_t *ctx);
+extern void mips_qs_lease_exit(mips64_ctx_t *ctx);
+
 /* Current 32-bit futex word (caller validated the mapping). */
 static uint32_t l4f_word(const mips64_ctx_t *ctx, uint32_t *hp)
 {
@@ -379,17 +385,30 @@ int64_t mips_futex_op(mips64_ctx_t *ctx, uint64_t uaddr, uint64_t op,
             top = &to;
         }
 #if defined(__linux__) && defined(SYS_futex)
+        /* Drop the dispatch lease across the blocking stretch (see
+         * above); the kernel re-checks atomically on entry. */
+        mips_qs_lease_exit(ctx);
         rc = l4f_host(hp, hop, (int)(uint32_t)val, top, NULL,
                       (uint32_t)val3);
+        mips_qs_lease_enter(ctx);
 #else
         /* WAIT takes a relative span, WAIT_BITSET an absolute stamp
-         * (hop bit 0x100 selects the REALTIME clock). */
+         * (hop bit 0x100 selects the REALTIME clock). Same lease
+         * drop: the table re-checks under its own lock. */
+        mips_qs_lease_exit(ctx);
         rc = l4f_darwin(hp, uaddr, hop, (int)(uint32_t)val,
                         ctx->is_be != 0, top,
                         base == L4F_WAIT_BITSET ? 1 : 0,
                         (hop & 0x100) != 0 ? 1 : 0, NULL, 0U, 0, 0,
                         0u);
+        mips_qs_lease_enter(ctx);
 #endif
+        /* A mutation may have retired the mapping mid-wait; treat a
+         * vanished window as a fault rather than touching it. */
+        if (rc == 0L && !mips_mem_ok(ctx, uaddr, 4U,
+                                     (uint32_t)MIPS_PROT_READ)) {
+            return l2a_ret(ctx, -(int64_t)EFAULT);
+        }
         if (rc < 0L) {
             return l2a_ret(ctx, -(int64_t)errno);
         }

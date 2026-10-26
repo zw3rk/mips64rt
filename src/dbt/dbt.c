@@ -33,6 +33,7 @@
 #include "os/backend.h"
 #include "vm/vm_pages.h"
 
+#include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -70,13 +71,15 @@ long mips64_dbt_enter(mips64_ctx_t *ctx, uint64_t base, void *code)
 /* SMC invalidation epoch.                                            */
 /* ------------------------------------------------------------------ */
 
-static uint64_t dbt_smc_epoch = 1;
+static _Atomic uint64_t dbt_smc_epoch = 1;
 
 void dbt_invalidate_all(void)
 {
-    dbt_smc_epoch++;
-    if (dbt_smc_epoch == 0)
-        dbt_smc_epoch = 1;
+    uint64_t next = atomic_fetch_add_explicit(&dbt_smc_epoch, 1u,
+                                              memory_order_acq_rel) + 1u;
+    if (next == 0u) {
+        atomic_store_explicit(&dbt_smc_epoch, 1u, memory_order_release);
+    }
     /* Drop every code mark with the translations: the next fill
      * re-marks whatever recompiles (the write gate reopens). */
     mips_vm_pages_clear(0u, ~(uint64_t)0u,
@@ -98,7 +101,7 @@ void dbt_invalidate_range(uint64_t va, uint64_t len)
 
 uint64_t dbt_epoch(void)
 {
-    return dbt_smc_epoch;
+    return atomic_load_explicit(&dbt_smc_epoch, memory_order_acquire);
 }
 
 /* ------------------------------------------------------------------ */
@@ -175,9 +178,9 @@ static void dbt_snap_drop(dbt_entry_t *e)
     }
 }
 
-static dbt_entry_t block_cache[MIPS64_DBT_CACHE_ENTRIES];
-static uint64_t ras[MIPS64_DBT_RAS_ENTRIES];
-static unsigned ras_top;
+static _Thread_local dbt_entry_t block_cache[MIPS64_DBT_CACHE_ENTRIES];
+static _Thread_local uint64_t ras[MIPS64_DBT_RAS_ENTRIES];
+static _Thread_local unsigned ras_top;
 
 static unsigned cache_index(uint64_t pc)
 {
@@ -335,7 +338,7 @@ static int compile_decline(mips64_ctx_t *ctx, uint64_t pc)
 
 int dbt_compile(mips64_ctx_t *ctx, uint64_t pc)
 {
-    static uint32_t staging[MIPS64_DBT_STAGING_WORDS];
+    static _Thread_local uint32_t staging[MIPS64_DBT_STAGING_WORDS];
     mips_dec_t insns[MIPS64_DBT_MAX_INSNS];
     dbt_entry_t *slot;
     uint64_t start_page;
@@ -681,8 +684,11 @@ int dbt_run(mips64_ctx_t *ctx)
             }
         }
         e = lookup_entry(ctx, pc);
-        start = (e != NULL) ? e->blk.guest_pc : pc;
-        end = (e != NULL) ? e->blk.guest_end : pc + 4u;
+        if (e == NULL || e->fallback || e->blk.code != code) {
+            continue;
+        }
+        start = e->blk.guest_pc;
+        end = e->blk.guest_end;
         ctx->blocks_executed++;
         if (!mips64_dbt_available()) {
             rc = interp_step(ctx);
@@ -738,19 +744,20 @@ int dbt_run(mips64_ctx_t *ctx)
              * faulting access runs again — earlier words already
              * committed, and re-executing them would replay register
              * clobbers with clobbered inputs. */
-            dbt_entry_t *te;
+            dbt_entry_t *te = e;
             const dbt_mem_site_t *site = NULL;
             uint64_t fpc;
             int mrc;
 
-            if (ctx->pad150 != 0u) {
-                ctx->pc = ctx->pad150;
-            }
+            /* ctx->pc is already precise (epilogues materialize it;
+             * the host guard resolves it before returning). The
+             * scratch slot is never consulted: it doubles as the
+             * unaligned shift park, and a stale shift would
+             * masquerade as a fault pc. */
             fpc = ctx->pc;
             ctx->exit_reason = MIPS64_EXIT_NONE;
             ctx->exit_info = 0u;
             ctx->pad150 = 0u;
-            te = lookup_entry(ctx, start);
             if (te != NULL && te->sites != NULL && fpc >= start) {
                 site = dbt_find_site(te, fpc - start);
             }
@@ -767,6 +774,13 @@ int dbt_run(mips64_ctx_t *ctx)
                     mips64_dbt_trace(ctx, ctx->pc, word);
                 }
             }
+            /* A handled fault clears the exit (pc already redirected
+             * into the handler): resume instead of exiting, exactly
+             * like the legacy fill-and-retry path. */
+            if (ctx->exit_reason == MIPS64_EXIT_NONE) {
+                ctx->exit_info = 0u;
+                continue;
+            }
             /* RC4: exactly one mips_fault trap per fault, so a
              * handled SIGSEGV delivers exactly like interp (frame +
              * handler pc) with no stale duplicate queued. */
@@ -777,7 +791,7 @@ int dbt_run(mips64_ctx_t *ctx)
              * index in exit_info. Derive the fault pc from the
              * retained row and run the shared recovery. */
             uint32_t idx = ctx->exit_info;
-            dbt_entry_t *te = lookup_entry(ctx, start);
+            dbt_entry_t *te = e;
             const dbt_mem_site_t *site = NULL;
             uint64_t fpc = ctx->pc;
             int mrc;
@@ -801,6 +815,12 @@ int dbt_run(mips64_ctx_t *ctx)
                 if (mips_fetch(ctx, ctx->pc, &word) == 0) {
                     mips64_dbt_trace(ctx, ctx->pc, word);
                 }
+            }
+            /* A handled fault clears the exit (pc already redirected
+             * into the handler): resume instead of exiting. */
+            if (ctx->exit_reason == MIPS64_EXIT_NONE) {
+                ctx->exit_info = 0u;
+                continue;
             }
             return (int)MIPS_FAULT;
         }

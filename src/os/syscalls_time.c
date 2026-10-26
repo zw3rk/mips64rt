@@ -21,6 +21,12 @@
 #include <stdint.h>
 #include <time.h>
 
+/* Quiescence lease hooks (src/os/quiesce.c): a blocking sleep must
+ * not hold the dispatch lease, or a concurrent VM mutation stalls
+ * forever on a thread that is not touching memory. */
+extern void mips_qs_lease_enter(mips64_ctx_t *ctx);
+extern void mips_qs_lease_exit(mips64_ctx_t *ctx);
+
 /* Shared helpers owned by src/os/syscalls.c. */
 extern int64_t l2a_ret(mips64_ctx_t *ctx, int64_t raw);
 extern void putn(uint8_t *p, uint64_t v, unsigned n, int be);
@@ -96,7 +102,9 @@ int64_t mips_sc_nanosleep(mips64_ctx_t *ctx, uint64_t clk, uint64_t req_va,
     if (rq.tv_nsec < 0 || rq.tv_nsec >= L2A_NSEC_PER_SEC) {
         return l2a_ret(ctx, -(int64_t)EINVAL);
     }
-    /* Relative sleep only; TIMER_ABSTIME waits for Phase 4. */
+    /* Relative sleep only; TIMER_ABSTIME waits for Phase 4.
+     * Park with 0 leases across the blocking sleep. */
+    mips_qs_lease_exit(ctx);
 #if defined(__linux__)
     rc = use_clock ? (int64_t)clock_nanosleep((clockid_t)(int)clk, 0, &rq,
                                               remp) :
@@ -108,6 +116,7 @@ int64_t mips_sc_nanosleep(mips64_ctx_t *ctx, uint64_t clk, uint64_t req_va,
     (void)clk;
     rc = (int64_t)nanosleep(&rq, remp);
 #endif
+    mips_qs_lease_enter(ctx);
     if (rc != 0) {
         rc = -(int64_t)errno;
         if (remp != NULL && errno == EINTR) {

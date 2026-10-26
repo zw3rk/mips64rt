@@ -22,8 +22,11 @@
  * lock is held. The atfork child handler re-initialises the mutex:
  * only the forking thread survives, so any in-flight holder is gone.
  */
-
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 #include "core/cpu.h"
+#include "os/quiesce.h"
 #include "vm/vm_pages.h"
 
 #include <errno.h>
@@ -68,8 +71,19 @@ static void mem_lock_init(void)
     (void)pthread_atfork(NULL, NULL, mem_atfork_child);
 }
 
+static _Thread_local int mem_preempt_depth;
+static _Thread_local sigset_t mem_preempt_saved;
+
 static void mem_lock(void)
 {
+    /* Block preemption across the table critical section (see
+     * quiesce.h): a peer parked holding this mutex would deadlock
+     * the mutator waiting for it. Depth-counted for the recursive
+     * mutex; the mask save/restore pairs nest. */
+    if (mem_preempt_depth == 0) {
+        mips_qs_block_preempt(&mem_preempt_saved);
+    }
+    mem_preempt_depth++;
     (void)pthread_once(&g_mem_once, mem_lock_init);
     (void)pthread_mutex_lock(&g_mem_mu);
 }
@@ -77,6 +91,10 @@ static void mem_lock(void)
 static void mem_unlock(void)
 {
     (void)pthread_mutex_unlock(&g_mem_mu);
+    mem_preempt_depth--;
+    if (mem_preempt_depth == 0) {
+        mips_qs_unblock_preempt(&mem_preempt_saved);
+    }
 }
 
 static uint64_t page_up(uint64_t v)

@@ -191,7 +191,7 @@ static size_t ei_probe_open(a64_emit_t *e, uint64_t pc, const mips_dec_t *d,
         e->err = 1;
         return (size_t)-1;
     }
-    seq = (uint16_t)e->len;
+    seq = (uint16_t)(e->len * 4u);
     ei_bfm(e, 0xD3400000u, EI_B, EI_A, 12u, 23u);
     ei_add_lsl(e, EI_B, EI_BASE, EI_B, 5u);
     if (is_store != 0) {
@@ -211,12 +211,12 @@ static size_t ei_probe_open(a64_emit_t *e, uint64_t pc, const mips_dec_t *d,
         return miss;
     }
     delta = pc - ei_bpc;
-    if (delta > (uint64_t)0xFFFFu) {
+    if (delta > (uint64_t)0xFFFFu || e->len * 4u > 0xFFFFu) {
         e->err = 1;
         return (size_t)-1;
     }
     s.seq_start_offset = seq;
-    s.host_insn_offset = (uint16_t)e->len;
+    s.host_insn_offset = (uint16_t)(e->len * 4u);
     s.cont_insn_offset = 0u;
     s.guest_pc_delta = (uint16_t)delta;
     s.insn_word = d->word;
@@ -265,11 +265,12 @@ static void ei_probe_close(a64_emit_t *e)
         /* Standalone emission: nothing was opened. */
         return;
     }
-    if (ei_open == (size_t)-1 || ei_open >= ei_sites.count) {
+    if (ei_open == (size_t)-1 || ei_open >= ei_sites.count ||
+        e->len * 4u > 0xFFFFu) {
         e->err = 1;
         return;
     }
-    ei_sites.sites[ei_open].cont_insn_offset = (uint16_t)e->len;
+    ei_sites.sites[ei_open].cont_insn_offset = (uint16_t)(e->len * 4u);
     ei_open = (size_t)-1;
 }
 
@@ -374,7 +375,9 @@ int ei_mem_aligned(a64_emit_t *e, const mips_dec_t *d, uint64_t pc,
         return e == NULL ? 1 : 0;
     }
     /* The 7th instruction: register-offset access on [EI_A, EI_H].
-     * x0, EI_C (value/dst), x25 and NZCV are untouched by the probe. */
+     * x0, EI_C (value/dst), x25 and NZCV are untouched by the probe.
+     * Single bytes never rev (a rev64 would exile the byte to the
+     * top halfword and the sign extension would read back zero). */
     if (is_load != 0) {
         ei_mem_rx(e, kind, 1, EI_C, EI_A, EI_H);
         if (be != 0 && (kind == (unsigned)EI_RX_U16 ||
@@ -383,7 +386,7 @@ int ei_mem_aligned(a64_emit_t *e, const mips_dec_t *d, uint64_t pc,
         } else if (be != 0 && (kind == (unsigned)EI_RX_U32 ||
                                kind == (unsigned)EI_RX_S32)) {
             ei_rev(e, 0x5AC00800u, EI_C, EI_C);
-        } else if (be != 0 && kind != (unsigned)EI_RX_U8) {
+        } else if (be != 0 && kind == (unsigned)EI_RX_U64) {
             ei_rev(e, 0xDAC00C00u, EI_C, EI_C);
         }
         if (sxt != 0u) {

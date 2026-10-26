@@ -25,6 +25,7 @@
 #include "dbt/aot/identity.h"
 #include "dbt/aot/sites.h"
 #include "os/family_broker.h"
+#include "os/quiesce.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -32,6 +33,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 extern char **environ;
@@ -253,6 +255,233 @@ static int resolve_image(const mips64_run_config_t *config,
     }
 }
 
+/* Lane U12 differential comparison (--difftest): fork the loaded
+ * guest twice (interp shadow, dbt primary), capture each engine's
+ * trace (I-lines), stdout, and exit status, and report the first
+ * divergence. Both children inherit the identical post-load image
+ * (AT_RANDOM included), so any I-line, byte, or status difference
+ * is a real engine divergence. Guest stdin is shared between the
+ * children: difftest on interactive guests is best-effort. */
+static int worker_run_child(mips64_ctx_t *ctx, int engine, int trace_fd,
+                            int out_fd)
+{
+    int rc;
+
+    if (dup2(trace_fd, STDERR_FILENO) < 0 ||
+        dup2(out_fd, STDOUT_FILENO) < 0) {
+        _Exit(127);
+    }
+    ctx->engine = engine;
+    ctx->trace_enabled = 1;
+    ctx->difftest_enabled = 0;
+    if (engine == MIPS64_ENGINE_DBT) {
+        rc = dbt_run(ctx);
+    } else {
+        rc = interp_run(ctx);
+    }
+    if (rc != 0) {
+        fprintf(stderr, "mips64rt: guest fault at pc=0x%llx (exit %d)\n",
+                (unsigned long long)ctx->pc, rc);
+        if (getenv("MIPS64RT_DUMPSTATE") != NULL) {
+            mips_dump_regs(ctx, stderr);
+        }
+        _Exit(139);
+    }
+    _Exit(0); /* unreachable: guest exit() ends the child via _Exit */
+}
+
+/* Compare the I-line streams of two trace files; 0 when identical,
+ * printing the first divergence to real stderr. */
+static int worker_cmp_traces(const char *a_path, const char *b_path)
+{
+    FILE *fa = fopen(a_path, "r");
+    FILE *fb = fopen(b_path, "r");
+    char la[512];
+    char lb[512];
+    unsigned long n = 0u;
+
+    if (fa == NULL || fb == NULL) {
+        if (fa != NULL) {
+            (void)fclose(fa);
+        }
+        if (fb != NULL) {
+            (void)fclose(fb);
+        }
+        return -1;
+    }
+    for (;;) {
+        int ha = 0;
+        int hb = 0;
+
+        while (fgets(la, sizeof la, fa) != NULL) {
+            if (la[0] == 'I' && la[1] == ' ') {
+                ha = 1;
+                break;
+            }
+        }
+        while (fgets(lb, sizeof lb, fb) != NULL) {
+            if (lb[0] == 'I' && lb[1] == ' ') {
+                hb = 1;
+                break;
+            }
+        }
+        if (!ha && !hb) {
+            break;
+        }
+        n++;
+        if (!ha || !hb || strcmp(la, lb) != 0) {
+            fprintf(stderr,
+                    "mips64rt: difftest divergence at I-line %lu:\n"
+                    "  interp: %s  dbt:    %s",
+                    n, ha ? la : "<eof>\n", hb ? lb : "<eof>\n");
+            (void)fclose(fa);
+            (void)fclose(fb);
+            return 1;
+        }
+    }
+    (void)fclose(fa);
+    (void)fclose(fb);
+    fprintf(stderr, "mips64rt: difftest clean (%lu I-lines compared)\n",
+            n);
+    return 0;
+}
+
+/* Compare two captured stdout files byte for byte; 0 when
+ * identical, first difference reported. */
+static int worker_cmp_bytes(const char *a_path, const char *b_path)
+{
+    FILE *fa = fopen(a_path, "rb");
+    FILE *fb = fopen(b_path, "rb");
+    unsigned long n = 0u;
+
+    if (fa == NULL || fb == NULL) {
+        if (fa != NULL) {
+            (void)fclose(fa);
+        }
+        if (fb != NULL) {
+            (void)fclose(fb);
+        }
+        return -1;
+    }
+    for (;;) {
+        int ca = fgetc(fa);
+        int cb = fgetc(fb);
+
+        if (ca == EOF && cb == EOF) {
+            break;
+        }
+        if (ca != cb) {
+            fprintf(stderr,
+                    "mips64rt: difftest stdout differs at byte %lu\n",
+                    n);
+            (void)fclose(fa);
+            (void)fclose(fb);
+            return 1;
+        }
+        n++;
+    }
+    (void)fclose(fa);
+    (void)fclose(fb);
+    return 0;
+}
+
+static int worker_difftest(mips64_ctx_t *ctx)
+{
+    char itrace[] = "/tmp/mips64rt-diff-i-XXXXXX";
+    char dtrace[] = "/tmp/mips64rt-diff-d-XXXXXX";
+    char iout[] = "/tmp/mips64rt-diff-io-XXXXXX";
+    char dout[] = "/tmp/mips64rt-diff-do-XXXXXX";
+    int ift;
+    int dft;
+    int ifo;
+    int dfo;
+    pid_t ci;
+    pid_t cd;
+    int si = -1;
+    int sd = -1;
+
+    ift = mkstemp(itrace);
+    dft = mkstemp(dtrace);
+    ifo = mkstemp(iout);
+    dfo = mkstemp(dout);
+    if (ift < 0 || dft < 0 || ifo < 0 || dfo < 0) {
+        fprintf(stderr, "mips64rt: difftest cannot stage captures\n");
+        return 2;
+    }
+    (void)fflush(NULL);
+    ci = fork();
+    if (ci < 0) {
+        fprintf(stderr, "mips64rt: difftest fork failed\n");
+        return 2;
+    }
+    if (ci == 0) {
+        worker_run_child(ctx, MIPS64_ENGINE_INTERP, ift, ifo);
+        _Exit(127);
+    }
+    cd = fork();
+    if (cd < 0) {
+        fprintf(stderr, "mips64rt: difftest fork failed\n");
+        return 2;
+    }
+    if (cd == 0) {
+        worker_run_child(ctx, MIPS64_ENGINE_DBT, dft, dfo);
+        _Exit(127);
+    }
+    (void)close(ift);
+    (void)close(dft);
+    (void)close(ifo);
+    (void)close(dfo);
+    {
+        int st;
+
+        while (waitpid(ci, &st, 0) < 0 && errno == EINTR) {
+        }
+        si = WIFEXITED(st) != 0 ? WEXITSTATUS(st) : 128;
+        while (waitpid(cd, &st, 0) < 0 && errno == EINTR) {
+        }
+        sd = WIFEXITED(st) != 0 ? WEXITSTATUS(st) : 128;
+    }
+    if (si != sd) {
+        fprintf(stderr,
+                "mips64rt: difftest status divergence (interp=%d dbt=%d)\n",
+                si, sd);
+        (void)unlink(itrace);
+        (void)unlink(dtrace);
+        (void)unlink(iout);
+        (void)unlink(dout);
+        return 1;
+    }
+    if (worker_cmp_traces(itrace, dtrace) != 0 ||
+        worker_cmp_bytes(iout, dout) != 0) {
+        (void)unlink(itrace);
+        (void)unlink(dtrace);
+        (void)unlink(iout);
+        (void)unlink(dout);
+        return 1;
+    }
+    /* Match: replay the primary's stdout, drop the captures, and
+     * exit with the agreed guest status. */
+    {
+        FILE *f = fopen(dout, "rb");
+        int c;
+
+        if (f != NULL) {
+            while ((c = fgetc(f)) != EOF) {
+                (void)fputc(c, stdout);
+            }
+            (void)fclose(f);
+        }
+    }
+    (void)unlink(itrace);
+    (void)unlink(dtrace);
+    (void)unlink(iout);
+    (void)unlink(dout);
+    if (si != 0) {
+        exit(si);
+    }
+    return 0;
+}
+
 int mips64_worker_loop_run(const mips64_run_config_t *config, int guest_argc,
                          char **guest_argv)
 {
@@ -321,6 +550,13 @@ int mips64_worker_loop_run(const mips64_run_config_t *config, int guest_argc,
         ctx.engine = config->engine;
         ctx.trace_enabled = config->trace;
         ctx.difftest_enabled = config->difftest;
+        mips_qs_register(&ctx);
+        if (config->difftest) {
+            /* The flag already required the dbt engine above: run
+             * the fork-based differential comparison instead of a
+             * single engine. difftest implies tracing. */
+            return worker_difftest(&ctx);
+        }
         if (config->engine == MIPS64_ENGINE_DBT) {
             rc = dbt_run(&ctx);
         } else {

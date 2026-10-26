@@ -487,8 +487,13 @@ static int64_t sc_wait4(mips64_ctx_t *ctx, uint64_t pid, uint64_t status_va,
          !mips_mem_ok(ctx, status_va, 4U, MIPS_PROT_WRITE))) {
         return sc_ret(ctx, -(int64_t)EFAULT);
     }
+    /* A blocking wait must not hold the dispatch lease: park with 0
+     * leases so a concurrent VM mutation is never stalled by a
+     * thread that is not touching memory. */
+    mips_qs_lease_exit(ctx);
     ret = waitpid((pid_t)(int64_t)pid, status_va != 0U ? &status : NULL,
                   (int)(options & 0xFFFFFFFFU));
+    mips_qs_lease_enter(ctx);
     if (ret < 0) {
         return sc_ret(ctx, -(int64_t)errno);
     }

@@ -25,14 +25,10 @@
 #include <signal.h>
 #include <stdatomic.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/syscall.h>
 #include <unistd.h>
-#if defined(__linux__)
-#include <ucontext.h>
-#elif defined(__APPLE__)
-#include <sys/ucontext.h>
-#endif
 
 #include "core/cpu.h"
 #include "dbt/dbt.h"
@@ -43,15 +39,6 @@
 #endif
 #if defined(__linux__) && !defined(SYS_gettid)
 #define SYS_gettid 178
-#endif
-
-/* Reserved preemption signal: a real-time slot clear of NPTL's own
- * (32, 33) on Linux, SIGUSR2 where no RT range exists. Blocked
- * nowhere; the translator owns it on both hosts. */
-#if defined(__linux__)
-#define QS_PREEMPT_SIG (SIGRTMIN + 3)
-#else
-#define QS_PREEMPT_SIG SIGUSR2
 #endif
 
 #define QS_MAX_SLOTS 16u
@@ -273,30 +260,19 @@ void mips_qs_begin(mips64_ctx_t *ctx)
     s->depth = 1;
     atomic_store(&s->state, MIPS_QS_MUTATING);
     atomic_store(&qs_mutating, 1);
-    /* Preempt every RUNNING peer. Slots bound to this thread are
-     * never peers: the same thread cannot run two workers at once,
-     * so a same-thread slot is either this one or stale (a dead
-     * ctx the test harness kept). Signalling one would preempt
-     * this very thread mid-transaction and deadlock the drain. */
-    {
-        pthread_t self = pthread_self();
-
-        for (i = 0u; i < QS_MAX_SLOTS; i++) {
-            if (atomic_load(&qs_slots[i].used) != 0 &&
-                &qs_slots[i] != s &&
-                !pthread_equal(qs_slots[i].pthread, self) &&
-                atomic_load(&qs_slots[i].state) == MIPS_QS_RUNNING) {
-                qs_preempt_peer(&qs_slots[i]);
-            }
-        }
-    }
-    /* Wait for peers to park and outstanding (non-self) leases to
-     * drain. A peer entering a lease now spins on the sequence, so
-     * the drain terminates. Same-thread slots are skipped like
-     * above: they cannot hold a concurrent lease. */
+    /* Drive every peer to PARKED, re-signalling inside the loop: a
+     * peer that was in LEASE state during the last sweep (or that
+     * just entered RUNNING) has no signal in flight yet. Slots
+     * bound to this thread are never peers: the same thread cannot
+     * run two workers at once, so a same-thread slot is either this
+     * one or stale. Signalling one would preempt this very thread
+     * mid-transaction and deadlock the drain. A parked peer is out
+     * regardless of any lease it still reports: it is spun in the
+     * handler touching no memory, and its lease accounting resumes
+     * intact (the drain counts only unparked holders). */
     for (;;) {
         int quiet = 1;
-        int mine = atomic_load(&s->leases);
+        int held = 0;
         pthread_t self = pthread_self();
 
         for (i = 0u; i < QS_MAX_SLOTS; i++) {
@@ -310,11 +286,21 @@ void mips_qs_begin(mips64_ctx_t *ctx)
             st = atomic_load(&qs_slots[i].state);
             if (st == MIPS_QS_RUNNING || st == MIPS_QS_LEASE) {
                 quiet = 0;
-                break;
+            }
+            if (st != MIPS_QS_PARKED) {
+                held += atomic_load(&qs_slots[i].leases);
             }
         }
-        if (quiet && atomic_load(&qs_leases) - mine <= 0) {
+        if (quiet && held <= 0) {
             break;
+        }
+        for (i = 0u; i < QS_MAX_SLOTS; i++) {
+            if (atomic_load(&qs_slots[i].used) != 0 &&
+                &qs_slots[i] != s &&
+                !pthread_equal(qs_slots[i].pthread, self) &&
+                atomic_load(&qs_slots[i].state) != MIPS_QS_PARKED) {
+                qs_preempt_peer(&qs_slots[i]);
+            }
         }
         sched_yield();
     }
@@ -354,6 +340,20 @@ void mips_qs_commit(mips64_ctx_t *ctx)
 void mips_qs_abort(mips64_ctx_t *ctx)
 {
     qs_end(ctx, 0);
+}
+
+void mips_qs_register(mips64_ctx_t *ctx)
+{
+    qs_slot_t *s;
+
+    if (ctx == NULL) {
+        return;
+    }
+    (void)pthread_once(&qs_once, qs_install);
+    s = qs_slot_for(ctx, 1);
+    if (s != NULL) {
+        qs_touch(s);
+    }
 }
 
 void mips_qs_unregister(mips64_ctx_t *ctx)

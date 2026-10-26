@@ -95,6 +95,12 @@ else
     bad "test_u0_fill_retry (cold-page fill-and-retry)"
 fi
 
+if _build/test_u0_gate >/dev/null; then
+    ok "test_u0_gate (write gate + Provider A)"
+else
+    bad "test_u0_gate (write gate + Provider A)"
+fi
+
 # --- 2. Docker section (bounded, guarded) ----------------------------
 IMG="debian:trixie-slim"
 NAME="mips64rt-parity-$$"
@@ -126,51 +132,87 @@ else
 set -u
 apt-get update -qq
 DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-    gcc-mips64el-linux-gnuabi64 qemu-user >/dev/null 2>&1
-mips64el-linux-gnuabi64-gcc -O1 -static -std=c11 -Werror=vla -pedantic \
-    -Wall -Wextra -Werror -mabi=64 \
-    -o /tmp/parity-n64le tests/test_p1_isa.c
-set +e
-timeout --kill-after=30s 60s qemu-mips64el /tmp/parity-n64le >/tmp/o-qemu 2>&1
-qrc=$?
-timeout --kill-after=30s 60s /w/_build/mips64rt --interp /tmp/parity-n64le >/tmp/o-interp 2>&1
-irc=$?
-timeout --kill-after=30s 60s /w/_build/mips64rt --dbt /tmp/parity-n64le >/tmp/o-dbt 2>&1
-drc=$?
-set -e
-echo "rc: qemu=$qrc interp=$irc dbt=$drc"
-[ "$qrc" = "$irc" ] || { echo "P-FAIL: interp exit differs from oracle"; exit 1; }
-[ "$qrc" = "$drc" ] || { echo "P-FAIL: dbt exit differs from oracle"; exit 1; }
-cmp -s /tmp/o-interp /tmp/o-dbt || { echo "P-FAIL: interp != dbt"; exit 1; }
-# Known oracle quirk (see test_p1_isa.c pageend_body note): a never-taken
-# branch-likely annuls its delay slot, so the first execution fetch fault
-# lands on the fall-through (offset 8), which both engines report
-# byte-identically. qemu-user instead faults while translating the
-# annulled delay word itself (offset 4). The engines are architecturally
-# right and agree with each other; only this one observation line is
-# normalized out of the oracle comparison. Any other oracle difference
-# is still a GAP (exit 2).
-grep -v "^P1-INFO pageend-offset=" /tmp/o-qemu > /tmp/o-qemu-n
-grep -v "^P1-INFO pageend-offset=" /tmp/o-interp > /tmp/o-interp-n
-if cmp -s /tmp/o-qemu-n /tmp/o-interp-n; then
-    echo "P-PASS: N64LE oracle parity (interp == dbt == qemu-mips64el)"
-    exit 0
-fi
-echo "P-GAP: oracle differs, engines agree (see diff)"
-diff /tmp/o-qemu /tmp/o-interp | head -20
-exit 2
+    gcc-mips64el-linux-gnuabi64 gcc-mips64-linux-gnuabi64 \
+    libc6-dev-mips64el-cross libc6-dev-mipsn32-mips64el-cross \
+    libc6-dev-mips64-cross libc6-dev-mipsn32-mips64-cross \
+    libn32gcc-14-dev-mips64el-cross libn32gcc-14-dev-mips64-cross \
+    qemu-user >/dev/null 2>&1
+CFLAGS="-O1 -static -std=c11 -Werror=vla -pedantic -Wall -Wextra -Werror"
+gaps=0
+fails=0
+run_abi() {
+    abi="$1"; cc="$2"; mabi="$3"; qemu="$4"
+    bin="/tmp/parity-$abi"
+    echo "== ABI $abi ($cc -mabi=$mabi vs $qemu) =="
+    # shellcheck disable=SC2086
+    $cc $CFLAGS -mabi=$mabi -o "$bin" tests/test_p1_isa.c || {
+        echo "P-FAIL: $abi guest build failed"; fails=$((fails + 1)); return
+    }
+    set +e
+    timeout --kill-after=30s 60s "$qemu" "$bin" >/tmp/o-qemu 2>&1
+    qrc=$?
+    timeout --kill-after=30s 60s /w/_build/mips64rt --interp "$bin" >/tmp/o-interp 2>&1
+    irc=$?
+    timeout --kill-after=30s 60s /w/_build/mips64rt --dbt "$bin" >/tmp/o-dbt 2>&1
+    drc=$?
+    set -e
+    echo "rc: qemu=$qrc interp=$irc dbt=$drc"
+    [ "$qrc" = "$irc" ] || { echo "P-FAIL: $abi interp exit differs from oracle"; fails=$((fails + 1)); return; }
+    [ "$qrc" = "$drc" ] || { echo "P-FAIL: $abi dbt exit differs from oracle"; fails=$((fails + 1)); return; }
+    cmp -s /tmp/o-interp /tmp/o-dbt || { echo "P-FAIL: $abi interp != dbt"; fails=$((fails + 1)); return; }
+    # Known oracle quirk (see test_p1_isa.c pageend_body note): a
+    # never-taken branch-likely annuls its delay slot, so the first
+    # execution fetch fault lands on the fall-through (offset 8),
+    # which both engines report byte-identically. qemu-user instead
+    # faults while translating the annulled delay word itself
+    # (offset 4). The engines are architecturally right and agree
+    # with each other; only this one observation line is normalized
+    # out of the oracle comparison. Any other oracle difference is
+    # still a GAP.
+    grep -v "^P1-INFO pageend-offset=" /tmp/o-qemu > /tmp/o-qemu-n
+    grep -v "^P1-INFO pageend-offset=" /tmp/o-interp > /tmp/o-interp-n
+    if cmp -s /tmp/o-qemu-n /tmp/o-interp-n; then
+        echo "P-PASS: $abi oracle parity (interp == dbt == $qemu)"
+        return
+    fi
+    echo "P-GAP: $abi oracle differs, engines agree (see diff)"
+    diff /tmp/o-qemu /tmp/o-interp | head -20
+    gaps=$((gaps + 1))
+}
+run_abi n64le mips64el-linux-gnuabi64-gcc 64 qemu-mips64el
+run_abi n64be mips64-linux-gnuabi64-gcc 64 qemu-mips64
+run_abi n32le mips64el-linux-gnuabi64-gcc n32 qemu-mipsn32el
+run_abi n32be mips64-linux-gnuabi64-gcc n32 qemu-mipsn32
+echo "abis done: fails=$fails gaps=$gaps"
+[ "$fails" -eq 0 ] || exit 1
+[ "$gaps" -eq 0 ] || exit 2
+exit 0
 ' >/tmp/parity-docker.log 2>&1
     crc=$?
     set -e
     if [ "$crc" -eq 0 ]; then
-        ok "N64LE oracle parity (interp == dbt == qemu-mips64el)"
+        ok "P1 4-ABI oracle parity (interp == dbt == qemu, N64/N32 x LE/BE)"
     elif [ "$crc" -eq 2 ]; then
-        gap "N64LE oracle GAP (interp == dbt, oracle differs)"
+        gap "P1 oracle GAP (interp == dbt, oracle differs)"
         sed -n '1,25p' /tmp/parity-docker.log
     else
         bad "docker oracle section failed (exit $crc)"
         sed -n '1,25p' /tmp/parity-docker.log
     fi
+fi
+
+# --- 3. Phase lanes with their own gates (bounded, self-cleaning) ---
+if ./tests/run_h1_smc.sh >/tmp/parity-h1.log 2>&1; then
+    ok "H1 SMC gate (interp == dbt, N64/N32 x LE/BE)"
+else
+    bad "H1 SMC gate failed"
+    tail -5 /tmp/parity-h1.log
+fi
+if ./tests/run_h4_cxx17.sh >/tmp/parity-h4.log 2>&1; then
+    ok "H4 C++17 gate (interp == dbt, N64/N32 x LE/BE)"
+else
+    bad "H4 C++17 gate failed"
+    tail -5 /tmp/parity-h4.log
 fi
 
 trap - EXIT INT TERM

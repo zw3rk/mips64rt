@@ -481,6 +481,26 @@ static void test_aligned_words(void)
     CHECK(u0buf[11] == UINT32_C(0xB8246AB6)); /* str w22, [x21, x4] */
     CHECK(u0buf[12] == UINT32_C(0x3904BA7F));
 
+    /* LB never revs (either endianness): a rev64 would exile the
+     * byte to the top halfword and the sign extension would read
+     * back zero for every positive byte. */
+    d.op = 0x20u; /* LB */
+    u0_begin();
+    CHECK(ei_mem_aligned(&u0e, &d, UINT64_C(0x1000), 0, 0) == 0);
+    CHECK(u0e.err == 0);
+    CHECK(u0e.len == 12u);
+    CHECK(u0buf[6] == UINT32_C(0x9274CEB6)); /* bic x22, x21, #0xFFF */
+    CHECK(u0buf[9] == UINT32_C(0x38A46AB7)); /* ldrsb x23, [x21, x4] */
+    CHECK(u0buf[10] == UINT32_C(0x93401EF7)); /* sxtb x23, x23 */
+    CHECK(u0buf[11] == UINT32_C(0xF9001677));
+    u0_begin();
+    CHECK(ei_mem_aligned(&u0e, &d, UINT64_C(0x1000), 1, 0) == 0);
+    CHECK(u0e.err == 0);
+    CHECK(u0e.len == 12u);
+    CHECK(u0buf[9] == UINT32_C(0x38A46AB7));
+    CHECK(u0buf[10] == UINT32_C(0x93401EF7));
+    CHECK(u0buf[11] == UINT32_C(0xF9001677));
+
     /* Slot words record a delay-slot site (emitted inside a block). */
     ei_mem_block_begin(UINT64_C(0x1000));
     u0_begin();
