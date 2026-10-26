@@ -75,7 +75,8 @@ enum {
     MIPS64_DBT_EXIT_UNDEF = MIPS64_EXIT_UNDEF,        /* interp one step */
     MIPS64_DBT_EXIT_SINGLE_STEP = MIPS64_EXIT_SINGLE_STEP, /* step+resume */
     MIPS64_DBT_EXIT_SYSCALL = MIPS64_EXIT_SYSCALL,   /* syscall at pc */
-    MIPS64_DBT_EXIT_FAULT = MIPS64_EXIT_FAULT        /* reason recorded */
+    MIPS64_DBT_EXIT_FAULT = MIPS64_EXIT_FAULT,       /* reason recorded */
+    MIPS64_DBT_EXIT_TRAP = MIPS64_EXIT_TRAP          /* site idx in info */
 };
 
 /* `exit_info` convention for `EXIT_DIRECT` (set by the emitter,
@@ -122,6 +123,41 @@ void dbt_u0_prefill(mips64_ctx_t *ctx, uint64_t start, uint64_t end);
  * is already present, which rules out a cold miss and stops a
  * fill/retry loop on a host-level fault). */
 int dbt_u0_fill_retry(mips64_ctx_t *ctx, uint64_t pc);
+
+/* Fault effective address of the memory word at `pc` (0 when the
+ * word is not a memory access). Lane U12: the dispatcher no longer
+ * calls this directly (the site-based `dbt_mem_recover` below maps
+ * si_addr from the retained row); it stays for the unit gate. */
+uint64_t dbt_fault_ea(mips64_ctx_t *ctx, uint64_t pc);
+
+/* Shared site-based miss path (see src/dbt/mem_recover.c): 0 means
+ * the word ran again (caller clears the exit and continues), 1
+ * means a fault or exit was delivered with its trace lines already
+ * printed (caller returns), 2 means a fault was delivered but the
+ * faulting word line is still owed (caller prints it from
+ * `ctx->pc`). */
+struct dbt_mem_site;
+int dbt_mem_recover(mips64_ctx_t *ctx, const struct dbt_mem_site *site,
+                    uint64_t block_pc, uint64_t fault_pc);
+
+/* Block visitor for host-pc resolution: rows, count, RX base/len,
+ * guest base; nonzero stops the walk. */
+typedef int (*dbt_block_visit_t)(const struct dbt_mem_site *sites,
+                                 size_t count, uint64_t rx_base,
+                                 size_t rx_len, uint64_t guest_pc,
+                                 void *arg);
+void dbt_visit_blocks(dbt_block_visit_t visit, void *arg);
+
+/* Print the natively executed prefix [start, fault); leaves
+ * `ctx->pc` at fault. */
+void dbt_trace_fault_prefix(mips64_ctx_t *ctx, uint64_t start,
+                            uint64_t fault);
+
+/* Resolve a host pc captured inside RX to the faulting guest pc (1)
+ * or report no match (0). Rewind a host pc interrupted inside a
+ * sequence prefix to the sequence start (1) or report no match (0). */
+int dbt_host_pc_to_guest(uint64_t host_pc, uint64_t *guest_pc);
+int dbt_rewind_pc(uint64_t host_pc, uint64_t *seq_out);
 
 /* Enter compiled code: saves host callee-saved registers, pins
  * `x19 = ctx` and `x20 = base`, calls `code`, restores, and returns

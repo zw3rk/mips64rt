@@ -573,3 +573,133 @@ void ei_sub_imm(a64_emit_t *e, unsigned rd, unsigned rn, uint32_t imm)
     a64e_u32(e, 0xD1000000u | ((imm & 0xFFFu) << 10) | ((rn & 31u) << 5) |
                 (rd & 31u));
 }
+
+/* ---- Lane U12 Rev4 soft-TLB words (all assembler-verified) ---- */
+
+/* add Xd, Xn, Xm, lsl #amount (verified: add x22,x20,x22,lsl#5 is
+ * 0x8b161696). Only the LSL form is needed (entry stride scaling). */
+void ei_add_lsl(a64_emit_t *e, unsigned rd, unsigned rn, unsigned rm,
+                unsigned amount)
+{
+    if (e != NULL &&
+        (amount > 63u || !ei_reg_ok(rd) || !ei_reg_ok(rn) ||
+         !ei_reg_ok(rm))) {
+        e->err = 1;
+        return;
+    }
+    a64e_u32(e, 0x8B000000u | ((rm & 31u) << 16) | ((amount & 63u) << 10) |
+                ((rn & 31u) << 5) | (rd & 31u));
+}
+
+/* ldp Xt1, Xt2, [Xn, #off] (off a signed multiple of 8 in
+ * [-512, 504]; verified: ldp x24,x4,[x22] is 0xa94012d8,
+ * ldp x4,x24,[x22,#8] is 0xa940e2c4). */
+void ei_ldp(a64_emit_t *e, unsigned rt1, unsigned rt2, unsigned rn,
+            int32_t off)
+{
+    int32_t d = off / 8;
+
+    if (e != NULL &&
+        (off % 8 != 0 || d < -64 || d > 63 || !ei_reg_ok(rt1) ||
+         !ei_reg_ok(rt2) || !ei_reg_ok(rn))) {
+        e->err = 1;
+        return;
+    }
+    a64e_u32(e, 0xA9400000u | (((uint32_t)(d & 0x7F)) << 15) |
+                ((rt2 & 31u) << 10) | ((rn & 31u) << 5) | (rt1 & 31u));
+}
+
+/* bic Xd, Xn, #mask with the five probe masks (assembler-verified
+ * template words: 0xFFF->0x9274cc00, 0xFFE->0x9274d000,
+ * 0xFFC->0x9274d400, 0xFF8->0x9274d800, 0xFF0->0x9274dc00). Any
+ * other mask is an emitter bug (the probe only folds power-of-two
+ * widths 1/2/4/8/16). */
+void ei_bic_imm(a64_emit_t *e, unsigned rd, unsigned rn, uint32_t mask)
+{
+    uint32_t base;
+
+    switch (mask) {
+    case 0xFFFu:
+        base = 0x9274CC00u;
+        break;
+    case 0xFFEu:
+        base = 0x9274D000u;
+        break;
+    case 0xFFCu:
+        base = 0x9274D400u;
+        break;
+    case 0xFF8u:
+        base = 0x9274D800u;
+        break;
+    case 0xFF0u:
+        base = 0x9274DC00u;
+        break;
+    default:
+        if (e != NULL) {
+            e->err = 1;
+        }
+        return;
+    }
+    if (e != NULL && (!ei_reg_ok(rd) || !ei_reg_ok(rn))) {
+        e->err = 1;
+        return;
+    }
+    a64e_u32(e, base | ((rn & 31u) << 5) | (rd & 31u));
+}
+
+/* Register-offset loads/stores: ld/st [Xn, Xm] (bases
+ * assembler-verified across all widths/signedness). kind selects the
+ * width and signedness; stores ignore the S (sign-extending) kinds. */
+void ei_mem_rx(a64_emit_t *e, unsigned kind, int is_load, unsigned rt,
+               unsigned rn, unsigned rm)
+{
+    uint32_t base;
+
+    switch ((kind << 1) | (is_load != 0 ? 1u : 0u)) {
+    case (0u << 1) | 1u: /* U8 load  */
+        base = 0x38606800u;
+        break;
+    case (0u << 1) | 0u: /* U8 store */
+        base = 0x38206800u;
+        break;
+    case (1u << 1) | 1u: /* U16 load  */
+        base = 0x78606800u;
+        break;
+    case (1u << 1) | 0u: /* U16 store */
+        base = 0x78206800u;
+        break;
+    case (2u << 1) | 1u: /* U32 load  */
+        base = 0xB8606800u;
+        break;
+    case (2u << 1) | 0u: /* U32 store */
+        base = 0xB8206800u;
+        break;
+    case (3u << 1) | 1u: /* U64 load  */
+        base = 0xF8606800u;
+        break;
+    case (3u << 1) | 0u: /* U64 store */
+        base = 0xF8206800u;
+        break;
+    case (4u << 1) | 1u: /* S8 load   */
+        base = 0x38A06800u;
+        break;
+    case (5u << 1) | 1u: /* S16 load  */
+        base = 0x78A06800u;
+        break;
+    case (6u << 1) | 1u: /* S32 load  */
+        base = 0xB8A06800u;
+        break;
+    default:
+        if (e != NULL) {
+            e->err = 1;
+        }
+        return;
+    }
+    if (e != NULL &&
+        (!ei_reg_ok(rt) || !ei_reg_ok(rn) || !ei_reg_ok(rm))) {
+        e->err = 1;
+        return;
+    }
+    a64e_u32(e, base | ((rm & 31u) << 16) | ((rn & 31u) << 5) |
+                (rt & 31u));
+}

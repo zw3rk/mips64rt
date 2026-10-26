@@ -74,6 +74,7 @@ BOOT_COMMON := src/main.c \
 	src/vm/vm_file.c \
 	src/dbt/a64_emit.c \
 	src/dbt/dbt.c \
+	src/dbt/mem_recover.c \
 	src/dbt/emit_int.c \
 	src/dbt/emit_enc.c \
 	src/dbt/emit_alu.c \
@@ -126,6 +127,7 @@ U0_SRCS := tests/test_u0_delay_tlb.c \
 	src/dbt/emit_int.c \
 	src/dbt/emit_fp.c \
 	src/dbt/dbt.c \
+	src/dbt/mem_recover.c \
 	src/dbt/trampoline_a64.S
 
 # Fill-and-retry regression gate: same TU list as the U0 gate with

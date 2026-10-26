@@ -27,6 +27,7 @@
 #include "dbt/dbt.h"
 
 #include "core/cpu.h"
+#include "dbt/emit_mem.h"
 #include "interp/decode.h"
 #include "os/backend.h"
 
@@ -103,45 +104,10 @@ int dbt_npc_resume(mips64_ctx_t *ctx)
     return mips_npc_resume_step(ctx, &applied);
 }
 
-void dbt_u0_prefill(mips64_ctx_t *ctx, uint64_t start, uint64_t end)
-{
-    uint64_t va;
-
-    if (ctx == NULL || end <= start) {
-        return;
-    }
-    /* One fill per 4 KiB page in the block span; misses fault to
-     * the interp_step fallback by construction, so a short span
-     * stays correct even without this loop. Fill empty slots only:
-     * the invalidation sentinel is UINT64_MAX (see u0_invalidate)
-     * and a matching tag is already correct. Overwriting a live
-     * entry here evicts just-filled data pages every iteration when
-     * a code vpn aliases a data vpn in the 64-entry table,
-     * livelocking fill-and-retry (demand fills still overwrite on
-     * miss). */
-    {
-        mips_soft_tlb_entry_t *tlb =
-            (mips_soft_tlb_entry_t *)mips_soft_tlb_base(ctx);
-
-        if (tlb == NULL) {
-            return;
-        }
-        va = start & ~(uint64_t)4095U;
-        while (va < end) {
-            uint64_t vpn = va >> 12;
-            mips_soft_tlb_entry_t *e =
-                &tlb[vpn & MIPS64_SOFT_TLB_INDEX_MASK];
-
-            if (e->tag == UINT64_MAX || e->tag == vpn) {
-                mips_soft_tlb_fill(ctx, va);
-            }
-            if (va + 4096U < va) {
-                break;
-            }
-            va += 4096U;
-        }
-    }
-}
+/* NOTE: dbt_u0_prefill, dbt_u0_fill_retry and dbt_fault_ea live in
+ * src/dbt/mem_recover.c (lane U12): the site-based miss path shares
+ * their span decode, so they moved next to it. The dbt.h
+ * declarations are unchanged. */
 
 /* ------------------------------------------------------------------ */
 /* W^X code pages.                                                    */
@@ -196,6 +162,8 @@ typedef struct {
     uint64_t epoch;    /* `dbt_smc_epoch` at compile time */
     uint8_t *snap;     /* malloc'd copy of the covered guest bytes */
     int fallback;      /* set: run `interp_step`, never native code */
+    dbt_mem_site_t *sites; /* retained relative miss-site rows */
+    size_t site_count;
 } dbt_entry_t;
 
 /* Release an entry snapshot (evict/decline overwrite, code mappings
@@ -205,6 +173,11 @@ static void dbt_snap_drop(dbt_entry_t *e)
     if (e != NULL && e->snap != NULL) {
         free(e->snap);
         e->snap = NULL;
+    }
+    if (e != NULL && e->sites != NULL) {
+        free(e->sites);
+        e->sites = NULL;
+        e->site_count = 0u;
     }
 }
 
@@ -461,6 +434,30 @@ int dbt_compile(mips64_ctx_t *ctx, uint64_t pc)
         slot->epoch = dbt_smc_epoch;
         slot->snap = snap;
         slot->fallback = 0;
+        slot->sites = NULL;
+        slot->site_count = 0u;
+        /* Retain the emission's relative site rows with the block
+         * (miss path, signal rewind, AOT): drained from the staging
+         * table, so the next compile starts clean. */
+        {
+            const dbt_mem_site_t *rows = NULL;
+            size_t nrows = 0u;
+
+            ei_mem_take_sites(&rows, &nrows);
+            if (rows != NULL && nrows != 0u &&
+                nrows <= DBT_MEM_SITES_MAX) {
+                dbt_mem_site_t *copy =
+                    (dbt_mem_site_t *)malloc(nrows *
+                                             sizeof(dbt_mem_site_t));
+
+                if (copy != NULL) {
+                    memcpy(copy, rows,
+                           nrows * sizeof(dbt_mem_site_t));
+                    slot->sites = copy;
+                    slot->site_count = nrows;
+                }
+            }
+        }
         ibtc_insert(ctx, pc, host);
         ctx->blocks_compiled++;
         ctx->wx_transitions++;
@@ -570,146 +567,65 @@ static void ras_update(mips64_ctx_t *ctx, unsigned info)
     }
 }
 
-/* RC4: effective address of the faulting word at pc (load/store with
- * base+offset form; anything else reports pc itself). exit_info only
- * carries the low 32 bits, so si_addr for a handled SIGSEGV is
- * recomputed here from the decoded word and current regs. */
-static uint64_t dbt_fault_ea(mips64_ctx_t *ctx, uint64_t pc)
+/* Print the natively executed prefix [start, fault) when a memory
+ * word misses: the recovery runs the word itself (which prints its
+ * own line), so the I-stream matches the interpreter exactly.
+ * Leaves ctx->pc at fault for the caller's word print. */
+void dbt_trace_fault_prefix(mips64_ctx_t *ctx, uint64_t start,
+                            uint64_t fault)
 {
-    uint32_t word = 0u;
-    mips_dec_t d;
-
-    if (mips_fetch(ctx, pc, &word) != 0) {
-        return pc;
+    if (ctx == NULL) {
+        return;
     }
-    mips_decode(word, &d);
-    if (d.op >= 0x20u && d.op <= 0x3Fu) {
-        return ctx->gpr[d.rs] + (uint64_t)(int64_t)d.simm;
-    }
-    return pc;
+    ctx->pc = fault;
+    trace_block_exit(ctx, start, fault, 0);
 }
 
-/* U0 cold-data-page fill-and-retry (see dbt.h): distinguish a TLB
- * miss on a mapped page (fill + retry) from a genuine fault. Span
- * ops (LWL/LWR/SWL/SWR touch a 4-byte word span, LDL/LDR/SDL/SDR an
- * 8-byte doubleword span) probe the aligned span; every other op
- * probes [ea, ea+width). Coprocessor transfers share the integer
- * widths; CACHE probes one byte read; PREF never faults in the
- * emitter but a mapped span still fills harmlessly. */
-int dbt_u0_fill_retry(mips64_ctx_t *ctx, uint64_t pc)
+/* Walk every live block for host-pc resolution (signal rewind,
+ * host-guard fault reporting). The visitor returns nonzero to stop. */
+void dbt_visit_blocks(dbt_block_visit_t visit, void *arg)
 {
-    uint32_t word = 0u;
-    mips_dec_t d;
-    uint64_t ea;
-    uint64_t base;
-    uint64_t len = 0u;
-    uint64_t p0;
-    uint64_t p1;
-    uint32_t need = MIPS_PROT_READ;
-    int is_span = 0;
-    mips_soft_tlb_entry_t *tlb;
+    size_t i;
 
-    if (ctx == NULL || mips_fetch(ctx, pc, &word) != 0) {
-        return 0;
+    if (visit == NULL) {
+        return;
     }
-    mips_decode(word, &d);
-    switch (d.op) {
-    case 0x20u: /* LB */
-    case 0x24u: /* LBU */
-        len = 1u;
-        break;
-    case 0x21u: /* LH */
-    case 0x25u: /* LHU */
-        len = 2u;
-        break;
-    case 0x23u: /* LW */
-    case 0x27u: /* LWU */
-    case 0x30u: /* LL */
-    case 0x31u: /* LWC1 */
-        len = 4u;
-        break;
-    case 0x37u: /* LD */
-    case 0x34u: /* LLD */
-    case 0x35u: /* LDC1 */
-        len = 8u;
-        break;
-    case 0x28u: /* SB */
-        need = MIPS_PROT_WRITE;
-        len = 1u;
-        break;
-    case 0x29u: /* SH */
-        need = MIPS_PROT_WRITE;
-        len = 2u;
-        break;
-    case 0x2bu: /* SW */
-    case 0x38u: /* SC */
-    case 0x39u: /* SWC1 */
-        need = MIPS_PROT_WRITE;
-        len = 4u;
-        break;
-    case 0x3fu: /* SD */
-    case 0x3cu: /* SCD */
-    case 0x3du: /* SDC1 */
-        need = MIPS_PROT_WRITE;
-        len = 8u;
-        break;
-    case 0x22u: /* LWL */
-    case 0x26u: /* LWR */
-        len = 4u;
-        is_span = 1;
-        break;
-    case 0x2au: /* SWL */
-    case 0x2eu: /* SWR */
-        need = MIPS_PROT_WRITE;
-        len = 4u;
-        is_span = 1;
-        break;
-    case 0x1au: /* LDL */
-    case 0x1bu: /* LDR */
-        len = 8u;
-        is_span = 1;
-        break;
-    case 0x2cu: /* SDL */
-    case 0x2du: /* SDR */
-        need = MIPS_PROT_WRITE;
-        len = 8u;
-        is_span = 1;
-        break;
-    case 0x2fu: /* CACHE */
-        len = 1u;
-        break;
-    case 0x33u: /* PREF */
-        len = 1u;
-        break;
-    default:
-        return 0;
+    for (i = 0u; i < MIPS64_DBT_CACHE_ENTRIES; i++) {
+        dbt_entry_t *e = &block_cache[i];
+
+        if (e->used == 0 || e->fallback != 0 || e->blk.code == NULL ||
+            e->sites == NULL || e->site_count == 0u) {
+            continue;
+        }
+        if (visit(e->sites, e->site_count,
+                  (uint64_t)(uintptr_t)e->blk.code,
+                  (size_t)e->blk.code_len, e->blk.guest_pc, arg) != 0) {
+            return;
+        }
     }
-    ea = ctx->gpr[d.rs] + (uint64_t)(int64_t)d.simm;
-    if (is_span != 0) {
-        base = ea & ~(len - 1u);
-    } else {
-        base = ea;
-    }
-    if (mips_mem_ok(ctx, base, len, need) == 0) {
-        return 0;
-    }
-    tlb = (mips_soft_tlb_entry_t *)mips_soft_tlb_base(ctx);
-    if (tlb == NULL) {
-        return 0;
-    }
-    p0 = base >> 12;
-    p1 = (base + len - 1u) >> 12;
-    if (tlb[p0 & MIPS64_SOFT_TLB_INDEX_MASK].tag == p0 &&
-        (p1 == p0 ||
-         tlb[p1 & MIPS64_SOFT_TLB_INDEX_MASK].tag == p1)) {
-        return 0;
-    }
-    mips_soft_tlb_fill(ctx, base);
-    if (p1 != p0) {
-        mips_soft_tlb_fill(ctx, base + len - 1u);
-    }
-    return 1;
 }
+
+/* Find the retained site for a guest-pc delta inside a block (NULL
+ * when the block has no rows or the delta matches none). */
+static const dbt_mem_site_t *dbt_find_site(const dbt_entry_t *e,
+                                           uint64_t delta)
+{
+    size_t i;
+
+    if (e == NULL || e->sites == NULL || delta > (uint64_t)0xFFFFu) {
+        return NULL;
+    }
+    for (i = 0u; i < e->site_count; i++) {
+        if ((uint64_t)e->sites[i].guest_pc_delta == delta) {
+            return &e->sites[i];
+        }
+    }
+    return NULL;
+}
+
+/* NOTE: dbt_fault_ea and dbt_u0_fill_retry live in
+ * src/dbt/mem_recover.c (lane U12); see the note above
+ * dbt_npc_resume. */
 
 int dbt_run(mips64_ctx_t *ctx)
 {
@@ -809,68 +725,80 @@ int dbt_run(mips64_ctx_t *ctx)
             if (rc != 0)
                 return rc;
             continue;
-        case MIPS64_DBT_EXIT_FAULT:
-            /* RC4: every compiled load/store records its guest pc in
-             * the scratch slot before touching host memory, so a
-             * host-guard capture lands on the precise faulting word
-             * even though blocks never advance ctx->pc per insn. */
+        case MIPS64_DBT_EXIT_FAULT: {
+            /* Host-guard capture on a stale entry: the precise pc
+             * comes from the retained site when the fault lands
+             * inside [seq_start, cont), else the word decodes at the
+             * captured pc (legacy path, no delay recovery). Only the
+             * faulting access runs again — earlier words already
+             * committed, and re-executing them would replay register
+             * clobbers with clobbered inputs. */
+            dbt_entry_t *te;
+            const dbt_mem_site_t *site = NULL;
+            uint64_t fpc;
+            int mrc;
+
             if (ctx->pad150 != 0u) {
                 ctx->pc = ctx->pad150;
             }
-            /* U0 cold-data-page fill-and-retry runs before any
-             * tracing: the re-executed block traces its own prefix
-             * on its real exit, so tracing here would print the
-             * prefix twice and break --trace/difftest parity. */
-            if (dbt_u0_fill_retry(ctx, ctx->pc) != 0) {
-                /* Retry at the faulting word: earlier words already
-                 * committed (re-executing them would replay register
-                 * clobbers with clobbered inputs, e.g. startup
-                 * gp-ra chains), so only the faulting access runs
-                 * again against the freshly filled entry. When the
-                 * faulting word is a delay slot, resume at its branch
-                 * instead: the slot alone cannot re-apply the
-                 * taken/fallthrough decision. The scratch slot is
-                 * cleared so a later guard capture without a fresh
-                 * record cannot reuse a stale pc. */
-                {
-                    uint32_t prev = 0u;
-                    mips_dec_t pd;
-
-                    if (ctx->pc >= 4u &&
-                        mips_fetch(ctx, ctx->pc - 4u, &prev) == 0) {
-                        mips_decode(prev, &pd);
-                        if (mips_has_delay_slot(&pd) != 0) {
-                            ctx->pc -= 4u;
-                        }
-                    }
-                }
-                ctx->pad150 = 0u;
+            fpc = ctx->pc;
+            ctx->exit_reason = MIPS64_EXIT_NONE;
+            ctx->exit_info = 0u;
+            ctx->pad150 = 0u;
+            te = lookup_entry(ctx, start);
+            if (te != NULL && te->sites != NULL && fpc >= start) {
+                site = dbt_find_site(te, fpc - start);
+            }
+            mrc = dbt_mem_recover(ctx, site, start, fpc);
+            if (mrc == 0) {
                 ctx->exit_reason = MIPS64_EXIT_NONE;
                 ctx->exit_info = 0u;
                 continue;
             }
-            trace_block_exit(ctx, start, end, 0);
-            /* The faulting insn is terminal: no `interp_step`
-             * re-run prints it, so print its line here to match
-             * `interp` (which traces the faulting fetch). */
-            if (ctx->trace_enabled) {
+            if (mrc == 2 && ctx->trace_enabled) {
                 uint32_t word = 0u;
 
-                if (mips_fetch(ctx, ctx->pc, &word) == 0)
+                if (mips_fetch(ctx, ctx->pc, &word) == 0) {
                     mips64_dbt_trace(ctx, ctx->pc, word);
+                }
             }
-            /* RC4: exactly one mips_fault trap per fault (inline
-             * epilogue faults and host-guard captures alike), so a
+            /* RC4: exactly one mips_fault trap per fault, so a
              * handled SIGSEGV delivers exactly like interp (frame +
              * handler pc) with no stale duplicate queued. */
-            if (ctx->exit_reason == MIPS64_EXIT_FAULT) {
-                mips_fault(ctx, dbt_fault_ea(ctx, ctx->pc));
+            return (int)MIPS_FAULT;
+        }
+        case MIPS64_DBT_EXIT_TRAP: {
+            /* Rev4 miss path: the per-site stub recorded the site
+             * index in exit_info. Derive the fault pc from the
+             * retained row and run the shared recovery. */
+            uint32_t idx = ctx->exit_info;
+            dbt_entry_t *te = lookup_entry(ctx, start);
+            const dbt_mem_site_t *site = NULL;
+            uint64_t fpc = ctx->pc;
+            int mrc;
+
+            ctx->exit_reason = MIPS64_EXIT_NONE;
+            ctx->exit_info = 0u;
+            ctx->pad150 = 0u;
+            if (te != NULL && te->sites != NULL && idx < te->site_count) {
+                site = &te->sites[idx];
+                fpc = start + (uint64_t)site->guest_pc_delta;
             }
-            if (ctx->exit_reason == MIPS64_EXIT_NONE) {
+            mrc = dbt_mem_recover(ctx, site, start, fpc);
+            if (mrc == 0) {
+                ctx->exit_reason = MIPS64_EXIT_NONE;
                 ctx->exit_info = 0u;
                 continue;
             }
+            if (mrc == 2 && ctx->trace_enabled) {
+                uint32_t word = 0u;
+
+                if (mips_fetch(ctx, ctx->pc, &word) == 0) {
+                    mips64_dbt_trace(ctx, ctx->pc, word);
+                }
+            }
             return (int)MIPS_FAULT;
+        }
         default:
             trace_block_exit(ctx, start, end, 0);
             ctx->exit_reason = MIPS64_EXIT_NONE;

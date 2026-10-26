@@ -5,8 +5,8 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * Lane L-U0-C-owned. Implements src/os/backend.h on Darwin (Apple Silicon): the U0
- * gate state (fixade flag default 1, delay-slot target, 64-entry
- * soft-TLB) lives in a small process-wide registry keyed by
+ * gate state (fixade flag default 1, delay-slot target, 4096-entry
+ * 32-byte soft-TLB) lives in a small process-wide registry keyed by
  * `mips64_ctx_t *` so the frozen cpu.h layout is never touched.
  * Pure C11 + pthread mutex; no Linux-only calls, so the same logic
  * compiles under the aarch64-musl cross compiler and natively.
@@ -38,8 +38,10 @@ static void u0_invalidate(mips_soft_tlb_entry_t *tlb)
     size_t i;
 
     for (i = 0; i < MIPS64_SOFT_TLB_ENTRIES; i++) {
-        tlb[i].tag = UINT64_MAX;
-        tlb[i].host_base = 0U;
+        tlb[i].read_tag = UINT64_MAX;
+        tlb[i].addend = 0U;
+        tlb[i].write_tag = UINT64_MAX;
+        tlb[i].flags_reserved = 0U;
     }
 }
 
@@ -196,6 +198,8 @@ void mips_soft_tlb_fill(mips64_ctx_t *ctx, uint64_t va)
 {
     u0_slot_t *s;
     uint64_t vpn;
+    uint64_t page;
+    mips_soft_tlb_entry_t *e;
 
     if (ctx == NULL) {
         return;
@@ -205,10 +209,27 @@ void mips_soft_tlb_fill(mips64_ctx_t *ctx, uint64_t va)
         return;
     }
     vpn = va >> 12;
+    page = vpn << 12;
+    e = &s->tlb[vpn & MIPS64_SOFT_TLB_INDEX_MASK];
     (void)pthread_mutex_lock(&u0_mu);
-    s->tlb[vpn & MIPS64_SOFT_TLB_INDEX_MASK].tag = vpn;
-    s->tlb[vpn & MIPS64_SOFT_TLB_INDEX_MASK].host_base =
-        ctx->guest_base + (vpn << 12);
+    /* The write gate fires here: write_tag is populated only for
+     * region-writable pages that also pass the page-state gate (no
+     * COW-clean/file page, no translated code, no LL reservation).
+     * The page-state restrictions land with the Provider A wiring;
+     * until then the region prot decides. */
+    if (mips_mem_ok(ctx, page, 4096U, (uint32_t)MIPS_PROT_READ)) {
+        e->read_tag = page;
+        e->addend = (uintptr_t)ctx->guest_base;
+    } else {
+        e->read_tag = UINT64_MAX;
+        e->addend = 0U;
+    }
+    if (mips_mem_ok(ctx, page, 4096U, (uint32_t)MIPS_PROT_WRITE)) {
+        e->write_tag = page;
+    } else {
+        e->write_tag = UINT64_MAX;
+    }
+    e->flags_reserved = 0U;
     (void)pthread_mutex_unlock(&u0_mu);
 }
 
@@ -221,6 +242,19 @@ void mips_soft_tlb_invalidate(mips64_ctx_t *ctx)
         u0_invalidate(s->tlb);
         (void)pthread_mutex_unlock(&u0_mu);
     }
+}
+
+void mips_soft_tlb_invalidate_all(void)
+{
+    size_t i;
+
+    (void)pthread_mutex_lock(&u0_mu);
+    for (i = 0; i < U0_MAX_SLOTS; i++) {
+        if (u0_slots[i].used) {
+            u0_invalidate(u0_slots[i].tlb);
+        }
+    }
+    (void)pthread_mutex_unlock(&u0_mu);
 }
 
 void mips_backend_state_reset(mips64_ctx_t *ctx)

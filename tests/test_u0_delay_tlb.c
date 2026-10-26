@@ -26,6 +26,7 @@
 #include "dbt/a64_emit.h"
 #include "dbt/dbt.h"
 #include "dbt/emit_int.h"
+#include "dbt/emit_mem.h"
 #include "os/backend.h"
 #include "vm/vm64.h"
 #include "vm/vm_file.h"
@@ -283,30 +284,49 @@ static void test_soft_tlb(void)
     base = (mips_soft_tlb_entry_t *)mips_soft_tlb_base(&ctx);
     CHECK(base != NULL);
     CHECK((((uintptr_t)base) & 7u) == 0u);
-    CHECK(sizeof(mips_soft_tlb_entry_t) == 16u);
+    CHECK(sizeof(mips_soft_tlb_entry_t) == 32u);
     CHECK(mips_soft_tlb_base(NULL) == NULL);
 
-    /* Entries start invalid; fill derives tag + host base. */
-    CHECK(base[5].tag == UINT64_MAX);
-    mips_soft_tlb_fill(&ctx, UINT64_C(0x12345000));
-    idx = (size_t)((UINT64_C(0x12345)) & MIPS64_SOFT_TLB_INDEX_MASK);
-    CHECK(idx == 5u);
-    CHECK(base[idx].tag == UINT64_C(0x12345));
-    CHECK(base[idx].host_base == ctx.guest_base + UINT64_C(0x12345000));
+    /* Entries start invalid; fill derives the split tags plus the
+     * uniform addend (read for readable, write for writable). */
+    CHECK(sizeof(mips_soft_tlb_entry_t) == 32u);
+    CHECK(base[0x345u].read_tag == UINT64_MAX);
+    CHECK(base[0x345u].write_tag == UINT64_MAX);
+    mips_soft_tlb_fill(&ctx, U0_PAGE + 0x500u);
+    idx = (size_t)(((U0_PAGE + 0x500u) >> 12) & MIPS64_SOFT_TLB_INDEX_MASK);
+    CHECK(idx == (size_t)((U0_PAGE >> 12) & 0xFFFu));
+    CHECK(base[idx].read_tag == (U0_PAGE & ~(uint64_t)0xFFFu));
+    CHECK(base[idx].write_tag == (U0_PAGE & ~(uint64_t)0xFFFu));
+    CHECK(base[idx].addend == (uintptr_t)ctx.guest_base);
+    CHECK(base[idx].flags_reserved == 0u);
     mips_soft_tlb_fill(NULL, 1U);
     mips_soft_tlb_invalidate(NULL);
 
+    /* A read-only remap closes the write gate but keeps reads. */
+    mips_mem_protect(&ctx, U0_PAGE, 0x1000u, (uint32_t)MIPS_PROT_READ);
+    mips_soft_tlb_invalidate(&ctx);
+    mips_soft_tlb_fill(&ctx, U0_PAGE + 8u);
+    CHECK(base[(size_t)((U0_PAGE >> 12) & 0xFFFu)].read_tag ==
+          (U0_PAGE & ~(uint64_t)0xFFFu));
+    CHECK(base[(size_t)((U0_PAGE >> 12) & 0xFFFu)].write_tag ==
+          UINT64_MAX);
+    mips_mem_protect(&ctx, U0_PAGE, 0x1000u,
+                     (uint32_t)(MIPS_PROT_READ | MIPS_PROT_WRITE));
+
     /* Prefill covers every page of the span. */
     mips_soft_tlb_invalidate(&ctx);
-    CHECK(base[idx].tag == UINT64_MAX);
+    CHECK(base[idx].read_tag == UINT64_MAX);
+    dbt_u0_prefill(&ctx, U0_PAGE, U0_PAGE + UINT64_C(0x1000));
+    CHECK(base[(size_t)((U0_PAGE >> 12) & 0xFFFu)].read_tag ==
+          (U0_PAGE & ~(uint64_t)0xFFFu));
+    /* Unmapped span pages are skipped, never stamped readable. */
     dbt_u0_prefill(&ctx, U0_PAGE, U0_PAGE + UINT64_C(0x2000));
-    CHECK(base[(size_t)((U0_PAGE >> 12) & 63u)].tag == (U0_PAGE >> 12));
-    CHECK(base[(size_t)(((U0_PAGE + 0x1000u) >> 12) & 63u)].tag ==
-          ((U0_PAGE + 0x1000u) >> 12));
+    CHECK(base[(size_t)(((U0_PAGE + 0x1000u) >> 12) & 0xFFFu)].read_tag ==
+          UINT64_MAX);
     dbt_u0_prefill(NULL, 0U, 4096U);
     dbt_u0_prefill(&ctx, 8U, 8U);
 
-    CHECK(MIPS64RT_BACKEND_REV == 4u);
+    CHECK(MIPS64RT_BACKEND_REV == 5u);
     CHECK(mips_backend_name() != NULL);
     CHECK(MIPS64_BUS_ADRALN == 1u);
     CHECK(MIPS64_SIGBUS == 10u);
@@ -337,26 +357,45 @@ static int u0_has_masked(uint32_t mask, uint32_t want)
     return 0;
 }
 
-static int u0_has_exact(uint32_t want)
-{
-    return u0_has_masked(UINT32_C(0xFFFFFFFF), want);
-}
-
 static void test_probe_words(void)
 {
+    /* Rev4 load probe (mask 0xFFC): ubfx, scaled add, tag/addend
+     * ldp, masked bic, folded subtract, miss cbnz. Every word is
+     * assembler-verified (see the /tmp/enc_probe captures). */
     u0_begin();
-    (void)ei_tlb_probe(&u0e);
+    (void)ei_tlb_probe(&u0e, 0xFFCu, 0);
     CHECK(u0e.err == 0);
-    CHECK(u0e.len == 7u);
-    CHECK(u0buf[0] == UINT32_C(0xD34CFEB6)); /* lsr x22, x21, #12 */
-    CHECK(u0buf[1] == UINT32_C(0xD34016C4)); /* ubfm x4, x22, #0, #5 */
-    CHECK(u0buf[2] == UINT32_C(0xD37CEC84)); /* lsl x4, x4, #4 */
-    CHECK(u0buf[3] == UINT32_C(0x8B040284)); /* add x4, x20, x4 */
-    CHECK(u0buf[4] == UINT32_C(0xF9400098)); /* ldr x24, [x4] */
-    CHECK(u0buf[5] == UINT32_C(0xCA160318)); /* eor x24, x24, x22 */
-    CHECK(u0buf[6] == UINT32_C(0xB5000018)); /* cbnz x24 (unpatched) */
+    CHECK(u0e.len == 6u);
+    CHECK(u0buf[0] == UINT32_C(0xD34C5EB6)); /* ubfx x22, x21, #12, #12 */
+    CHECK(u0buf[1] == UINT32_C(0x8B161696)); /* add x22, x20, x22, lsl #5 */
+    CHECK(u0buf[2] == UINT32_C(0xA94012D8)); /* ldp x24, x4, [x22] */
+    CHECK(u0buf[3] == UINT32_C(0x9274D6B6)); /* bic x22, x21, #0xFFC */
+    CHECK(u0buf[4] == UINT32_C(0xCB1802D6)); /* sub x22, x22, x24 */
+    CHECK(u0buf[5] == UINT32_C(0xB5000016)); /* cbnz x22 (unpatched) */
+
+    /* Store probe (mask 0xFF8): the ldp swaps to (addend, tag). */
+    u0_begin();
+    (void)ei_tlb_probe(&u0e, 0xFF8u, 1);
+    CHECK(u0e.err == 0);
+    CHECK(u0e.len == 6u);
+    CHECK(u0buf[0] == UINT32_C(0xD34C5EB6));
+    CHECK(u0buf[1] == UINT32_C(0x8B161696));
+    CHECK(u0buf[2] == UINT32_C(0xA940E2C4)); /* ldp x4, x24, [x22, #8] */
+    CHECK(u0buf[3] == UINT32_C(0x9274DAB6)); /* bic x22, x21, #0xFF8 */
+    CHECK(u0buf[4] == UINT32_C(0xCB1802D6));
+    CHECK(u0buf[5] == UINT32_C(0xB5000016));
+
+    /* Bad widths are an emitter error, never a silent miscompile. */
+    u0_begin();
+    (void)ei_tlb_probe(&u0e, 0xFF7u, 0);
+    CHECK(u0e.err != 0);
 }
 
+/* Exact Rev4 memory-word shapes (rs=4, rt=5, simm=16). The address
+ * triple is shared: ldr x21,[x19,#0x40]; movz x24,#16;
+ * add x21,x21,x24. The 6-insn probe follows, then the single
+ * register-offset memory word on [x21, x4]. No alignment tst, no
+ * scratch pc store, no x0 anywhere, never x18. */
 static void test_aligned_words(void)
 {
     mips_dec_t d;
@@ -367,43 +406,98 @@ static void test_aligned_words(void)
     d.rt = 5u;
     d.simm = 16;
 
-    /* LE: probe follows the align check, x4 carries the host
-     * address, the legacy [x20 + va] add is gone, x0 is named by
-     * no word (exact probe prefix pins every register). */
+    /* LE LW: 12 words, ends with ldrsw + sxtw + guest store. */
     u0_begin();
-    CHECK(ei_mem_aligned(&u0e, &d, UINT64_C(0x1000), 0) == 0);
+    CHECK(ei_mem_aligned(&u0e, &d, UINT64_C(0x1000), 0, 0) == 0);
     CHECK(u0e.err == 0);
-    CHECK(u0_has_exact(UINT32_C(0x8B150296)) == 0);
-    CHECK(u0_has_masked(UINT32_C(0xFF000000), UINT32_C(0xB5000000)) == 1);
-    CHECK(u0_has_exact(UINT32_C(0xF9400496)) == 1); /* ldr x22,[x4,#8] */
-    CHECK(u0_has_exact(UINT32_C(0xD3402EA4)) == 1); /* ubfm x4,x21,#0,#11 */
-    CHECK(u0_has_exact(UINT32_C(0x8B0402C4)) == 1); /* add x4,x22,x4 */
-    CHECK(u0e.len > 13u);
-    CHECK(u0buf[6] == UINT32_C(0xD34CFEB6));
-    CHECK(u0buf[7] == UINT32_C(0xD34016C4));
-    CHECK(u0buf[8] == UINT32_C(0xD37CEC84));
-    CHECK(u0buf[9] == UINT32_C(0x8B040284));
-    CHECK(u0buf[10] == UINT32_C(0xF9400098));
-    CHECK(u0buf[11] == UINT32_C(0xCA160318));
-    CHECK((u0buf[12] & UINT32_C(0xFF00001F)) == UINT32_C(0xB5000018));
+    CHECK(u0e.len == 12u);
+    CHECK(u0buf[0] == UINT32_C(0xF9401275));
+    CHECK(u0buf[1] == UINT32_C(0xD2800218));
+    CHECK(u0buf[2] == UINT32_C(0x8B1802B5));
+    CHECK(u0buf[3] == UINT32_C(0xD34C5EB6));
+    CHECK(u0buf[4] == UINT32_C(0x8B161696));
+    CHECK(u0buf[5] == UINT32_C(0xA94012D8));
+    CHECK(u0buf[6] == UINT32_C(0x9274D6B6));
+    CHECK(u0buf[7] == UINT32_C(0xCB1802D6));
+    CHECK(u0buf[8] == UINT32_C(0xB5000016));
+    CHECK(u0buf[9] == UINT32_C(0xB8A46AB7)); /* ldrsw x23, [x21, x4] */
+    CHECK(u0buf[10] == UINT32_C(0x93407EF7)); /* sxtw x23, x23 */
+    CHECK(u0buf[11] == UINT32_C(0xF9001677)); /* str x23, [x19, #0x28] */
     CHECK(u0_has_masked(UINT32_C(0xFFC00000), UINT32_C(0x5AC00000)) == 0);
-    CHECK(u0_has_masked(UINT32_C(0xFFC00000), UINT32_C(0xDAC00000)) == 0);
 
-    /* BE LW carries the word rev; BE LD the doubleword rev64. */
+    /* BE LW: same plus the word rev before the sign extension. */
     u0_begin();
-    CHECK(ei_mem_aligned(&u0e, &d, UINT64_C(0x1000), 1) == 0);
+    CHECK(ei_mem_aligned(&u0e, &d, UINT64_C(0x1000), 1, 0) == 0);
     CHECK(u0e.err == 0);
-    CHECK(u0_has_masked(UINT32_C(0xFFC00000), UINT32_C(0x5AC00000)) == 1);
+    CHECK(u0e.len == 13u);
+    CHECK(u0buf[9] == UINT32_C(0xB8A46AB7));
+    CHECK(u0buf[10] == UINT32_C(0x5AC00AF7)); /* rev w23, w23 */
+    CHECK(u0buf[11] == UINT32_C(0x93407EF7));
+    CHECK(u0buf[12] == UINT32_C(0xF9001677));
+
+    /* BE LD: doubleword load + rev64 + X-form store. */
     d.op = 0x37u; /* LD */
     u0_begin();
-    CHECK(ei_mem_aligned(&u0e, &d, UINT64_C(0x1000), 1) == 0);
+    CHECK(ei_mem_aligned(&u0e, &d, UINT64_C(0x1000), 1, 0) == 0);
     CHECK(u0e.err == 0);
-    CHECK(u0_has_masked(UINT32_C(0xFFC00000), UINT32_C(0xDAC00000)) == 1);
+    CHECK(u0e.len == 12u);
+    CHECK(u0buf[6] == UINT32_C(0x9274DAB6)); /* bic x22, x21, #0xFF8 */
+    CHECK(u0buf[9] == UINT32_C(0xF8646AB7)); /* ldr x23, [x21, x4] */
+    CHECK(u0buf[10] == UINT32_C(0xDAC00EF7)); /* rev x23, x23 */
+    CHECK(u0buf[11] == UINT32_C(0xF9001677)); /* str x23, [x19, #0x28] */
+
+    /* BE LH: halfword load + rev16 + sign extension. */
     d.op = 0x21u; /* LH */
     u0_begin();
-    CHECK(ei_mem_aligned(&u0e, &d, UINT64_C(0x1000), 1) == 0);
+    CHECK(ei_mem_aligned(&u0e, &d, UINT64_C(0x1000), 1, 0) == 0);
     CHECK(u0e.err == 0);
-    CHECK(u0_has_masked(UINT32_C(0xFFC00000), UINT32_C(0x5AC00000)) == 1);
+    CHECK(u0e.len == 13u);
+    CHECK(u0buf[6] == UINT32_C(0x9274D2B6)); /* bic x22, x21, #0xFFE */
+    CHECK(u0buf[9] == UINT32_C(0x78A46AB7)); /* ldrsh x23, [x21, x4] */
+    CHECK(u0buf[10] == UINT32_C(0x5AC006F7)); /* rev16 w23, w23 */
+    CHECK(u0buf[11] == UINT32_C(0x93403EF7)); /* sxth x23, x23 */
+    CHECK(u0buf[12] == UINT32_C(0xF9001677));
+
+    /* LE SB: byte store path with the llbit clear. */
+    d.op = 0x28u; /* SB */
+    u0_begin();
+    CHECK(ei_mem_aligned(&u0e, &d, UINT64_C(0x1000), 0, 0) == 0);
+    CHECK(u0e.err == 0);
+    CHECK(u0e.len == 12u);
+    CHECK(u0buf[5] == UINT32_C(0xA940E2C4)); /* ldp x4, x24, [x22, #8] */
+    CHECK(u0buf[6] == UINT32_C(0x9274CEB6)); /* bic x22, x21, #0xFFF */
+    CHECK(u0buf[9] == UINT32_C(0xF9401677)); /* ldr x23, [x19, #0x28] */
+    CHECK(u0buf[10] == UINT32_C(0x38246AB7)); /* strb w23, [x21, x4] */
+    CHECK(u0buf[11] == UINT32_C(0x3904BA7F)); /* llbit clear */
+
+    /* BE SW: the rev lands in x22 (dead past the compare), never x0. */
+    d.op = 0x2Bu; /* SW */
+    u0_begin();
+    CHECK(ei_mem_aligned(&u0e, &d, UINT64_C(0x1000), 1, 0) == 0);
+    CHECK(u0e.err == 0);
+    CHECK(u0e.len == 13u);
+    CHECK(u0buf[9] == UINT32_C(0xF9401677));
+    CHECK(u0buf[10] == UINT32_C(0x5AC00AF6)); /* rev w22, w23 */
+    CHECK(u0buf[11] == UINT32_C(0xB8246AB6)); /* str w22, [x21, x4] */
+    CHECK(u0buf[12] == UINT32_C(0x3904BA7F));
+
+    /* Slot words record a delay-slot site (emitted inside a block). */
+    ei_mem_block_begin(UINT64_C(0x1000));
+    u0_begin();
+    ei_mem_branch_note(UINT64_C(0xFFC), (unsigned)RT_NPC_STATIC_TARGET,
+                       (int32_t)8);
+    CHECK(ei_mem_aligned(&u0e, &d, UINT64_C(0x1000), 0, 1) == 0);
+    CHECK(u0e.err == 0);
+    ei_mem_branch_clear();
+    {
+        const struct dbt_mem_site *sites;
+        size_t count;
+
+        ei_mem_block_end(&u0e);
+        CHECK(u0e.err == 0);
+        ei_mem_take_sites(&sites, &count);
+        CHECK(count == 1u);
+    }
 }
 
 /* ---- vm64 / Provider A 6-step contract over both providers ---- */

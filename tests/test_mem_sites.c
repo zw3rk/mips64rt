@@ -1,123 +1,165 @@
-/* Lane U12 miss-site table checks: 24-byte records, bump allocation,
- * little-endian serialization, and the exact 2-insn miss stub words.
+/*
+ * tests/test_mem_sites.c — Lane U12 relative miss-site table tests.
  *
  * Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0
  *
- * Host-portable (same pattern as `tests/test_decode.c`): builds with
- * the host C compiler, no Docker, no guest toolchain.
- *
- * Curated C11 only: no VLA, no Annex K, no <threads.h>, no _Generic,
- * no sprintf/strcpy/strcat.
+ * Pins the 24-byte relative dbt_mem_site_t layout (offsets,
+ * serialization round-trip, validation rejects), and the 2-insn
+ * miss stub shape (movz w4, #site; b with zero offset for the block
+ * end to patch). Never executed: emission only.
  */
 
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 
+#include "core/cpu.h"
+#include "dbt/a64_emit.h"
+#include "dbt/emit_int.h"
 #include "dbt/emit_mem.h"
 
-static int failures = 0;
-static int checks = 0;
+static int passes;
+static int fails;
 
-static void check(const char *name, int cond)
+#define CHECK(cond)                                                        \
+    do {                                                                   \
+        if (!(cond)) {                                                     \
+            (void)printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond);   \
+            fails++;                                                       \
+        } else {                                                           \
+            passes++;                                                      \
+        }                                                                  \
+    } while (0)
+
+static dbt_mem_site_t u0_site(uint16_t seq, uint16_t insn, uint16_t cont,
+                              uint16_t delta)
 {
-    checks++;
-    if (cond != 0) {
-        printf("ok: %s\n", name);
-    } else {
-        printf("FAIL: %s\n", name);
-        failures++;
+    dbt_mem_site_t s;
+
+    (void)memset(&s, 0, sizeof s);
+    s.seq_start_offset = seq;
+    s.host_insn_offset = insn;
+    s.cont_insn_offset = cont;
+    s.guest_pc_delta = delta;
+    s.npc_delta = -8;
+    s.insn_word = 0x8CA50010u;
+    s.sp_rollback_delta = 0;
+    s.npc_mode = (uint8_t)RT_NPC_SEQUENTIAL;
+    s.width = 4u;
+    s.flags = (uint8_t)DBT_MEM_F_STORE;
+    s.val_or_dst_reg = 5u;
+    s.addr_base_reg = 4u;
+    s.reserved = 0u;
+    return s;
+}
+
+static void test_record_layout(void)
+{
+    dbt_mem_site_t s = u0_site(0x10u, 0x18u, 0x1Cu, 0x20u);
+
+    CHECK(sizeof(dbt_mem_site_t) == 24u);
+    CHECK(offsetof(dbt_mem_site_t, seq_start_offset) == 0u);
+    CHECK(offsetof(dbt_mem_site_t, host_insn_offset) == 2u);
+    CHECK(offsetof(dbt_mem_site_t, cont_insn_offset) == 4u);
+    CHECK(offsetof(dbt_mem_site_t, guest_pc_delta) == 6u);
+    CHECK(offsetof(dbt_mem_site_t, npc_delta) == 8u);
+    CHECK(offsetof(dbt_mem_site_t, insn_word) == 12u);
+    CHECK(offsetof(dbt_mem_site_t, sp_rollback_delta) == 16u);
+    CHECK(offsetof(dbt_mem_site_t, npc_mode) == 18u);
+    CHECK(offsetof(dbt_mem_site_t, width) == 19u);
+    CHECK(offsetof(dbt_mem_site_t, flags) == 20u);
+    CHECK(offsetof(dbt_mem_site_t, val_or_dst_reg) == 21u);
+    CHECK(offsetof(dbt_mem_site_t, addr_base_reg) == 22u);
+    CHECK(offsetof(dbt_mem_site_t, reserved) == 23u);
+    CHECK(s.flags == (uint8_t)DBT_MEM_F_STORE);
+    CHECK(DBT_MEM_SITES_MAX == 256u);
+}
+
+static void test_bump_serialize_roundtrip(void)
+{
+    dbt_mem_sites_t t;
+    dbt_mem_sites_t u;
+    dbt_mem_site_t a = u0_site(0x10u, 0x18u, 0x1Cu, 0x20u);
+    dbt_mem_site_t b = u0_site(0x30u, 0x38u, 0x40u, 0x44u);
+    uint8_t buf[48];
+    size_t n;
+
+    dbt_mem_sites_init(&t);
+    CHECK(t.count == 0u);
+    CHECK(dbt_mem_site_bump(NULL, &a) < 0);
+    CHECK(dbt_mem_site_bump(&t, NULL) < 0);
+    CHECK(dbt_mem_site_bump(&t, &a) == 0);
+    b.npc_mode = (uint8_t)RT_NPC_DYNAMIC_CTX;
+    b.flags |= (uint8_t)DBT_MEM_F_IN_DELAY_SLOT;
+    CHECK(dbt_mem_site_bump(&t, &b) == 1);
+    CHECK(t.count == 2u);
+
+    /* All-or-nothing sizing: short cap and NULL fail cleanly. */
+    CHECK(dbt_mem_sites_serialize(NULL, buf, sizeof buf) == 0u);
+    CHECK(dbt_mem_sites_serialize(&t, NULL, sizeof buf) == 0u);
+    CHECK(dbt_mem_sites_serialize(&t, buf, 24u) == 0u);
+    n = dbt_mem_sites_serialize(&t, buf, sizeof buf);
+    CHECK(n == 48u);
+
+    /* Row 0 is the store site: relative offsets then the payload. */
+    CHECK(buf[0] == 0x10u && buf[1] == 0x00u);
+    CHECK(buf[2] == 0x18u && buf[3] == 0x00u);
+    CHECK(buf[4] == 0x1Cu && buf[5] == 0x00u);
+    CHECK(buf[6] == 0x20u && buf[7] == 0x00u);
+    CHECK(buf[18] == (uint8_t)RT_NPC_SEQUENTIAL);
+    CHECK(buf[19] == 4u);
+    CHECK(buf[20] == (uint8_t)DBT_MEM_F_STORE);
+
+    /* Round trip preserves every field, including the delay bit. */
+    dbt_mem_sites_init(&u);
+    CHECK(dbt_mem_sites_deserialize(NULL, buf, n) == 0u);
+    CHECK(dbt_mem_sites_deserialize(&u, NULL, n) == 0u);
+    CHECK(dbt_mem_sites_deserialize(&u, buf, 23u) == 0u);
+    CHECK(dbt_mem_sites_deserialize(&u, buf, n) == 2u);
+    CHECK(u.count == 2u);
+    CHECK(u.sites[0].guest_pc_delta == 0x20u);
+    CHECK(u.sites[0].insn_word == 0x8CA50010u);
+    CHECK(u.sites[0].width == 4u);
+    CHECK(u.sites[1].npc_mode == (uint8_t)RT_NPC_DYNAMIC_CTX);
+    CHECK((u.sites[1].flags & (uint8_t)DBT_MEM_F_IN_DELAY_SLOT) != 0u);
+    CHECK(u.sites[1].npc_delta == -8);
+
+    /* Reserved must be zero: nonzero rows are rejected wholesale. */
+    buf[23] = 1u;
+    {
+        dbt_mem_sites_t v;
+
+        dbt_mem_sites_init(&v);
+        CHECK(dbt_mem_sites_deserialize(&v, buf, n) == 0u);
+        CHECK(v.count == 0u);
     }
+}
+
+static void test_stub_shape(void)
+{
+    static a64_emit_t e;
+    static uint32_t buf[16];
+    size_t at;
+
+    (void)memset(&e, 0, sizeof e);
+    e.buf = buf;
+    e.cap = 16u;
+    at = ei_mem_miss_stub(&e, 7u);
+    CHECK(at == 0u);
+    CHECK(e.err == 0);
+    CHECK(e.len == 2u);
+    CHECK(buf[0] == UINT32_C(0x528000E4)); /* movz w4, #7 */
+    CHECK(buf[1] == UINT32_C(0x14000000)); /* b (block end patches) */
+    CHECK(ei_mem_miss_stub(&e, 0x10000u) == (size_t)-1);
+    CHECK(ei_mem_miss_stub(NULL, 0u) == (size_t)-1);
 }
 
 int main(void)
 {
-    static dbt_mem_sites_t sites;
-    static uint32_t words[8];
-    static uint8_t bytes[DBT_MEM_SITES_MAX * 24u];
-    a64_emit_t e;
-    size_t at;
-    size_t n;
-    int i0;
-    int i1;
-    int i;
-    static const uint8_t want0[24] = {
-        0x78u, 0x56u, 0x34u, 0x12u, 0xF0u, 0xDEu, 0xBCu, 0x9Au,
-        0x00u, 0x00u, 0x00u, 0x00u, 0x2Au, 0x00u, 0x00u, 0x00u,
-        0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u
-    };
-
-    check("site is 24 bytes", sizeof(dbt_mem_site_t) == 24u);
-    check("guest_pc at 0", offsetof(dbt_mem_site_t, guest_pc) == 0u);
-    check("miss_kind at 8", offsetof(dbt_mem_site_t, miss_kind) == 8u);
-    check("host_off at 12", offsetof(dbt_mem_site_t, host_off) == 12u);
-    check("disp at 16", offsetof(dbt_mem_site_t, disp) == 16u);
-
-    dbt_mem_sites_init(&sites);
-    check("init count zero", sites.count == 0u);
-
-    /* NULL and empty-table edges. */
-    check("bump null table", dbt_mem_site_bump(NULL, 0u, 0u, 0u) == -1);
-    check("serialize null table", dbt_mem_sites_serialize(NULL, bytes,
-                                                          sizeof bytes) == 0u);
-    check("serialize empty", dbt_mem_sites_serialize(&sites, bytes,
-                                                     sizeof bytes) == 0u);
-    check("stub null emitter", ei_mem_miss_stub(NULL, 0u) == (size_t)-1);
-
-    i0 = dbt_mem_site_bump(&sites, 0x9ABCDEF012345678ull,
-                           (uint32_t)DBT_MEM_SITE_LOAD, 42u);
-    i1 = dbt_mem_site_bump(&sites, 0x1000u,
-                           (uint32_t)DBT_MEM_SITE_STORE, 44u);
-    check("bump indices", i0 == 0 && i1 == 1 && sites.count == 2u);
-    check("bump fields",
-          sites.sites[0].guest_pc == 0x9ABCDEF012345678ull &&
-          sites.sites[0].miss_kind == (uint32_t)DBT_MEM_SITE_LOAD &&
-          sites.sites[0].host_off == 42u && sites.sites[0].disp == 0u);
-
-    /* Fill to capacity, then prove the overflow bump fails cleanly. */
-    for (i = 2; i < (int)DBT_MEM_SITES_MAX; i++) {
-        if (dbt_mem_site_bump(&sites, (uint64_t)i,
-                              (uint32_t)DBT_MEM_SITE_ATOMIC,
-                              (uint32_t)i) < 0)
-            break;
-    }
-    check("table fills to max", sites.count == DBT_MEM_SITES_MAX);
-    check("bump overflow", dbt_mem_site_bump(&sites, 0u, 0u, 0u) == -1);
-
-    /* Serialize a fresh two-site table and byte-compare row zero. */
-    dbt_mem_sites_init(&sites);
-    dbt_mem_site_bump(&sites, 0x9ABCDEF012345678ull,
-                      (uint32_t)DBT_MEM_SITE_LOAD, 42u);
-    dbt_mem_site_bump(&sites, 0x1000u, (uint32_t)DBT_MEM_SITE_STORE, 44u);
-    memset(bytes, 0xA5u, sizeof bytes);
-    n = dbt_mem_sites_serialize(&sites, bytes, sizeof bytes);
-    check("serialize length", n == 48u);
-    check("serialize row zero", memcmp(bytes, want0, 24u) == 0);
-    check("serialize row one pc",
-          bytes[24] == 0x00u && bytes[25] == 0x10u && bytes[26] == 0x00u &&
-          bytes[27] == 0x00u && bytes[28] == 0x00u && bytes[29] == 0x00u &&
-          bytes[30] == 0x00u && bytes[31] == 0x00u);
-    check("serialize row one kind/off",
-          bytes[32] == 0x01u && bytes[33] == 0x00u && bytes[34] == 0x00u &&
-          bytes[35] == 0x00u && bytes[36] == 0x2Cu && bytes[37] == 0x00u &&
-          bytes[38] == 0x00u && bytes[39] == 0x00u);
-    check("serialize short cap",
-          dbt_mem_sites_serialize(&sites, bytes, 47u) == 0u);
-
-    /* The 2-insn stub: `movz w0, #7` then `brk #0xDB`, nothing else. */
-    memset(words, 0, sizeof words);
-    e.buf = words;
-    e.cap = 8u;
-    e.len = 0u;
-    e.err = 0;
-    at = ei_mem_miss_stub(&e, 7u);
-    check("stub slot", at == 0u && e.err == 0 && e.len == 2u);
-    check("stub movz", words[0] == 0x528000E0u);
-    check("stub brk", words[1] == 0xD4201B60u);
-    check("stub rejects 17-bit site",
-          ei_mem_miss_stub(&e, 0x10000u) == (size_t)-1);
-
-    printf("mem_sites: %d checks, %d failures\n", checks, failures);
-    return failures == 0 ? 0 : 1;
+    test_record_layout();
+    test_bump_serialize_roundtrip();
+    test_stub_shape();
+    (void)printf("SITES: %d passed, %d failed\n", passes, fails);
+    return (fails == 0) ? 0 : 1;
 }

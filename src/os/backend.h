@@ -28,9 +28,10 @@
 
 /* ---- §1 revision/identity ---- */
 
-/* Backend interface revision. Rev4 is the U0 prototype gate level:
- * fixade control, bus-fault, delay target, npc_mode, soft-TLB. */
-#define MIPS64RT_BACKEND_REV 4u
+/* Backend interface revision. Rev5 is the U12 remediation level:
+ * 32-byte split-tag soft-TLB entries (read_tag/addend/write_tag),
+ * relative miss-site records, and the TRAP miss path. */
+#define MIPS64RT_BACKEND_REV 5u
 
 /* Host backend name ("linux" / "darwin"); never NULL. */
 const char *mips_backend_name(void);
@@ -127,33 +128,55 @@ static inline int mips_npc_resume_step(mips64_ctx_t *ctx, uint64_t *applied)
     return 1;
 }
 
-/* ---- §6 soft-TLB + gate state (exact Rev4 §6 surface) ---- */
+/* ---- §6 soft-TLB + gate state (Rev4 §4.3 surface) ---- */
 
-/* Direct-mapped soft-TLB: 64 entries of 16 bytes, indexed by
- * (va >> 12) & 63. Emitted code binds x20 to &tlb[0] (never x18);
- * the 7-instruction probe in src/dbt/emit_mem.c resolves the host
- * page and materializes the host address into x4, preserving x0. */
-#define MIPS64_SOFT_TLB_BITS 6u
+/* Direct-mapped soft-TLB: 4096 entries of 32 bytes, indexed by
+ * (va >> 12) & 0xFFF (128 KiB per thread). Emitted code binds x20
+ * to &tlb[0] (never x18); the 7-instruction probe in
+ * src/dbt/emit_mem.c checks read_tag/write_tag plus alignment in one
+ * subtract and addresses the host page as [guest_va, addend].
+ *
+ * The write gate: write_tag carries the page base if and only if
+ * the page is region-writable AND the page-state gate passes (not
+ * COW-clean, no live translated code, no active LL reservation);
+ * otherwise it is ~0ULL and every store traps to the miss path. The
+ * addend is uniform across the arena (Provider A in-place design:
+ * host_page_base = arena_base + page_base). */
+#define MIPS64_SOFT_TLB_BITS 12u
 #define MIPS64_SOFT_TLB_ENTRIES (1u << MIPS64_SOFT_TLB_BITS)
 #define MIPS64_SOFT_TLB_INDEX_MASK (MIPS64_SOFT_TLB_ENTRIES - 1u)
 
 typedef struct {
-    uint64_t tag;       /* va >> 12, or UINT64_MAX when invalid */
-    uint64_t host_base; /* host address of the page base */
+    uint64_t read_tag;        /* +0: page base when readable, else ~0 */
+    uintptr_t addend;         /* +8: host_page_base - page_base */
+    uint64_t write_tag;       /* +16: page base when writable-per-gate */
+    uint64_t flags_reserved;  /* +24: zero (32-byte cache alignment) */
 } mips_soft_tlb_entry_t;
+
+_Static_assert(sizeof(mips_soft_tlb_entry_t) == 32u,
+               "soft-TLB entry must be 32 bytes");
+_Static_assert(offsetof(mips_soft_tlb_entry_t, addend) == 8u,
+               "addend at +8");
+_Static_assert(offsetof(mips_soft_tlb_entry_t, write_tag) == 16u,
+               "write_tag at +16");
 
 /* Stable base of ctx's TLB (&tlb[0]); this is the pointer the DBT
  * dispatcher passes as the x20 binding. Never NULL for non-NULL
  * ctx (NULL ctx yields NULL). */
 void *mips_soft_tlb_base(mips64_ctx_t *ctx);
 
-/* Fill the entry covering va from the reservation direct map
- * (host_base = guest_base + (va >> 12) * 4096). NULL is a no-op. */
+/* Fill the entry covering va: read_tag when the page is readable,
+ * write_tag when the page is region-writable and the page-state
+ * gate passes, addend from the reservation direct map
+ * (host_page_base = guest_base + page). NULL is a no-op. */
 void mips_soft_tlb_fill(mips64_ctx_t *ctx, uint64_t va);
 
 /* Invalidate every entry for ctx (all tags UINT64_MAX). NULL is
  * a no-op. */
 void mips_soft_tlb_invalidate(mips64_ctx_t *ctx);
+
+/* Invalidate every entry of every live slot (quiescence step 5). */
+void mips_soft_tlb_invalidate_all(void);
 
 /* Reset all U0 gate state for ctx: fixade back to default (1),
  * delay target dropped, TLB invalidated. NULL is a no-op. */

@@ -30,6 +30,7 @@
 
 #include "core/cpu.h"
 
+#include "dbt/dbt.h"
 #include "os/signal_core.h"
 
 #include <errno.h>
@@ -43,6 +44,11 @@
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <unistd.h>
+#if defined(__linux__)
+#include <ucontext.h>
+#elif defined(__APPLE__)
+#include <sys/ucontext.h>
+#endif
 
 /* Guest clone flags (Linux arch-independent values, shared by MIPS64).
  * MIPS signal numbers (asm/signal.h): SIGCHLD is 18 on MIPS. The exit
@@ -424,6 +430,29 @@ static _Thread_local jmp_buf l4b_jb;
 static _Thread_local volatile sig_atomic_t l4b_armed = 0;
 static _Thread_local int l4b_fault_sig = 0;
 static _Thread_local uint64_t l4b_fault_addr = 0U;
+/* In-handler capture of the faulting host pc (integer only; the
+ * site-table resolve runs after the longjmp, outside signal
+ * context). The ctx is stashed by mips_hostfault_run so the guard
+ * can report the precise guest pc through the scratch slot. */
+static _Thread_local uint64_t l4b_fault_host_pc = 0U;
+static _Thread_local mips64_ctx_t *l4b_ctx = NULL;
+
+/* Faulting host pc from the machine context (AArch64 only; 0
+ * elsewhere, which disables site resolution on those hosts). */
+static uint64_t l4b_host_pc(void *uc)
+{
+    if (uc == NULL) {
+        return 0U;
+    }
+#if defined(__linux__) && (defined(__aarch64__) || defined(__arm64__))
+    return (uint64_t)((ucontext_t *)uc)->uc_mcontext.pc;
+#elif defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
+    return (uint64_t)((ucontext_t *)uc)->uc_mcontext->__ss.__pc;
+#else
+    (void)uc;
+    return 0U;
+#endif
+}
 
 static const void *l4b_pool = NULL;
 static size_t l4b_pool_len = 0U;
@@ -483,6 +512,10 @@ static void l4b_handler(int sig, siginfo_t *si, void *uc)
          * VA the faulting access targeted. */
         l4b_fault_addr = (l4b_pool == NULL) ? (uint64_t)addr :
             (uint64_t)(addr - base);
+        /* Capture the faulting host pc (async-safe integer read);
+         * the run side resolves it to the precise guest pc through
+         * the retained miss-site tables. */
+        l4b_fault_host_pc = l4b_host_pc(uc);
         longjmp(l4b_jb, 1);
     }
     l4b_forward(sig, si, uc);
@@ -536,19 +569,34 @@ int mips_hostfault_run(mips64_ctx_t *ctx, void *code, uint32_t *reasonp)
     l4b_armed = 1;
     l4b_fault_sig = 0;
     l4b_fault_addr = 0U;
+    l4b_fault_host_pc = 0U;
+    l4b_ctx = ctx;
     if (setjmp(l4b_jb) == 0) {
         fn(ctx);
         l4b_armed = 0;
+        l4b_ctx = NULL;
         if (reasonp != NULL) {
             *reasonp = ctx->exit_reason;
         }
         return 0;
     }
     l4b_armed = 0;
+    l4b_ctx = NULL;
     (void)l4b_fault_sig;
     ctx->llbit = 0U;
     ctx->exit_reason = MIPS64_EXIT_FAULT;
     ctx->exit_info = (uint32_t)l4b_fault_addr;
+    /* Rev4 precise-pc channel: resolve the captured host pc to the
+     * faulting guest pc and report it through the scratch slot (the
+     * dispatcher's EXIT_FAULT case picks it up). Unresolvable pcs
+     * leave the slot alone for the legacy decode-at-pc path. */
+    if (l4b_fault_host_pc != 0U) {
+        uint64_t gpc = 0U;
+
+        if (dbt_host_pc_to_guest(l4b_fault_host_pc, &gpc) != 0) {
+            ctx->pad150 = gpc;
+        }
+    }
     if (reasonp != NULL) {
         *reasonp = ctx->exit_reason;
     }

@@ -30,6 +30,7 @@
  */
 
 #include "dbt/emit_int.h"
+#include "dbt/emit_mem.h"
 
 /* Lane L3b FP entry point (src/dbt/emit_fp.c): 0 emitted, nonzero for
  * unknown words (dispatcher falls back to interp_step). */
@@ -315,11 +316,15 @@ static int ei_branch(a64_emit_t *e, const mips_dec_t *d, const mips_dec_t *s,
             ei_gst(e, EI_T, d->rd);
         }
         /* The delay slot owns x21..x24, so park the target in x25
-         * (trampoline-preserved, emitter-unused) across it. */
+         * (trampoline-preserved, emitter-unused) across it. The slot
+         * site inherits the dynamic NPC: no branch replay on faults. */
         ei_mov(e, EI_S, EI_A);
+        ei_mem_branch_note(pc, (unsigned)RT_NPC_DYNAMIC_CTX, 0);
         if (ei_one(e, s, pc + 4u, be, 1) != 0) {
+            ei_mem_branch_clear();
             return 1;
         }
+        ei_mem_branch_clear();
         ei_mov(e, EI_A, EI_S);
         ei_str(e, 0, EI_A, EI_CTX, MIPS64_CTX_PC_OFFSET);
         ei_mov32(e, EI_T, 4u);
@@ -360,31 +365,49 @@ static int ei_branch(a64_emit_t *e, const mips_dec_t *d, const mips_dec_t *s,
     } else {
         t = has_cond != 0 ? ei_bcc(e, cc) : (size_t)-1;
     }
+    /* The slot site inherits the static taken-target delta: fault
+     * recovery applies it without replaying the branch. */
     if (likely != 0) {
         /* Not-taken likely: skip the slot with no fetch. */
         ei_exit_at(e, pc + 8u, MIPS64_EXIT_BRANCH);
         ei_patch_at(e, t, e == NULL ? 0u : e->len, 0);
+        ei_mem_branch_note(pc, (unsigned)RT_NPC_STATIC_TARGET,
+                           (int32_t)(tgt - pc));
         if (ei_one(e, s, pc + 4u, be, 1) != 0) {
+            ei_mem_branch_clear();
             return 1;
         }
+        ei_mem_branch_clear();
         ei_exit_at(e, tgt, MIPS64_EXIT_BRANCH);
         return 0;
     }
     if (has_cond == 0) {
         /* Unconditional: the slot runs, then the target (no link to
          * the fallthrough, which is unreachable). */
+        ei_mem_branch_note(pc, (unsigned)RT_NPC_STATIC_TARGET,
+                           (int32_t)(tgt - pc));
         if (ei_one(e, s, pc + 4u, be, 1) != 0) {
+            ei_mem_branch_clear();
             return 1;
         }
+        ei_mem_branch_clear();
     } else {
+        ei_mem_branch_note(pc, (unsigned)RT_NPC_STATIC_TARGET,
+                           (int32_t)(tgt - pc));
         if (ei_one(e, s, pc + 4u, be, 1) != 0) {
+            ei_mem_branch_clear();
             return 1;
         }
+        ei_mem_branch_clear();
         ei_exit_at(e, pc + 8u, MIPS64_EXIT_BRANCH);
         ei_patch_at(e, t, e == NULL ? 0u : e->len, 0);
+        ei_mem_branch_note(pc, (unsigned)RT_NPC_STATIC_TARGET,
+                           (int32_t)(tgt - pc));
         if (ei_one(e, s, pc + 4u, be, 1) != 0) {
+            ei_mem_branch_clear();
             return 1;
         }
+        ei_mem_branch_clear();
     }
     ei_exit_at(e, tgt, MIPS64_EXIT_BRANCH);
     return 0;
@@ -441,37 +464,45 @@ static int ei_one(a64_emit_t *e, const mips_dec_t *d, uint64_t pc, int be,
         r = ef_emit_fp(e, d, pc, slot);
         break;
     case 0x1Au: /* LDL */
-        r = ei_unaligned(e, d, pc, 1, 1, be, be != 0 ? 0 : 3, 0, 56u);
+        r = ei_unaligned(e, d, pc, 1, 1, be, be != 0 ? 0 : 3, 0, 56u,
+                         slot);
         break;
     case 0x1Bu: /* LDR */
-        r = ei_unaligned(e, d, pc, 1, 1, be, be != 0 ? 2 : 0, 1, 56u);
+        r = ei_unaligned(e, d, pc, 1, 1, be, be != 0 ? 2 : 0, 1, 56u,
+                         slot);
         break;
     case 0x22u: /* LWL */
-        r = ei_unaligned(e, d, pc, 1, 0, be, be != 0 ? 0 : 3, 0, 24u);
+        r = ei_unaligned(e, d, pc, 1, 0, be, be != 0 ? 0 : 3, 0, 24u,
+                         slot);
         break;
     case 0x26u: /* LWR */
-        r = ei_unaligned(e, d, pc, 1, 0, be, be != 0 ? 2 : 0, 1, 24u);
+        r = ei_unaligned(e, d, pc, 1, 0, be, be != 0 ? 2 : 0, 1, 24u,
+                         slot);
         break;
     case 0x2Au: /* SWL */
-        r = ei_unaligned(e, d, pc, 0, 0, be, be != 0 ? 0 : 2, 1, 24u);
+        r = ei_unaligned(e, d, pc, 0, 0, be, be != 0 ? 0 : 2, 1, 24u,
+                         slot);
         break;
     case 0x2Eu: /* SWR */
-        r = ei_unaligned(e, d, pc, 0, 0, be, be != 0 ? 3 : 0, 0, 24u);
+        r = ei_unaligned(e, d, pc, 0, 0, be, be != 0 ? 3 : 0, 0, 24u,
+                         slot);
         break;
     case 0x2Cu: /* SDL */
         /* BE stores mirror the 32-bit BE store modes (SWL/SWR), not
          * the load modes: SDL needs LSR-by-sk (m=1), SDR LSL-by-56-sk
          * (m=3 after adjust). Matches do_sdl/do_sdr in interp. */
-        r = ei_unaligned(e, d, pc, 0, 1, be, be != 0 ? 1 : 2, 0, 56u);
+        r = ei_unaligned(e, d, pc, 0, 1, be, be != 0 ? 1 : 2, 0, 56u,
+                         slot);
         break;
     case 0x2Du: /* SDR */
-        r = ei_unaligned(e, d, pc, 0, 1, be, be != 0 ? 3 : 0, 0, 56u);
+        r = ei_unaligned(e, d, pc, 0, 1, be, be != 0 ? 3 : 0, 0, 56u,
+                         slot);
         break;
     case 0x30u: /* LL */
     case 0x34u: /* LLD */
     case 0x38u: /* SC */
     case 0x3Cu: /* SCD */
-        r = ei_atomic(e, d, pc, be);
+        r = ei_atomic(e, d, pc, be, slot);
         break;
     case 0x20u: /* LB */
     case 0x21u: /* LH */
@@ -484,7 +515,7 @@ static int ei_one(a64_emit_t *e, const mips_dec_t *d, uint64_t pc, int be,
     case 0x2Bu: /* SW */
     case 0x37u: /* LD */
     case 0x3Fu: /* SD */
-        r = ei_mem_aligned(e, d, pc, be);
+        r = ei_mem_aligned(e, d, pc, be, slot);
         break;
     case 0x2Fu: /* CACHE */
     case 0x33u: /* PREF */
@@ -529,6 +560,9 @@ int dbt_emit_int(mips64_ctx_t *ctx, uint64_t pc, const mips_dec_t *insns,
     e.len = 0u;
     e.err = 0;
     be = ctx->is_be != 0u ? 1 : 0;
+    /* Every memory word records one relative site between begin and
+     * end (the dispatcher retains the table with the block). */
+    ei_mem_block_begin(pc);
     for (i = 0u; i < count; i++) {
         uint64_t cur = pc + (uint64_t)i * 4u;
         const mips_dec_t *d = &insns[i];
@@ -558,6 +592,11 @@ int dbt_emit_int(mips64_ctx_t *ctx, uint64_t pc, const mips_dec_t *insns,
                 *out_len = 0u;
                 return 1;
             }
+            ei_mem_block_end(&e);
+            if (e.err != 0) {
+                *out_len = 0u;
+                return 1;
+            }
             *out_len = e.len * 4u;
             *out_end = cur + 8u;
             return 0;
@@ -568,12 +607,18 @@ int dbt_emit_int(mips64_ctx_t *ctx, uint64_t pc, const mips_dec_t *insns,
             return 1;
         }
         if (r == 2) {
+            ei_mem_block_end(&e);
+            if (e.err != 0) {
+                *out_len = 0u;
+                return 1;
+            }
             *out_len = e.len * 4u;
             *out_end = cur + 4u;
             return 0;
         }
     }
     ei_exit_at(&e, pc + (uint64_t)count * 4u, MIPS64_EXIT_BRANCH);
+    ei_mem_block_end(&e);
     if (e.err != 0) {
         *out_len = 0u;
         return 1;

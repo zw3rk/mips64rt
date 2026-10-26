@@ -114,6 +114,23 @@ void ei_div(a64_emit_t *e, uint32_t base, int is_w, unsigned rd, unsigned rn,
 void ei_msub(a64_emit_t *e, int is_w, unsigned rd, unsigned rn, unsigned rm,
              unsigned ra);
 void ei_clz(a64_emit_t *e, int is_w, unsigned rd, unsigned rn);
+void ei_add_lsl(a64_emit_t *e, unsigned rd, unsigned rn, unsigned rm,
+                unsigned amount);
+void ei_ldp(a64_emit_t *e, unsigned rt1, unsigned rt2, unsigned rn,
+            int32_t off);
+void ei_bic_imm(a64_emit_t *e, unsigned rd, unsigned rn, uint32_t mask);
+/* Register-offset access kinds for ei_mem_rx. */
+enum {
+    EI_RX_U8 = 0,
+    EI_RX_U16 = 1,
+    EI_RX_U32 = 2,
+    EI_RX_U64 = 3,
+    EI_RX_S8 = 4,
+    EI_RX_S16 = 5,
+    EI_RX_S32 = 6
+};
+void ei_mem_rx(a64_emit_t *e, unsigned kind, int is_load, unsigned rt,
+               unsigned rn, unsigned rm);
 void ei_rev(a64_emit_t *e, uint32_t base, unsigned rd, unsigned rn);
 void ei_sxt(a64_emit_t *e, unsigned imms, unsigned rd, unsigned rn);
 void ei_bfm(a64_emit_t *e, uint32_t base, unsigned rd, unsigned rn,
@@ -173,10 +190,26 @@ int ei_cop(a64_emit_t *e, const mips_dec_t *d, uint64_t pc, int slot);
 /* U0 7-instruction soft-TLB probe (entry EI_A = guest VA, x20 = TLB
  * base; hit falls through with x4 = entry pointer, miss slot
  * returned for the shared fault epilogue). Preserves x0, never x18. */
-size_t ei_tlb_probe(a64_emit_t *e);
-int ei_mem_aligned(a64_emit_t *e, const mips_dec_t *d, uint64_t pc, int be);
+size_t ei_tlb_probe(a64_emit_t *e, uint32_t mask, int is_store);
+int ei_mem_aligned(a64_emit_t *e, const mips_dec_t *d, uint64_t pc, int be,
+                   int slot);
 int ei_unaligned(a64_emit_t *e, const mips_dec_t *d, uint64_t pc, int is_load,
-                 int is_d, int be, int mode, int dir, unsigned cval);
-int ei_atomic(a64_emit_t *e, const mips_dec_t *d, uint64_t pc, int be);
+                 int is_d, int be, int mode, int dir, unsigned cval,
+                 int slot);
+int ei_atomic(a64_emit_t *e, const mips_dec_t *d, uint64_t pc, int be,
+              int slot);
+/* Lane U12 block-site framing: every memory word records one relative
+ * site (see dbt/emit_mem.h) between begin and end; end emits the
+ * per-site 2-insn stubs plus the single shared miss epilogue (which
+ * exits with MIPS64_EXIT_TRAP and the site index in exit_info) and
+ * patches every recorded miss slot. The take accessor drains the
+ * table for the block cache (NULL/0 when the block was declined). */
+void ei_mem_block_begin(uint64_t block_pc);
+void ei_mem_block_end(a64_emit_t *e);
+/* Forward-declared: the full record lives in dbt/emit_mem.h (which
+ * includes this header for a64_emit_t, so including it back here
+ * would cycle). */
+struct dbt_mem_site;
+void ei_mem_take_sites(const struct dbt_mem_site **sites, size_t *count);
 
 #endif /* MIPS64RT_DBT_EMIT_INT_H */

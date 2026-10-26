@@ -99,6 +99,7 @@ timeout --kill-after=30s 200s $NIX_GCC -static-pie -fPIE \
 	src/os/exec.c \
 	src/dbt/a64_emit.c \
 	src/dbt/dbt.c \
+	src/dbt/mem_recover.c \
 	src/dbt/emit_int.c \
 	src/dbt/emit_enc.c \
 	src/dbt/emit_alu.c \
