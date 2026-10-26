@@ -76,6 +76,7 @@ timeout --kill-after=30s 200s $NIX_GCC -static-pie -fPIE \
 	src/os/worker_loop.c \
 	src/dbt/aot/sha256.c \
 	src/dbt/aot/identity.c \
+	src/dbt/aot/sites.c \
 	src/os/family_broker.c \
 	src/os/signal_core.c \
 	src/interp/decode.c \
@@ -97,6 +98,7 @@ timeout --kill-after=30s 200s $NIX_GCC -static-pie -fPIE \
 	src/os/threads.c \
 	src/os/futex.c \
 	src/os/exec.c \
+	src/os/quiesce.c \
 	src/dbt/a64_emit.c \
 	src/dbt/dbt.c \
 	src/dbt/mem_recover.c \

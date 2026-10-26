@@ -23,6 +23,7 @@
 #include "loader.h"
 #include "os/host_args.h"
 #include "dbt/aot/identity.h"
+#include "dbt/aot/sites.h"
 #include "os/family_broker.h"
 
 #include <errno.h>
@@ -141,6 +142,9 @@ static int prepare_cache_dir(const mips64_run_config_t *config,
     }
     if (fd >= 0)
         close(fd);
+    /* Point the AOT site writer at the reserved leaf (the loader
+     * side lands with the code cache). */
+    mips_aot_set_leaf(entry);
     if (trace)
         fprintf(stderr, "mips64rt: cache entry '%s'\n", entry);
     return 0;

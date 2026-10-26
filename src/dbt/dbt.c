@@ -27,6 +27,7 @@
 #include "dbt/dbt.h"
 
 #include "core/cpu.h"
+#include "dbt/aot/sites.h"
 #include "dbt/emit_mem.h"
 #include "interp/decode.h"
 #include "os/backend.h"
@@ -455,6 +456,10 @@ int dbt_compile(mips64_ctx_t *ctx, uint64_t pc)
                            nrows * sizeof(dbt_mem_site_t));
                     slot->sites = copy;
                     slot->site_count = nrows;
+                    /* Best-effort AOT persistence (no-op without a
+                     * worker leaf). The loader side lands with the
+                     * code cache. */
+                    mips_aot_note_block(pc, copy, nrows);
                 }
             }
         }

@@ -10,12 +10,26 @@
  * end to patch). Never executed: emission only.
  */
 
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
+
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 
+#include <fcntl.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
 #include "core/cpu.h"
 #include "dbt/a64_emit.h"
+#include "dbt/aot/identity.h"
+#include "dbt/aot/sites.h"
 #include "dbt/emit_int.h"
 #include "dbt/emit_mem.h"
 
@@ -155,11 +169,104 @@ static void test_stub_shape(void)
     CHECK(ei_mem_miss_stub(NULL, 0u) == (size_t)-1);
 }
 
+static int u0_visit_count;
+static uint64_t u0_visit_pc;
+static size_t u0_visit_rows;
+
+static int u0_visit(uint64_t guest_pc, const dbt_mem_site_t *sites,
+                    size_t count, void *arg)
+{
+    (void)arg;
+    u0_visit_count++;
+    u0_visit_pc = guest_pc;
+    u0_visit_rows = count;
+    if (sites == NULL || count != 2u) {
+        return 1;
+    }
+    if (sites[0].insn_word != 0x8CA50010u ||
+        sites[1].guest_pc_delta != 0x44u) {
+        return 1;
+    }
+    return 0;
+}
+
+static void test_aot_file_roundtrip(void)
+{
+    char path[] = "/tmp/mips64rt-sites-XXXXXX";
+    dbt_mem_site_t rows[2];
+    int fd;
+
+    CHECK(MIPS64_AOT_EMITTER_VERSION == 2u);
+    rows[0] = u0_site(0x10u, 0x18u, 0x1Cu, 0x20u);
+    rows[1] = u0_site(0x30u, 0x38u, 0x40u, 0x44u);
+    rows[1].npc_mode = (uint8_t)RT_NPC_DYNAMIC_CTX;
+
+    /* No leaf: silent no-op, never fails the run. */
+    mips_aot_set_leaf(NULL);
+    CHECK(mips_aot_leaf_path() == NULL);
+    mips_aot_note_block(0x1000u, rows, 2u);
+    CHECK(mips_aot_sites_load("/nonexistent-leaf.aot", u0_visit,
+                              NULL) != 0);
+
+    fd = mkstemp(path);
+    CHECK(fd >= 0);
+    if (fd < 0) {
+        return;
+    }
+    (void)close(fd);
+    mips_aot_set_leaf(path);
+    CHECK(mips_aot_leaf_path() != NULL);
+    mips_aot_note_block(0x1000u, rows, 2u);
+    mips_aot_note_block(0x2000u, rows, 1u);
+
+    u0_visit_count = 0;
+    u0_visit_pc = 0u;
+    u0_visit_rows = 0u;
+    CHECK(mips_aot_sites_load(path, u0_visit, NULL) == 0);
+    CHECK(u0_visit_count == 2);
+    CHECK(u0_visit_pc == 0x2000u);
+    CHECK(u0_visit_rows == 1u);
+
+    /* Version mismatch is refused, not misread. */
+    {
+        int wfd = open(path, O_WRONLY | O_TRUNC);
+
+        CHECK(wfd >= 0);
+        if (wfd >= 0) {
+            uint8_t bad[20];
+
+            (void)memset(bad, 0, sizeof bad);
+            bad[0] = 'M';
+            bad[1] = '6';
+            bad[2] = '4';
+            bad[3] = 'S';
+            bad[4] = 1u;
+            (void)write(wfd, bad, sizeof bad);
+            (void)close(wfd);
+        }
+        CHECK(mips_aot_sites_load(path, u0_visit, NULL) == -2);
+    }
+    /* Truncation is refused. */
+    {
+        int wfd = open(path, O_WRONLY | O_TRUNC);
+
+        CHECK(wfd >= 0);
+        if (wfd >= 0) {
+            (void)write(wfd, "M64S", 4u);
+            (void)close(wfd);
+        }
+        CHECK(mips_aot_sites_load(path, u0_visit, NULL) == -3);
+    }
+    mips_aot_set_leaf(NULL);
+    (void)unlink(path);
+}
+
 int main(void)
 {
     test_record_layout();
     test_bump_serialize_roundtrip();
     test_stub_shape();
+    test_aot_file_roundtrip();
     (void)printf("SITES: %d passed, %d failed\n", passes, fails);
     return (fails == 0) ? 0 : 1;
 }

@@ -23,6 +23,7 @@
 #include "dbt/dbt.h"
 #include "interp/decode.h"
 #include "os/backend.h"
+#include "os/quiesce.h"
 
 #include <errno.h>
 #include <stdint.h>
@@ -222,6 +223,33 @@ int main(void)
     /* Unmapped data page is genuine. */
     ctx.gpr[5] = UINT64_C(0x30000);
     CHECK(dbt_u0_fill_retry(&ctx, FILL_CODE) == 0);
+
+    /* Quiescence transaction: leases balance, begin/commit/abort
+     * order the mutation, NULLs are no-ops, and unregister drops
+     * the slot. Single-threaded: preemption is vacuous. */
+    mips_qs_lease_enter(NULL);
+    mips_qs_lease_exit(NULL);
+    mips_qs_begin(NULL);
+    mips_qs_commit(NULL);
+    mips_qs_abort(NULL);
+    mips_qs_unregister(NULL);
+    mips_qs_lease_enter(&ctx);
+    mips_qs_lease_exit(&ctx);
+    mips_qs_begin(&ctx);
+    CHECK(mips_mem_protect(&ctx, FILL_PAGE, UINT64_C(0x1000),
+                           (uint32_t)1u) == 0);
+    mips_qs_commit(&ctx);
+    CHECK(mips_mem_ok(&ctx, FILL_PAGE, UINT64_C(0x1000),
+                      (uint32_t)2u) == 0);
+    mips_qs_begin(&ctx);
+    CHECK(mips_mem_protect(&ctx, FILL_PAGE, UINT64_C(0x1000),
+                           (uint32_t)(1u | 2u)) == 0);
+    mips_qs_commit(&ctx);
+    mips_qs_begin(&ctx);
+    CHECK(mips_mem_protect(&ctx, UINT64_C(0x30000), UINT64_C(0x1000),
+                           (uint32_t)1u) != 0);
+    mips_qs_abort(&ctx);
+    mips_qs_unregister(&ctx);
 
     (void)printf("FILLRETRY: %d passed, %d failed\n", passes, fails);
     return fails == 0 ? 0 : 1;

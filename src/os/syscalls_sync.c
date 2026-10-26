@@ -259,6 +259,50 @@ int64_t mips_sc_vec(mips64_ctx_t *ctx, uint64_t fd, uint64_t iov_va,
     return l2a_ret(ctx, (int64_t)total);
 }
 
+/* Scalar read/write (moved from syscall_min.c so the whole
+ * dispatch can lease in one place): one validated guest window, one
+ * host call, short counts as-is. errno translation mirrors sc_ret
+ * (l2a_ret is its twin). */
+int64_t mips_sc_read(mips64_ctx_t *ctx, uint64_t fd, uint64_t buf,
+                     uint64_t count)
+{
+    uint8_t *host_buf;
+    ssize_t n;
+
+    if (count == 0U) {
+        return l2a_ret(ctx, 0);
+    }
+    if (!mips_mem_ok(ctx, buf, count, MIPS_PROT_WRITE)) {
+        return l2a_ret(ctx, -(int64_t)EFAULT);
+    }
+    host_buf = (uint8_t *)mips64_guest_ptr(ctx, buf);
+    n = read((int)fd, host_buf, (size_t)count);
+    if (n < 0) {
+        return l2a_ret(ctx, -(int64_t)errno);
+    }
+    return l2a_ret(ctx, (int64_t)n);
+}
+
+int64_t mips_sc_write(mips64_ctx_t *ctx, uint64_t fd, uint64_t buf,
+                      uint64_t count)
+{
+    const uint8_t *host_buf;
+    ssize_t n;
+
+    if (count == 0U) {
+        return l2a_ret(ctx, 0);
+    }
+    if (!mips_mem_ok(ctx, buf, count, MIPS_PROT_READ)) {
+        return l2a_ret(ctx, -(int64_t)EFAULT);
+    }
+    host_buf = (const uint8_t *)mips64_guest_ptr(ctx, buf);
+    n = write((int)fd, host_buf, (size_t)count);
+    if (n < 0) {
+        return l2a_ret(ctx, -(int64_t)errno);
+    }
+    return l2a_ret(ctx, (int64_t)n);
+}
+
 /* Positional scalar I/O (pread64/pwrite64): one validated guest
  * window, one host call, short counts returned as-is. The
  * file-mutation hook for pwrite64 (inode size/EOF tracking) lands

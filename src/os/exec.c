@@ -53,6 +53,7 @@
 
 #include "os/host_args.h"
 #include "os/syscall_nr.h"
+#include "os/quiesce.h"
 #include "os/signal_core.h"
 
 #include <errno.h>
@@ -469,7 +470,11 @@ int64_t mips_sc_exec(mips64_ctx_t *ctx, uint64_t nr, uint64_t path_va,
                          (size_t)ctx->task_size);
         }
         memcpy(ctx, backup, sizeof *backup);
+        /* Rollback under the quiescence transaction: peers park
+         * across the table swap like any other VM mutation. */
+        mips_qs_begin(ctx);
         mips_mem_restore(ctx->regions, ctx->region_count);
+        mips_qs_commit(ctx);
         /* Not a MIPS image: delegate to the host kernel (scripts run
          * through their #! line there). The restore above runs first
          * so a failed host exec still returns with the old image

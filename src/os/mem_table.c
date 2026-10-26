@@ -125,6 +125,24 @@ __attribute__((weak)) void dbt_invalidate_range(uint64_t va, uint64_t len)
     (void)len;
 }
 
+/* Lane U12 quiescence transaction. Weak defaults for the same
+ * reason: small unit links (test_decode, test_mem_sites) mutate the
+ * table single-threaded, where the transaction is vacuous; the
+ * strong definitions in src/os/quiesce.c override in the real
+ * translator and the U0 gates, where every mutation transacts. */
+__attribute__((weak)) void mips_qs_begin(mips64_ctx_t *ctx)
+{
+    (void)ctx;
+}
+__attribute__((weak)) void mips_qs_commit(mips64_ctx_t *ctx)
+{
+    (void)ctx;
+}
+__attribute__((weak)) void mips_qs_abort(mips64_ctx_t *ctx)
+{
+    (void)ctx;
+}
+
 /* Split the region containing va so a region starts at va. Page
  * granularity: va must be page aligned (va == 0 and va == task_size are
  * boundaries that need no split). Returns 0, or -ENOMEM when the table
@@ -297,6 +315,9 @@ int mips_mem_map(mips64_ctx_t *ctx, uint64_t va, uint64_t len, uint32_t prot,
         va > ctx->task_size - len) {
         return -EINVAL;
     }
+    /* Quiescence step 1: park peers and drain leases before the
+     * host mapping lands (steps 2-3 inside). */
+    mips_qs_begin(ctx);
     mem_lock();
     for (i = 0; i < g_region_count; i++) {
         if (va < g_regions[i].end && g_regions[i].start < va + len) {
@@ -320,6 +341,11 @@ int mips_mem_map(mips64_ctx_t *ctx, uint64_t va, uint64_t len, uint32_t prot,
         }
     }
     mem_unlock();
+    if (rc != 0) {
+        mips_qs_abort(ctx);
+    } else {
+        mips_qs_commit(ctx);
+    }
     return rc;
 }
 
@@ -349,13 +375,16 @@ int mips_mem_unmap(mips64_ctx_t *ctx, uint64_t va, uint64_t len)
         return -EINVAL;
     }
     end = va + len;
+    mips_qs_begin(ctx);
     mem_lock();
     if (split_at(ctx->task_size, va) != 0) {
         mem_unlock();
+        mips_qs_abort(ctx);
         return -ENOMEM;
     }
     if (end < ctx->task_size && split_at(ctx->task_size, end) != 0) {
         mem_unlock();
+        mips_qs_abort(ctx);
         return -ENOMEM;
     }
     got = mmap((void *)(uintptr_t)(ctx->guest_base + va), (size_t)len,
@@ -364,6 +393,7 @@ int mips_mem_unmap(mips64_ctx_t *ctx, uint64_t va, uint64_t len)
         int e = errno;
 
         mem_unlock();
+        mips_qs_abort(ctx);
         return -e;
     }
     w = 0U;
@@ -377,6 +407,7 @@ int mips_mem_unmap(mips64_ctx_t *ctx, uint64_t va, uint64_t len)
     g_region_count = w;
     dbt_invalidate_range(va, len);
     mem_unlock();
+    mips_qs_commit(ctx);
     return 0;
 }
 
@@ -410,6 +441,7 @@ int mips_mem_protect(mips64_ctx_t *ctx, uint64_t va, uint64_t len,
         return -EINVAL;
     }
     end = va + len;
+    mips_qs_begin(ctx);
     mem_lock();
     if (!mips_mem_ok(ctx, va, len, 0U)) {
         rc = -ENOMEM;
@@ -433,6 +465,11 @@ int mips_mem_protect(mips64_ctx_t *ctx, uint64_t va, uint64_t len,
         dbt_invalidate_range(va, len);
     }
     mem_unlock();
+    if (rc != 0) {
+        mips_qs_abort(ctx);
+    } else {
+        mips_qs_commit(ctx);
+    }
     return rc;
 }
 

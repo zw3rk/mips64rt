@@ -109,6 +109,14 @@ extern int64_t mips_sc_vec(mips64_ctx_t *ctx, uint64_t fd, uint64_t iov_va,
 extern int64_t mips_sc_file_extra(mips64_ctx_t *ctx, int n32, uint64_t nr,
                                   uint64_t a0, uint64_t a1, uint64_t a2,
                                   uint64_t a3, int *claimed);
+/* Lane U12 scalar read/write (src/os/syscalls_sync.c). */
+extern int64_t mips_sc_read(mips64_ctx_t *ctx, uint64_t fd, uint64_t buf,
+                            uint64_t count);
+extern int64_t mips_sc_write(mips64_ctx_t *ctx, uint64_t fd, uint64_t buf,
+                             uint64_t count);
+/* Lane U12 quiescence lease (src/os/quiesce.c). */
+extern void mips_qs_lease_enter(mips64_ctx_t *ctx);
+extern void mips_qs_lease_exit(mips64_ctx_t *ctx);
 /* Phase 4 seams (lanes L4a/L4b/L4c). The (ctx, sp) signal seams read
  * their arguments from the guest registers; sp is reserved. */
 extern int64_t mips_sc_rt_sigaction(mips64_ctx_t *ctx, uint64_t sp);
@@ -205,45 +213,9 @@ static void copy_uts_field(uint8_t *dst, const char *src)
     }
 }
 
-static int64_t sc_read(mips64_ctx_t *ctx, uint64_t fd, uint64_t buf,
-                       uint64_t count)
-{
-    uint8_t *host_buf;
-    ssize_t n;
-
-    if (count == 0U) {
-        return sc_ret(ctx, 0);
-    }
-    if (!mips_mem_ok(ctx, buf, count, MIPS_PROT_WRITE)) {
-        return sc_ret(ctx, -EFAULT);
-    }
-    host_buf = (uint8_t *)mips64_guest_ptr(ctx, buf);
-    n = read((int)fd, host_buf, (size_t)count);
-    if (n < 0) {
-        return sc_ret(ctx, -(int64_t)errno);
-    }
-    return sc_ret(ctx, (int64_t)n);
-}
-
-static int64_t sc_write(mips64_ctx_t *ctx, uint64_t fd, uint64_t buf,
-                        uint64_t count)
-{
-    const uint8_t *host_buf;
-    ssize_t n;
-
-    if (count == 0U) {
-        return sc_ret(ctx, 0);
-    }
-    if (!mips_mem_ok(ctx, buf, count, MIPS_PROT_READ)) {
-        return sc_ret(ctx, -EFAULT);
-    }
-    host_buf = (const uint8_t *)mips64_guest_ptr(ctx, buf);
-    n = write((int)fd, host_buf, (size_t)count);
-    if (n < 0) {
-        return sc_ret(ctx, -(int64_t)errno);
-    }
-    return sc_ret(ctx, (int64_t)n);
-}
+/* NOTE: the scalar read/write bodies live in src/os/syscalls_sync.c
+ * as mips_sc_read/mips_sc_write (lane U12 file-I/O home); the lease
+ * wraps the whole dispatch in mips_syscall below. */
 
 static int64_t sc_brk(mips64_ctx_t *ctx, uint64_t addr)
 {
@@ -606,10 +578,10 @@ static int64_t mips_syscall_inner(mips64_ctx_t *ctx)
         return sc_ret(ctx, 0); /* unreachable */
     }
     if (nr == (uint64_t)(n32 ? MIPS64_NR32_read : MIPS64_NR_read)) {
-        return sc_read(ctx, a0, a1, a2);
+        return mips_sc_read(ctx, a0, a1, a2);
     }
     if (nr == (uint64_t)(n32 ? MIPS64_NR32_write : MIPS64_NR_write)) {
-        return sc_write(ctx, a0, a1, a2);
+        return mips_sc_write(ctx, a0, a1, a2);
     }
     if (nr == (uint64_t)(n32 ? MIPS64_NR32_brk : MIPS64_NR_brk)) {
         return sc_brk(ctx, a0);
@@ -888,13 +860,17 @@ static int64_t mips_syscall_inner(mips64_ctx_t *ctx)
     return sc_ret(ctx, -(int64_t)ENOSYS);
 }
 
-/* Public dispatcher: the inner body above, then the RC4 pending-signal
- * sweep (which may redirect pc into a handler; both engines treat the
- * moved pc as final and resume there). */
+/* Public dispatcher: the whole body runs under a quiescence memory
+ * lease (lane U12: Dekker handshake against VM mutations), then the
+ * RC4 pending-signal sweep (which may redirect pc into a handler;
+ * both engines treat the moved pc as final and resume there). */
 int64_t mips_syscall(mips64_ctx_t *ctx)
 {
-    int64_t rc = mips_syscall_inner(ctx);
+    int64_t rc;
 
+    mips_qs_lease_enter(ctx);
+    rc = mips_syscall_inner(ctx);
+    mips_qs_lease_exit(ctx);
     sc_deliver_pending(ctx);
     return rc;
 }

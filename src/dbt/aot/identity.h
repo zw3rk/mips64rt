@@ -26,6 +26,12 @@
 /* Cache leaf: `<64 hex>.aot` + NUL. */
 #define MIPS64_CACHE_LEAF_BYTES (MIPS64_SHA256_BYTES * 2u + 5u)
 
+/* AOT site-record emitter version. Version 1 was the U0 direct-map
+ * assumption (untagged misses, no retained rows); version 2 is the
+ * U12 relative `dbt_mem_site_t` format. The loader refuses any other
+ * version, so a translator upgrade never misreads a stale leaf. */
+#define MIPS64_AOT_EMITTER_VERSION 2u
+
 /* Hash the file at `path` (opened `O_RDONLY`, streamed, never mapped).
  * Returns 0 on success, -1 on I/O failure (`errno` preserved). */
 int mips64_runtime_digest(const char *path, uint8_t out[MIPS64_SHA256_BYTES]);

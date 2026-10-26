@@ -53,11 +53,12 @@ fi
 mkdir -p _build
 if "$CC_HOST" -std=c11 -Werror=vla -pedantic -Wall -Wextra -Werror \
     -pthread -Isrc tests/test_mem_sites.c src/dbt/emit_mem.c \
+    src/dbt/aot/sites.c \
     src/dbt/emit_enc.c src/dbt/a64_emit.c src/dbt/emit_int.c \
     src/dbt/emit_alu.c src/dbt/emit_fp.c src/interp/decode.c \
     src/os/mem.c src/os/mem_table.c "$OS_BACKEND" tests/stubs_signal.c \
     -o _build/test_mem_sites && _build/test_mem_sites >/dev/null; then
-    ok "test_mem_sites (24B bump/serialize/stub)"
+    ok "test_mem_sites (24B relative rows + AOT file round-trip)"
 else
     bad "test_mem_sites"
 fi

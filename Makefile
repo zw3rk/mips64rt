@@ -48,6 +48,7 @@ BOOT_COMMON := src/main.c \
 	src/os/host_args.c \
 	src/dbt/aot/sha256.c \
 	src/dbt/aot/identity.c \
+	src/dbt/aot/sites.c \
 	src/os/family_broker.c \
 	src/os/worker_loop.c \
 	src/os/signal_core.c \
@@ -70,6 +71,7 @@ BOOT_COMMON := src/main.c \
 	src/os/threads.c \
 	src/os/futex.c \
 	src/os/exec.c \
+	src/os/quiesce.c \
 	src/vm/vm64.c \
 	src/vm/vm_file.c \
 	src/dbt/a64_emit.c \
@@ -116,9 +118,11 @@ build-cross:
 U0_SRCS := tests/test_u0_delay_tlb.c \
 	src/os/mem.c \
 	src/os/mem_table.c \
+	src/os/quiesce.c \
 	$(HOST_BACKEND) \
 	src/vm/vm64.c \
 	src/vm/vm_file.c \
+	src/dbt/aot/sites.c \
 	src/interp/decode.c \
 	src/dbt/a64_emit.c \
 	src/dbt/emit_enc.c \

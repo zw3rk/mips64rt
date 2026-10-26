@@ -28,9 +28,14 @@
 
 #define _GNU_SOURCE
 
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #include "core/cpu.h"
 
 #include "dbt/dbt.h"
+#include "os/quiesce.h"
 #include "os/signal_core.h"
 
 #include <errno.h>
@@ -412,6 +417,9 @@ void mips_thread_exit(mips64_ctx_t *ctx, int status)
         }
     }
     (void)pthread_mutex_unlock(&l4b_mu);
+    /* Drop the quiescence slot (releases any lease the exiting thread
+     * still held, so a dead worker never blocks a future drain). */
+    mips_qs_unregister(ctx);
     free(ctx);
     pthread_exit(NULL);
 }
