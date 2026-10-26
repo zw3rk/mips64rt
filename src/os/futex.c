@@ -30,6 +30,7 @@
 
 #include <errno.h>
 #include <limits.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <string.h>
 #include <sys/syscall.h>
@@ -73,27 +74,204 @@ static uint64_t l4f_trunc_va(const mips64_ctx_t *ctx, uint64_t va)
     return va;
 }
 
+/* Darwin futex table: __ulock_wait/__ulock_wake are private SPI
+ * (no SDK headers) and their wake-count semantics proved
+ * unreliable under probing (single wakes landing on 0 of 3
+ * barrier-synced waiters), so the blocking path rendezvouses on
+ * public primitives instead: 64 address-keyed slots with a mutex +
+ * condvar each. Broadcast wakes all (a safe superset — futex
+ * waiters always re-check), REQUEUE degrades to wake-all on the
+ * source (same reason), and a full table degrades to an immediate
+ * spurious return (also legal). Guest VAs key the slots; the arena
+ * keeps them stable while mapped. */
+#if !defined(__linux__) || !defined(SYS_futex)
+#define L4F_DARWIN_SLOTS 64u
+
+typedef struct {
+    int used;
+    uint64_t va;
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    int waiters;
+} l4f_dslot_t;
+
+static l4f_dslot_t l4f_dslots[L4F_DARWIN_SLOTS];
+
+static l4f_dslot_t *l4f_dslot_for(uint64_t va, int create)
+{
+    size_t i;
+    size_t at = (size_t)((va >> 2u) & (uint64_t)(L4F_DARWIN_SLOTS - 1u));
+
+    for (i = 0u; i < L4F_DARWIN_SLOTS; i++) {
+        l4f_dslot_t *s = &l4f_dslots[(at + i) & (L4F_DARWIN_SLOTS - 1u)];
+
+        if (s->used != 0 && s->va == va) {
+            return s;
+        }
+        if (s->used == 0) {
+            if (!create) {
+                return NULL;
+            }
+            s->used = 1;
+            s->va = va;
+            s->waiters = 0;
+            (void)pthread_mutex_init(&s->mu, NULL);
+            (void)pthread_cond_init(&s->cv, NULL);
+            return s;
+        }
+    }
+    return NULL;
+}
+
+/* Absolute REALTIME deadline for cond_timedwait from a relative
+ * span (WAIT) or an absolute stamp on either clock (WAIT_BITSET:
+ * hop bit 0x100 selects REALTIME, otherwise MONOTONIC). */
+static void l4f_deadline(const struct timespec *rel_or_abs, int is_abs,
+                         int realtime, struct timespec *out)
+{
+    struct timespec now;
+
+    if (!is_abs) {
+        (void)clock_gettime(CLOCK_REALTIME, &now);
+        out->tv_sec = now.tv_sec + rel_or_abs->tv_sec;
+        out->tv_nsec = now.tv_nsec + rel_or_abs->tv_nsec;
+    } else if (realtime) {
+        *out = *rel_or_abs;
+    } else {
+        struct timespec mono;
+
+        (void)clock_gettime(CLOCK_MONOTONIC, &mono);
+        out->tv_sec = rel_or_abs->tv_sec - mono.tv_sec;
+        out->tv_nsec = rel_or_abs->tv_nsec - mono.tv_nsec;
+        (void)clock_gettime(CLOCK_REALTIME, &now);
+        out->tv_sec += now.tv_sec;
+        out->tv_nsec += now.tv_nsec;
+    }
+    while (out->tv_nsec >= 1000000000L) {
+        out->tv_sec++;
+        out->tv_nsec -= 1000000000L;
+    }
+    while (out->tv_nsec < 0L) {
+        out->tv_sec--;
+        out->tv_nsec += 1000000000L;
+    }
+}
+
+/* Raw word without endian handling (the table rechecks raw
+ * against raw: the dispatch already validated the logical value). */
+static uint32_t l4f_word_raw(uint32_t *hp)
+{
+    uint32_t v;
+
+    (void)memcpy(&v, hp, sizeof v);
+    return v;
+}
+
+static long l4f_darwin_wait(uint64_t va, uint32_t *hp, uint32_t val,
+                            int be,
+                            const struct timespec *to, int is_abs,
+                            int realtime)
+{
+    l4f_dslot_t *s = l4f_dslot_for(va, 1);
+    struct timespec dl;
+    int have_dl = 0;
+    int rc;
+
+    if (s == NULL) {
+        return 0;
+    }
+    if (to != NULL) {
+        l4f_deadline(to, is_abs, realtime, &dl);
+        have_dl = 1;
+    }
+    (void)pthread_mutex_lock(&s->mu);
+    /* Check-and-queue atomically under the slot lock (the kernel
+     * does the same under its bucket lock): a broadcast racing this
+     * wait either lands before the check (value already changed) or
+     * wakes the queued sleep. No lost wakeups. */
+    if ((uint32_t)getn((const uint8_t *)hp, 4U, be) != val) {
+        (void)pthread_mutex_unlock(&s->mu);
+        errno = EAGAIN;
+        return -1;
+    }
+    s->waiters++;
+    if (have_dl) {
+        rc = pthread_cond_timedwait(&s->cv, &s->mu, &dl);
+    } else {
+        rc = pthread_cond_wait(&s->cv, &s->mu);
+    }
+    s->waiters--;
+    (void)pthread_mutex_unlock(&s->mu);
+    /* A wakeup always finishes the wait like the kernel primitive:
+     * the caller re-checks the word and re-waits on spurious
+     * wakeups (standard futex protocol). */
+    if (rc == ETIMEDOUT) {
+        errno = ETIMEDOUT;
+        return -1;
+    }
+    if (rc != 0) {
+        errno = rc;
+        return -1;
+    }
+    return 0;
+}
+
+static long l4f_darwin_wake(uint64_t va, int nr)
+{
+    l4f_dslot_t *s = l4f_dslot_for(va, 0);
+    long n;
+
+    if (s == NULL || nr <= 0) {
+        return 0;
+    }
+    (void)pthread_mutex_lock(&s->mu);
+    n = (long)(s->waiters < nr ? s->waiters : nr);
+    if (n > 0) {
+        (void)pthread_cond_broadcast(&s->cv);
+    }
+    (void)pthread_mutex_unlock(&s->mu);
+    return n;
+}
+
+static long l4f_darwin(uint32_t *uaddr, uint64_t va, int op, int val,
+                       int be, const struct timespec *timeout, int is_abs,
+                       int realtime, uint32_t *uaddr2, uint64_t va2,
+                       int req_nr, int check_exp, uint32_t expected)
+{
+    int base = op & 0x7F;
+
+    (void)uaddr2;
+    (void)va2;
+    if (base == L4F_WAIT || base == L4F_WAIT_BITSET) {
+        return l4f_darwin_wait(va, uaddr, (uint32_t)val, be, timeout,
+                               is_abs, realtime);
+    }
+    if (base == L4F_WAKE || base == L4F_WAKE_BITSET) {
+        return l4f_darwin_wake(va, val);
+    }
+    /* REQUEUE / CMP_REQUEUE degrade to wake-all on the source (the
+     * guest protocol always re-waits, so moved waiters still make
+     * progress; see the table comment). */
+    if (check_exp && l4f_word_raw(uaddr) != expected) {
+        errno = EAGAIN;
+        return -1;
+    }
+    return l4f_darwin_wake(va, req_nr > 0 ? req_nr : INT_MAX);
+}
+#endif
+
 /* Host futex(2) once: every op number is arch-independent, so the
- * masked guest op passes through unchanged. Non-Linux hosts cannot
- * queue; they report -ENOSYS for the blocking path. */
+ * masked guest op passes through unchanged. Non-Linux hosts queue
+ * on the Darwin table above. */
+#if defined(__linux__) && defined(SYS_futex)
 static long l4f_host(uint32_t *uaddr, int op, int val,
                      const struct timespec *timeout, uint32_t *uaddr2,
                      uint32_t val3)
 {
-#if defined(__linux__) && defined(SYS_futex)
     return syscall((long)SYS_futex, uaddr, op, val, timeout, uaddr2,
                    val3);
-#else
-    (void)uaddr;
-    (void)op;
-    (void)val;
-    (void)timeout;
-    (void)uaddr2;
-    (void)val3;
-    errno = ENOSYS;
-    return -1;
-#endif
 }
+#endif
 
 /* Current 32-bit futex word (caller validated the mapping). */
 static uint32_t l4f_word(const mips64_ctx_t *ctx, uint32_t *hp)
@@ -200,8 +378,18 @@ int64_t mips_futex_op(mips64_ctx_t *ctx, uint64_t uaddr, uint64_t op,
             }
             top = &to;
         }
+#if defined(__linux__) && defined(SYS_futex)
         rc = l4f_host(hp, hop, (int)(uint32_t)val, top, NULL,
                       (uint32_t)val3);
+#else
+        /* WAIT takes a relative span, WAIT_BITSET an absolute stamp
+         * (hop bit 0x100 selects the REALTIME clock). */
+        rc = l4f_darwin(hp, uaddr, hop, (int)(uint32_t)val,
+                        ctx->is_be != 0, top,
+                        base == L4F_WAIT_BITSET ? 1 : 0,
+                        (hop & 0x100) != 0 ? 1 : 0, NULL, 0U, 0, 0,
+                        0u);
+#endif
         if (rc < 0L) {
             return l2a_ret(ctx, -(int64_t)errno);
         }
@@ -215,7 +403,12 @@ int64_t mips_futex_op(mips64_ctx_t *ctx, uint64_t uaddr, uint64_t op,
         } else {
             nr = (int)(uint32_t)val;
         }
+#if defined(__linux__) && defined(SYS_futex)
         rc = l4f_host(hp, hop, nr, NULL, NULL, (uint32_t)val3);
+#else
+        rc = l4f_darwin(hp, uaddr, hop, nr, ctx->is_be != 0, NULL, 0,
+                        0, NULL, 0U, 0, 0, 0u);
+#endif
         if (rc < 0L) {
             return l2a_ret(ctx, -(int64_t)errno);
         }
@@ -245,8 +438,23 @@ int64_t mips_futex_op(mips64_ctx_t *ctx, uint64_t uaddr, uint64_t op,
             return l2a_ret(ctx, -(int64_t)EFAULT);
         }
         hp2 = (uint32_t *)mips64_guest_ptr(ctx, uaddr2);
+#if defined(__linux__) && defined(SYS_futex)
         rc = l4f_host(hp, hop, (int)(uint32_t)val, nrq, hp2,
                       (uint32_t)val3);
+#else
+        /* REQUEUE/CMP_REQUEUE degrade to wake-all on the source;
+         * req_nr is val3 (REQUEUE) or the integer timeout_va slot
+         * (CMP_REQUEUE, already range-checked); CMP_REQUEUE also
+         * checks the expected word. */
+        (void)nrq;
+        rc = l4f_darwin(hp, uaddr, hop, (int)(uint32_t)val,
+                        ctx->is_be != 0, NULL, 0,
+                        0, hp2, uaddr2,
+                        base == L4F_CMP_REQUEUE ? (int)(uint32_t)timeout_va :
+                                                  (int)(uint32_t)val3,
+                        base == L4F_CMP_REQUEUE ? 1 : 0,
+                        (uint32_t)val3);
+#endif
         if (rc < 0L) {
             return l2a_ret(ctx, -(int64_t)errno);
         }

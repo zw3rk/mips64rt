@@ -178,6 +178,20 @@ void mips_soft_tlb_invalidate(mips64_ctx_t *ctx);
 /* Invalidate every entry of every live slot (quiescence step 5). */
 void mips_soft_tlb_invalidate_all(void);
 
+/* ---- §7 JIT code publication (W^X done right per host) ----
+ *
+ * The DBT publishes AArch64 code through these hooks (see
+ * dbt_code_publish); guest data pages are never PROT_EXEC on any
+ * host. Linux: RW staging, flip to R|X, clear the I-cache. Darwin:
+ * MAP_JIT pages toggled with pthread_jit_write_protect_np, sealed
+ * WITHOUT mprotect (which would break JIT pages), I-cache retired
+ * with sys_icache_invalidate. */
+size_t mips_host_page_size(void);
+void *mips_jit_alloc(size_t size);
+void mips_jit_begin_write(void *p, size_t size);
+int mips_jit_seal_rx(void *p, size_t size);
+void mips_jit_free(void *p, size_t size);
+
 /* Reset all U0 gate state for ctx: fixade back to default (1),
  * delay target dropped, TLB invalidated. NULL is a no-op. */
 void mips_backend_state_reset(mips64_ctx_t *ctx);

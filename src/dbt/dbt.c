@@ -121,41 +121,27 @@ int dbt_npc_resume(mips64_ctx_t *ctx)
 /* W^X code pages.                                                    */
 /* ------------------------------------------------------------------ */
 
-static long dbt_host_page_size(void)
-{
-    static long cached = 0;
-
-    if (cached <= 0) {
-        cached = sysconf(_SC_PAGESIZE);
-        if (cached < 4096)
-            cached = 4096;
-    }
-    return cached;
-}
-
-/* Publish one block: copy to a fresh RW mapping, flip to R+X, flush
- * the I-cache (W^X). Guest data pages are never `PROT_EXEC` on the
- * host. Evicted cache entries keep their RX mapping until process
- * end (RC2 bound: the cache holds 1024 entries), so no live IBTC
- * slot can ever dangle. */
+/* Publish one block through the backend JIT hooks (W^X done right
+ * per host: Linux flips RW->RX, Darwin toggles MAP_JIT writability
+ * and never mprotects). Guest data pages are never `PROT_EXEC` on
+ * the host. Evicted cache entries keep their RX mapping until
+ * process end (RC2 bound: the cache holds 1024 entries), so no live
+ * IBTC slot can ever dangle. */
 static void *dbt_code_publish(const uint8_t *buf, size_t len)
 {
-    size_t ps = (size_t)dbt_host_page_size();
-    size_t n = (len + ps - 1u) & ~(ps - 1u);
     void *p;
 
-    if (buf == NULL || len == 0 || n < len)
+    if (buf == NULL || len == 0)
         return NULL;
-    p = mmap(NULL, n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS,
-             -1, 0);
-    if (p == MAP_FAILED)
+    p = mips_jit_alloc(len);
+    if (p == NULL)
         return NULL;
+    mips_jit_begin_write(p, len);
     memcpy(p, buf, len);
-    if (mprotect(p, n, PROT_READ | PROT_EXEC) != 0) {
-        (void)munmap(p, n);
+    if (mips_jit_seal_rx(p, len) != 0) {
+        mips_jit_free(p, len);
         return NULL;
     }
-    __builtin___clear_cache((char *)p, (char *)p + len);
     return p;
 }
 

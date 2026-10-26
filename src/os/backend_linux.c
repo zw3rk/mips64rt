@@ -19,6 +19,8 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 #define U0_MAX_SLOTS 16u
 
@@ -258,6 +260,73 @@ void mips_soft_tlb_invalidate_all(void)
         }
     }
     (void)pthread_mutex_unlock(&u0_mu);
+}
+
+size_t mips_host_page_size(void)
+{
+    long ps = sysconf(_SC_PAGESIZE);
+
+    return (size_t)(ps < 4096L ? 4096L : ps);
+}
+
+void *mips_jit_alloc(size_t size)
+{
+    size_t ps = mips_host_page_size();
+    size_t n = (size + ps - 1u) & ~(ps - 1u);
+    void *p;
+
+    if (n == 0u) {
+        return NULL;
+    }
+    p = mmap(NULL, n, PROT_READ | PROT_WRITE,
+             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    return p == MAP_FAILED ? NULL : p;
+}
+
+void mips_jit_begin_write(void *p, size_t size)
+{
+    size_t ps = mips_host_page_size();
+    uintptr_t lo;
+    uintptr_t hi;
+
+    if (p == NULL || size == 0u) {
+        return;
+    }
+    /* The staging mapping is already writable; reassert in case a
+     * previous seal flipped it. */
+    lo = (uintptr_t)p & ~(uintptr_t)(ps - 1u);
+    hi = ((uintptr_t)p + size + (ps - 1u)) & ~(uintptr_t)(ps - 1u);
+    (void)mprotect((void *)lo, hi - lo, PROT_READ | PROT_WRITE);
+}
+
+int mips_jit_seal_rx(void *p, size_t size)
+{
+    size_t ps = mips_host_page_size();
+    uintptr_t lo;
+    uintptr_t hi;
+
+    if (p == NULL || size == 0u) {
+        return MIPS_FAULT;
+    }
+    lo = (uintptr_t)p & ~(uintptr_t)(ps - 1u);
+    hi = ((uintptr_t)p + size + (ps - 1u)) & ~(uintptr_t)(ps - 1u);
+    if (mprotect((void *)lo, hi - lo, PROT_READ | PROT_EXEC) != 0) {
+        return MIPS_FAULT;
+    }
+#if defined(__aarch64__) || defined(__arm64__)
+    __builtin___clear_cache((char *)p, (char *)p + size);
+#endif
+    return 0;
+}
+
+void mips_jit_free(void *p, size_t size)
+{
+    size_t ps = mips_host_page_size();
+    size_t n = (size + ps - 1u) & ~(ps - 1u);
+
+    if (p != NULL && n != 0u) {
+        (void)munmap(p, n);
+    }
 }
 
 void mips_backend_state_reset(mips64_ctx_t *ctx)
