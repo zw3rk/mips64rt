@@ -30,7 +30,7 @@
 
 #include "core/cpu.h"
 
-#include "rt64/linux/signal_core.h"
+#include "os/signal_core.h"
 
 #include <errno.h>
 #include <limits.h>

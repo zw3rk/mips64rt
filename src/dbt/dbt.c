@@ -112,14 +112,34 @@ void dbt_u0_prefill(mips64_ctx_t *ctx, uint64_t start, uint64_t end)
     }
     /* One fill per 4 KiB page in the block span; misses fault to
      * the interp_step fallback by construction, so a short span
-     * stays correct even without this loop. */
-    va = start & ~(uint64_t)4095U;
-    while (va < end) {
-        mips_soft_tlb_fill(ctx, va);
-        if (va + 4096U < va) {
-            break;
+     * stays correct even without this loop. Fill empty slots only:
+     * the invalidation sentinel is UINT64_MAX (see u0_invalidate)
+     * and a matching tag is already correct. Overwriting a live
+     * entry here evicts just-filled data pages every iteration when
+     * a code vpn aliases a data vpn in the 64-entry table,
+     * livelocking fill-and-retry (demand fills still overwrite on
+     * miss). */
+    {
+        mips_soft_tlb_entry_t *tlb =
+            (mips_soft_tlb_entry_t *)mips_soft_tlb_base(ctx);
+
+        if (tlb == NULL) {
+            return;
         }
-        va += 4096U;
+        va = start & ~(uint64_t)4095U;
+        while (va < end) {
+            uint64_t vpn = va >> 12;
+            mips_soft_tlb_entry_t *e =
+                &tlb[vpn & MIPS64_SOFT_TLB_INDEX_MASK];
+
+            if (e->tag == UINT64_MAX || e->tag == vpn) {
+                mips_soft_tlb_fill(ctx, va);
+            }
+            if (va + 4096U < va) {
+                break;
+            }
+            va += 4096U;
+        }
     }
 }
 
@@ -569,6 +589,128 @@ static uint64_t dbt_fault_ea(mips64_ctx_t *ctx, uint64_t pc)
     return pc;
 }
 
+/* U0 cold-data-page fill-and-retry (see dbt.h): distinguish a TLB
+ * miss on a mapped page (fill + retry) from a genuine fault. Span
+ * ops (LWL/LWR/SWL/SWR touch a 4-byte word span, LDL/LDR/SDL/SDR an
+ * 8-byte doubleword span) probe the aligned span; every other op
+ * probes [ea, ea+width). Coprocessor transfers share the integer
+ * widths; CACHE probes one byte read; PREF never faults in the
+ * emitter but a mapped span still fills harmlessly. */
+int dbt_u0_fill_retry(mips64_ctx_t *ctx, uint64_t pc)
+{
+    uint32_t word = 0u;
+    mips_dec_t d;
+    uint64_t ea;
+    uint64_t base;
+    uint64_t len = 0u;
+    uint64_t p0;
+    uint64_t p1;
+    uint32_t need = MIPS_PROT_READ;
+    int is_span = 0;
+    mips_soft_tlb_entry_t *tlb;
+
+    if (ctx == NULL || mips_fetch(ctx, pc, &word) != 0) {
+        return 0;
+    }
+    mips_decode(word, &d);
+    switch (d.op) {
+    case 0x20u: /* LB */
+    case 0x24u: /* LBU */
+        len = 1u;
+        break;
+    case 0x21u: /* LH */
+    case 0x25u: /* LHU */
+        len = 2u;
+        break;
+    case 0x23u: /* LW */
+    case 0x27u: /* LWU */
+    case 0x30u: /* LL */
+    case 0x31u: /* LWC1 */
+        len = 4u;
+        break;
+    case 0x37u: /* LD */
+    case 0x34u: /* LLD */
+    case 0x35u: /* LDC1 */
+        len = 8u;
+        break;
+    case 0x28u: /* SB */
+        need = MIPS_PROT_WRITE;
+        len = 1u;
+        break;
+    case 0x29u: /* SH */
+        need = MIPS_PROT_WRITE;
+        len = 2u;
+        break;
+    case 0x2bu: /* SW */
+    case 0x38u: /* SC */
+    case 0x39u: /* SWC1 */
+        need = MIPS_PROT_WRITE;
+        len = 4u;
+        break;
+    case 0x3fu: /* SD */
+    case 0x3cu: /* SCD */
+    case 0x3du: /* SDC1 */
+        need = MIPS_PROT_WRITE;
+        len = 8u;
+        break;
+    case 0x22u: /* LWL */
+    case 0x26u: /* LWR */
+        len = 4u;
+        is_span = 1;
+        break;
+    case 0x2au: /* SWL */
+    case 0x2eu: /* SWR */
+        need = MIPS_PROT_WRITE;
+        len = 4u;
+        is_span = 1;
+        break;
+    case 0x1au: /* LDL */
+    case 0x1bu: /* LDR */
+        len = 8u;
+        is_span = 1;
+        break;
+    case 0x2cu: /* SDL */
+    case 0x2du: /* SDR */
+        need = MIPS_PROT_WRITE;
+        len = 8u;
+        is_span = 1;
+        break;
+    case 0x2fu: /* CACHE */
+        len = 1u;
+        break;
+    case 0x33u: /* PREF */
+        len = 1u;
+        break;
+    default:
+        return 0;
+    }
+    ea = ctx->gpr[d.rs] + (uint64_t)(int64_t)d.simm;
+    if (is_span != 0) {
+        base = ea & ~(len - 1u);
+    } else {
+        base = ea;
+    }
+    if (mips_mem_ok(ctx, base, len, need) == 0) {
+        return 0;
+    }
+    tlb = (mips_soft_tlb_entry_t *)mips_soft_tlb_base(ctx);
+    if (tlb == NULL) {
+        return 0;
+    }
+    p0 = base >> 12;
+    p1 = (base + len - 1u) >> 12;
+    if (tlb[p0 & MIPS64_SOFT_TLB_INDEX_MASK].tag == p0 &&
+        (p1 == p0 ||
+         tlb[p1 & MIPS64_SOFT_TLB_INDEX_MASK].tag == p1)) {
+        return 0;
+    }
+    mips_soft_tlb_fill(ctx, base);
+    if (p1 != p0) {
+        mips_soft_tlb_fill(ctx, base + len - 1u);
+    }
+    return 1;
+}
+
 int dbt_run(mips64_ctx_t *ctx)
 {
     if (ctx == NULL)
@@ -674,6 +816,38 @@ int dbt_run(mips64_ctx_t *ctx)
              * even though blocks never advance ctx->pc per insn. */
             if (ctx->pad150 != 0u) {
                 ctx->pc = ctx->pad150;
+            }
+            /* U0 cold-data-page fill-and-retry runs before any
+             * tracing: the re-executed block traces its own prefix
+             * on its real exit, so tracing here would print the
+             * prefix twice and break --trace/difftest parity. */
+            if (dbt_u0_fill_retry(ctx, ctx->pc) != 0) {
+                /* Retry at the faulting word: earlier words already
+                 * committed (re-executing them would replay register
+                 * clobbers with clobbered inputs, e.g. startup
+                 * gp-ra chains), so only the faulting access runs
+                 * again against the freshly filled entry. When the
+                 * faulting word is a delay slot, resume at its branch
+                 * instead: the slot alone cannot re-apply the
+                 * taken/fallthrough decision. The scratch slot is
+                 * cleared so a later guard capture without a fresh
+                 * record cannot reuse a stale pc. */
+                {
+                    uint32_t prev = 0u;
+                    mips_dec_t pd;
+
+                    if (ctx->pc >= 4u &&
+                        mips_fetch(ctx, ctx->pc - 4u, &prev) == 0) {
+                        mips_decode(prev, &pd);
+                        if (mips_has_delay_slot(&pd) != 0) {
+                            ctx->pc -= 4u;
+                        }
+                    }
+                }
+                ctx->pad150 = 0u;
+                ctx->exit_reason = MIPS64_EXIT_NONE;
+                ctx->exit_info = 0u;
+                continue;
             }
             trace_block_exit(ctx, start, end, 0);
             /* The faulting insn is terminal: no `interp_step`

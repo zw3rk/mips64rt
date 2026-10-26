@@ -20,7 +20,7 @@ HOST_CC ?= cc
 # `-pthread` for the Phase 4 thread runtime; glibc >= 2.34 and macOS link
 # without it, older glibc needs it.
 CFLAGS := -std=c11 -Werror=vla -pedantic -Wall -Wextra -Werror -pthread
-INCLUDES := -Isrc -Isrc/rt64
+INCLUDES := -Isrc
 BUILD := _build
 
 # Phase 2 binary: CLI + engine dispatch + interp + AArch64 DBT.
@@ -31,20 +31,27 @@ BUILD := _build
 # RC6 integration adds the L6a host-contract surface (arg parsing) and
 # the Class-B cache/family providers it consumes (digest, leaf,
 # broker rendezvous).
-# U0 lane L-U0-C: exactly one OS backend links into the binary.
-ifeq ($(shell uname -s),Darwin)
-OS_BACKEND := src/os/backend_darwin.c
-else
+# Unified U0+U12: exactly one OS backend links into the binary (U0),
+# and the AOT digest/identity TUs live under `src/dbt/aot/` with the
+# host-contract runtime TUs under `src/os/` (U12, no `src/rt64/`).
+# The backend follows the compiler TARGET triple, never the build
+# host: a Linux cross build on macOS must link the Linux backend.
 OS_BACKEND := src/os/backend_linux.c
+ifeq ($(findstring darwin,$(shell $(CC) -dumpmachine 2>/dev/null)),darwin)
+OS_BACKEND := src/os/backend_darwin.c
+endif
+HOST_BACKEND := src/os/backend_linux.c
+ifeq ($(findstring darwin,$(shell $(HOST_CC) -dumpmachine 2>/dev/null)),darwin)
+HOST_BACKEND := src/os/backend_darwin.c
 endif
 BOOT_SRCS := src/main.c \
 	src/os/host_args.c \
 	$(OS_BACKEND) \
-	src/rt64/aot/sha256.c \
-	src/rt64/aot/identity.c \
-	src/rt64/runtime/family_broker.c \
-	src/rt64/runtime/worker_loop.c \
-	src/rt64/linux/signal_core.c \
+	src/dbt/aot/sha256.c \
+	src/dbt/aot/identity.c \
+	src/os/family_broker.c \
+	src/os/worker_loop.c \
+	src/os/signal_core.c \
 	src/interp/decode.c \
 	src/interp/interp.c \
 	src/interp/unaligned.c \
@@ -80,7 +87,7 @@ help:
 	@echo "Targets:"
 	@echo "  build                 build $(BUILD)/mips64rt with \$$(CC)"
 	@echo "  build-cross           build static-PIE with \$$(CROSS_CC)"
-	@echo "  build-darwin          build native test_u0_delay_tlb (lane L-U0-C)"
+	@echo "  build-darwin          build $(BUILD)/mips64rt-darwin + test_u0_delay_tlb with \$$(HOST_CC) (no -static-pie)"
 	@echo "  check                 build + check-line-limits + self-checks"
 	@echo "  check-line-limits     every .c/.h/.S under src/ is <= 900 lines"
 	@echo "  check-abi-invariants  build+run tests/check_abi_invariants (lane L0b)"
@@ -88,7 +95,7 @@ help:
 
 build: $(BUILD)/mips64rt
 
-$(BUILD)/mips64rt: $(BOOT_SRCS) src/core/cpu.h src/os/syscall_nr.h
+$(BUILD)/mips64rt: $(BOOT_SRCS) src/core/cpu.h src/os/syscall_nr.h src/os/host_compat.h src/dbt/emit_mem.h
 	@mkdir -p $(BUILD)
 	$(CC) -static-pie -fPIE $(CFLAGS) $(INCLUDES) $(BOOT_SRCS) -o $@
 
@@ -102,7 +109,7 @@ build-cross:
 U0_SRCS := tests/test_u0_delay_tlb.c \
 	src/os/mem.c \
 	src/os/mem_table.c \
-	$(OS_BACKEND) \
+	$(HOST_BACKEND) \
 	src/vm/vm64.c \
 	src/vm/vm_file.c \
 	src/interp/decode.c \
@@ -115,11 +122,27 @@ U0_SRCS := tests/test_u0_delay_tlb.c \
 	src/dbt/dbt.c \
 	src/dbt/trampoline_a64.S
 
-build-darwin: $(BUILD)/test_u0_delay_tlb
+# Fill-and-retry regression gate: same TU list as the U0 gate with
+# the fill_retry driver swapped in.
+FILL_SRCS := tests/test_u0_fill_retry.c \
+	$(filter-out tests/test_u0_delay_tlb.c,$(U0_SRCS))
+
+# Lane U12: host-native sibling of `build` for macOS/Apple Silicon.
+# Same TU list, host C compiler, PIE without `-static-pie` (the macOS
+# linker rejects it). AArch64-only (the trampoline is A64 assembly).
+build-darwin: $(BUILD)/mips64rt-darwin $(BUILD)/test_u0_delay_tlb $(BUILD)/test_u0_fill_retry
+
+$(BUILD)/mips64rt-darwin: $(BOOT_SRCS) src/core/cpu.h src/os/syscall_nr.h src/os/host_compat.h src/dbt/emit_mem.h
+	@mkdir -p $(BUILD)
+	$(HOST_CC) -fPIE $(CFLAGS) $(INCLUDES) $(BOOT_SRCS) -o $@
 
 $(BUILD)/test_u0_delay_tlb: $(U0_SRCS) src/core/cpu.h src/os/backend.h src/vm/vm64.h src/vm/vm_file.h src/dbt/dbt.h
 	@mkdir -p $(BUILD)
 	$(HOST_CC) -std=c11 -Werror=vla -pedantic -Wall -Wextra -Werror -pthread $(INCLUDES) $(U0_SRCS) -o $@
+
+$(BUILD)/test_u0_fill_retry: $(FILL_SRCS) src/core/cpu.h src/os/backend.h src/vm/vm64.h src/vm/vm_file.h src/dbt/dbt.h
+	@mkdir -p $(BUILD)
+	$(HOST_CC) -std=c11 -Werror=vla -pedantic -Wall -Wextra -Werror -pthread $(INCLUDES) $(FILL_SRCS) -o $@
 
 check: build check-line-limits
 	@$(CC) $(CFLAGS) $(INCLUDES) -fsyntax-only src/core/cpu.h src/os/syscall_nr.h
@@ -131,7 +154,7 @@ check: build check-line-limits
 	fi
 	@if [ -f tests/check_abi_invariants.c ]; then $(MAKE) check-abi-invariants; fi
 	@if [ -f tests/test_decode.c ]; then \
-		$(HOST_CC) -std=c11 -Werror=vla -pedantic -Wall -Wextra -Werror -pthread -Isrc tests/test_decode.c src/interp/decode.c src/os/mem.c src/os/mem_table.c $(OS_BACKEND) tests/stubs_signal.c -o $(BUILD)/test_decode && $(BUILD)/test_decode; \
+		$(HOST_CC) -std=c11 -Werror=vla -pedantic -Wall -Wextra -Werror -pthread -Isrc tests/test_decode.c src/interp/decode.c src/os/mem.c src/os/mem_table.c $(HOST_BACKEND) tests/stubs_signal.c -o $(BUILD)/test_decode && $(BUILD)/test_decode; \
 	fi
 
 check-line-limits:

@@ -94,11 +94,17 @@ void ei_exit_fault_pc(a64_emit_t *e, uint64_t pc)
     ei_ret(e);
 }
 
-/* Fault exit with the fault address in a register (low half stored). */
+/* Fault exit with the fault address in a register (low half stored).
+ * The scratch slot is refreshed with pc as well: the miss branches
+ * skip the hit-path pc record, so without this store the dispatcher's
+ * pad150 would name a previous word and fault recovery (fill-and-retry
+ * decode, si_addr recomputation) would inspect the wrong instruction.
+ * EI_T is dead at every epilogue (terminal block exit). */
 void ei_exit_fault_reg(a64_emit_t *e, uint64_t pc, unsigned areg)
 {
     ei_mov64(e, EI_T, pc);
     ei_str(e, 0, EI_T, EI_CTX, MIPS64_CTX_PC_OFFSET);
+    ei_str(e, 0, EI_T, EI_CTX, EI_OFF_SCRATCH);
     ei_str(e, 1, areg, EI_CTX, MIPS64_CTX_EXIT_REASON_OFFSET + 4u);
     ei_strb(e, EI_XZR, EI_CTX, MIPS64_CTX_LLBIT_OFFSET);
     ei_mov32(e, 0u, MIPS64_EXIT_FAULT);

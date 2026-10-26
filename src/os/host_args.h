@@ -8,7 +8,7 @@
  * `src/main.c` calls `mips64_host_args_init()` (environment defaults)
  * followed by `mips64_parse_host_args()` (explicit CLI overrides); this
  * module never touches guest state. The start-up wiring in
- * `src/rt64/runtime/worker_loop.c` consumes the parsed struct (image
+ * `src/os/worker_loop.c` consumes the parsed struct (image
  * resolution, sysroot join, digest, broker, authorities).
  *
  * Curated C11 only: no VLAs, no Annex K, no <threads.h>, no _Generic,

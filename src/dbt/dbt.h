@@ -110,6 +110,19 @@ int dbt_npc_resume(mips64_ctx_t *ctx);
  * interp_step fallback by construction). */
 void dbt_u0_prefill(mips64_ctx_t *ctx, uint64_t start, uint64_t end);
 
+/* U0 cold-data-page fill-and-retry: the inlined probe exits with
+ * EXIT_FAULT on every first-touch data page, so a miss on a MAPPED
+ * page must fill the entry and retry the block instead of delivering
+ * a spurious guest SIGSEGV (the first N64 startup stack load faulted
+ * the whole --dbt run before this). Decodes the word at pc, probes
+ * the access span with mips_mem_ok (READ for loads, WRITE for
+ * stores), and fills the uncovered pages. Returns 1 when the caller
+ * should clear the exit state and retry, 0 for a genuine fault
+ * (unmapped span, non-memory word, undecodable pc, or an entry that
+ * is already present, which rules out a cold miss and stops a
+ * fill/retry loop on a host-level fault). */
+int dbt_u0_fill_retry(mips64_ctx_t *ctx, uint64_t pc);
+
 /* Enter compiled code: saves host callee-saved registers, pins
  * `x19 = ctx` and `x20 = base`, calls `code`, restores, and returns
  * the `w0` exit code. Implemented in `trampoline_a64.S` on AArch64;
