@@ -105,6 +105,10 @@ extern int64_t mips_sc_close_range(mips64_ctx_t *ctx, uint64_t first,
 extern int64_t mips_sc_vec(mips64_ctx_t *ctx, uint64_t fd, uint64_t iov_va,
                            uint64_t iovcnt, uint64_t off, int is_p,
                            int is_write);
+/* Lane H2 file-mutation + sysmips tail (src/os/syscalls_sync.c). */
+extern int64_t mips_sc_file_extra(mips64_ctx_t *ctx, int n32, uint64_t nr,
+                                  uint64_t a0, uint64_t a1, uint64_t a2,
+                                  uint64_t a3, int *claimed);
 /* Phase 4 seams (lanes L4a/L4b/L4c). The (ctx, sp) signal seams read
  * their arguments from the guest registers; sp is reserved. */
 extern int64_t mips_sc_rt_sigaction(mips64_ctx_t *ctx, uint64_t sp);
@@ -868,6 +872,18 @@ static int64_t mips_syscall_inner(mips64_ctx_t *ctx)
             dbt_invalidate_range(a0, a1);
         }
         return sc_ret(ctx, 0);
+    }
+    {
+        /* Lane H2: truncate, ftruncate, pread64, pwrite64, and
+         * sysmips(MIPS_FIXADE) live in the file-extra tail. */
+        int claimed = 0;
+        int64_t extra =
+            mips_sc_file_extra(ctx, n32 ? 1 : 0, nr, a0, a1, a2, a3,
+                               &claimed);
+
+        if (claimed != 0) {
+            return extra;
+        }
     }
     return sc_ret(ctx, -(int64_t)ENOSYS);
 }

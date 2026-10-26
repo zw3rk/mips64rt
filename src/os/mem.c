@@ -120,6 +120,14 @@ static int mem_fix_st(mips64_ctx_t *ctx, uint64_t va, unsigned size,
     if (mem_fix_emulate(ctx, va) != 0) {
         return MIPS_FAULT;
     }
+    /* Validate the full cross-page span before writing a single
+     * byte: a span that reaches an unmapped (or read-only) page
+     * faults here with zero partial mutation instead of writing the
+     * mapped prefix and then faulting mid-span. */
+    if (!mips_mem_ok(ctx, va, size, (uint32_t)MIPS_PROT_WRITE)) {
+        mips_fault(ctx, va);
+        return MIPS_FAULT;
+    }
     for (i = 0U; i < size; i++) {
         uint64_t b;
 

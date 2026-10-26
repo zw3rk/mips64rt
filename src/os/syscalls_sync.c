@@ -25,6 +25,7 @@
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/uio.h>
+#include <unistd.h>
 
 /* Shared helpers owned by src/os/syscalls.c. */
 extern int mips_mem_ok(const mips64_ctx_t *ctx, uint64_t va, uint64_t len,
@@ -34,6 +35,26 @@ extern void putn(uint8_t *p, uint64_t v, unsigned n, int be);
 extern uint64_t getn(const uint8_t *p, unsigned n, int be);
 extern uint8_t *guest_range(mips64_ctx_t *ctx, uint64_t va, uint64_t len,
                             int write);
+/* Lane H2 file-mutation bodies owned by src/os/syscalls.c. */
+extern int64_t mips_sc_truncate(mips64_ctx_t *ctx, uint64_t path_va,
+                                uint64_t len);
+extern int64_t mips_sc_ftruncate(mips64_ctx_t *ctx, uint64_t fd,
+                                 uint64_t len);
+/* TIF_FIXADE control hook owned by the OS backend TU. */
+extern int mips_fixade_ctl(mips64_ctx_t *ctx, unsigned long cmd,
+                           unsigned long arg);
+
+/* Guest sysmips(2) numbers, absent from the frozen
+ * src/os/syscall_nr.h (added here with the kernel-header values:
+ * N64 5199 = 5000+199, N32 6199 = 6000+199; arch/mips UAPI
+ * asm/unistd_{n64,n32}.h, verified against Debian trixie kernel
+ * headers). */
+#define MIPS64_NR_sysmips 5199u
+#define MIPS64_NR32_sysmips 6199u
+
+/* Guest sysmips MIPS_FIXADE command (arch/mips UAPI asm/sysmips.h;
+ * matches MIPS_SYS_MIPS_FIXADE in src/os/backend.h). */
+#define MIPS_SYNC_FIXADE 7u
 
 /* MIPS futex ops (linux/futex.h, arch-independent) and signal-mask ops
  * (UAPI asm/signal.h: 1/2/3 on MIPS, unlike asm-generic 0/1/2). */
@@ -236,4 +257,81 @@ int64_t mips_sc_vec(mips64_ctx_t *ctx, uint64_t fd, uint64_t iov_va,
         }
     }
     return l2a_ret(ctx, (int64_t)total);
+}
+
+/* Positional scalar I/O (pread64/pwrite64): one validated guest
+ * window, one host call, short counts returned as-is. The
+ * file-mutation hook for pwrite64 (inode size/EOF tracking) lands
+ * with the Provider A wiring; until then the bytes are written and
+ * truncation coherence is the caller's (ftruncate) business. */
+static int64_t l2a_pio(mips64_ctx_t *ctx, uint64_t fd, uint64_t buf_va,
+                       uint64_t count, uint64_t off, int is_write)
+{
+    uint8_t *p;
+    ssize_t rc;
+
+    if (count == 0U) {
+        return l2a_ret(ctx, 0);
+    }
+    p = guest_range(ctx, buf_va, count, is_write ? 0 : 1);
+    if (p == NULL) {
+        return l2a_ret(ctx, -(int64_t)EFAULT);
+    }
+    rc = is_write ? pwrite((int)fd, p, (size_t)count, (off_t)off) :
+                    pread((int)fd, p, (size_t)count, (off_t)off);
+    if (rc < 0) {
+        return l2a_ret(ctx, -(int64_t)errno);
+    }
+    return l2a_ret(ctx, (int64_t)rc);
+}
+
+/* Lane H2 file-mutation + sysmips dispatch tail: truncate, ftruncate,
+ * pread64, pwrite64, and sysmips(MIPS_FIXADE). *claimed reports 1
+ * when nr was handled (the return value is already guest-convention
+ * adjusted) and 0 when the caller must keep dispatching (the return
+ * is then -ENOSYS). */
+int64_t mips_sc_file_extra(mips64_ctx_t *ctx, int n32, uint64_t nr,
+                           uint64_t a0, uint64_t a1, uint64_t a2,
+                           uint64_t a3, int *claimed)
+{
+    if (claimed != NULL) {
+        *claimed = 0;
+    }
+    if (ctx == NULL || claimed == NULL) {
+        return -(int64_t)EINVAL;
+    }
+    if (nr == (uint64_t)(n32 ? MIPS64_NR32_truncate : MIPS64_NR_truncate)) {
+        *claimed = 1;
+        return mips_sc_truncate(ctx, a0, a1);
+    }
+    if (nr == (uint64_t)(n32 ? MIPS64_NR32_ftruncate
+                             : MIPS64_NR_ftruncate)) {
+        *claimed = 1;
+        return mips_sc_ftruncate(ctx, a0, a1);
+    }
+    if (nr == (uint64_t)(n32 ? MIPS64_NR32_pread64 : MIPS64_NR_pread64)) {
+        *claimed = 1;
+        return l2a_pio(ctx, a0, a1, a2, a3, 0);
+    }
+    if (nr == (uint64_t)(n32 ? MIPS64_NR32_pwrite64 : MIPS64_NR_pwrite64)) {
+        *claimed = 1;
+        return l2a_pio(ctx, a0, a1, a2, a3, 1);
+    }
+    if (nr == (uint64_t)(n32 ? MIPS64_NR32_sysmips : MIPS64_NR_sysmips)) {
+        int frc;
+
+        *claimed = 1;
+        /* Only the FIXADE control is implemented; SETNAME,
+         * FLUSH_CACHE, and unknown commands are -EINVAL, matching
+         * Linux sysmips(2). */
+        if (a0 != (uint64_t)MIPS_SYNC_FIXADE) {
+            return l2a_ret(ctx, -(int64_t)EINVAL);
+        }
+        frc = mips_fixade_ctl(ctx, (unsigned long)a0, (unsigned long)a1);
+        if (frc != 0) {
+            return l2a_ret(ctx, -(int64_t)EINVAL);
+        }
+        return l2a_ret(ctx, 0);
+    }
+    return -(int64_t)ENOSYS;
 }
