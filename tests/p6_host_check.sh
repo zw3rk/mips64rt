@@ -8,7 +8,7 @@
 #   1. Host cross-build of the translator with the lane TU set: the
 #      Makefile is coordinator-frozen and does not list the new TU yet,
 #      so this script compiles BOOT_SRCS plus src/os/host_args.c and
-#      the referenced src/rt64/ substrate TUs (aot/sha256, aot/
+#      the referenced substrate TUs (dbt/aot/sha256, dbt/aot/
 #      identity, runtime/family_broker) with the same curated C11
 #      flags into _build/mips64rt-l6a. The coordinator wires these
 #      TUs into BOOT_SRCS at the RC6 merge.
@@ -70,14 +70,14 @@ mkdir -p _build
 # shellcheck disable=SC2086
 timeout --kill-after=30s 200s $NIX_GCC -static-pie -fPIE \
 	-std=c11 -Werror=vla -pedantic -Wall -Wextra -Werror -pthread \
-	-Isrc -Isrc/rt64 \
+	-Isrc \
 	src/main.c \
 	src/os/host_args.c \
-	src/rt64/runtime/worker_loop.c \
-	src/rt64/aot/sha256.c \
-	src/rt64/aot/identity.c \
-	src/rt64/runtime/family_broker.c \
-	src/rt64/linux/signal_core.c \
+	src/os/worker_loop.c \
+	src/dbt/aot/sha256.c \
+	src/dbt/aot/identity.c \
+	src/os/family_broker.c \
+	src/os/signal_core.c \
 	src/interp/decode.c \
 	src/interp/interp.c \
 	src/interp/unaligned.c \

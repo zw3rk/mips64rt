@@ -53,7 +53,7 @@
 
 #include "os/host_args.h"
 #include "os/syscall_nr.h"
-#include "rt64/linux/signal_core.h"
+#include "os/signal_core.h"
 
 #include <errno.h>
 #include <fcntl.h>

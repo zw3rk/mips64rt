@@ -26,7 +26,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+/* glibc-only header; macOS provides major()/minor() via sys/types.h. */
+#if defined(__linux__)
 #include <sys/sysmacros.h>
+#endif
 #include <sys/types.h>
 
 /* Shared helpers owned by src/os/syscalls.c. */
@@ -43,6 +46,22 @@ extern int64_t guest_str(mips64_ctx_t *ctx, uint64_t va, char *out);
 #undef st_atime
 #undef st_mtime
 #undef st_ctime
+
+#if defined(__APPLE__)
+/* macOS names the timespec members st_*timespec, not st_*tim. */
+#define st_atim st_atimespec
+#define st_mtim st_mtimespec
+#define st_ctim st_ctimespec
+#endif
+
+/* Linux AT flag values (arch-independent); macOS lacks the middle
+ * two, and fstatat(2) there rejects unknown flags at runtime. */
+#ifndef AT_EMPTY_PATH
+#define AT_EMPTY_PATH 0x1000
+#endif
+#ifndef AT_NO_AUTOMOUNT
+#define AT_NO_AUTOMOUNT 0x800
+#endif
 
 #define L2A_PATH_MAX 4096U
 
@@ -180,6 +199,7 @@ int64_t mips_sc_fstat(mips64_ctx_t *ctx, uint64_t fd, uint64_t buf_va)
     return l2a_ret(ctx, 0);
 }
 
+#if defined(__linux__)
 /* Field table for the 256-byte statx. This toolchain's struct statx
  * predates stx_mnt_id and the dio fields, so those three come from
  * stable kernel-UAPI byte offsets after the tabled loop. */
@@ -240,10 +260,12 @@ static int64_t emit_statx(mips64_ctx_t *ctx, const struct statx *hs,
     memcpy(dst, img, sizeof img);
     return 0;
 }
+#endif /* statx fill is Linux-only; see below. */
 
 int64_t mips_sc_statx(mips64_ctx_t *ctx, uint64_t dirfd, uint64_t path_va,
                       uint64_t flags, uint64_t mask, uint64_t buf_va)
 {
+#if defined(__linux__)
     char path[L2A_PATH_MAX + 1U];
     char full[L2A_PATH_MAX + MIPS64RT_HOST_ARGS_PATH_MAX + 2U];
     struct statx hsx;
@@ -295,4 +317,13 @@ int64_t mips_sc_statx(mips64_ctx_t *ctx, uint64_t dirfd, uint64_t path_va,
         return l2a_ret(ctx, rc);
     }
     return l2a_ret(ctx, 0);
+#else
+    /* No statx(2) on this host. */
+    (void)dirfd;
+    (void)path_va;
+    (void)flags;
+    (void)mask;
+    (void)buf_va;
+    return l2a_ret(ctx, -(int64_t)ENOSYS);
+#endif
 }

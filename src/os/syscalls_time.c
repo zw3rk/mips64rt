@@ -97,9 +97,17 @@ int64_t mips_sc_nanosleep(mips64_ctx_t *ctx, uint64_t clk, uint64_t req_va,
         return l2a_ret(ctx, -(int64_t)EINVAL);
     }
     /* Relative sleep only; TIMER_ABSTIME waits for Phase 4. */
+#if defined(__linux__)
     rc = use_clock ? (int64_t)clock_nanosleep((clockid_t)(int)clk, 0, &rq,
                                               remp) :
                      (int64_t)nanosleep(&rq, remp);
+#else
+    /* No clock_nanosleep(2) on this host: every relative sleep
+     * lowers to nanosleep(2). */
+    (void)use_clock;
+    (void)clk;
+    rc = (int64_t)nanosleep(&rq, remp);
+#endif
     if (rc != 0) {
         rc = -(int64_t)errno;
         if (remp != NULL && errno == EINTR) {

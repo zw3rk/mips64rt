@@ -4,7 +4,7 @@
  * `mips64rt` Phase 0 CLI entry. Curated C11 only.
  *
  * Phase 0 admits the guest ELF (EM_MIPS, ELFCLASS64/N64 or ELFCLASS32/N32)
- * and dispatches to the engine plumbing in `src/rt64/runtime/worker_loop`.
+ * and dispatches to the engine plumbing in `src/os/worker_loop`.
  * Guest execution arrives in Phase 1 (interp) / Phase 2 (dbt); until then
  * the worker loop reports the bootstrap status cleanly.
  *
@@ -13,14 +13,14 @@
  * parsed struct onto `mips64_run_config_t` and keeps the `--help` /
  * `--version` surface. The start-up wiring (image resolution, sysroot
  * join, digest, cache leaf, family broker, authorities) lives in
- * `src/rt64/runtime/worker_loop.c`.
+ * `src/os/worker_loop.c`.
  */
 #define _POSIX_C_SOURCE 200809L
 
 #include "core/cpu.h"
 #include "os/host_args.h"
 #include "os/syscall_nr.h"
-#include "rt64/runtime/worker_loop.h"
+#include "os/worker_loop.h"
 
 #include <errno.h>
 #include <fcntl.h>

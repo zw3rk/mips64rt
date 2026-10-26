@@ -50,6 +50,10 @@
  * mips_proc_* entry points live here instead. */
 #include "os/proc.c"
 
+/* Non-Linux host fallbacks (dup3/pipe2/close_range/getrandom/
+ * clock_nanosleep shapes); Linux keeps the direct syscalls. */
+#include "os/host_compat.h"
+
 /* linux/close_range.h values (arch-independent); this toolchain's
  * headers predate the macros, so define them when missing. */
 #ifndef CLOSE_RANGE_UNSHARE
@@ -203,9 +207,19 @@ static const struct {
     { MIPS_O_CREAT, O_CREAT }, { MIPS_O_EXCL, O_EXCL },
     { MIPS_O_NOCTTY, O_NOCTTY }, { MIPS_O_TRUNC, O_TRUNC },
     { MIPS_O_APPEND, O_APPEND }, { MIPS_O_NONBLOCK, O_NONBLOCK },
-    { MIPS_O_DIRECT, O_DIRECT }, { MIPS_O_DIRECTORY, O_DIRECTORY },
+/* macOS lacks these Linux open flags: the rows compile out and the
+ * `known` mask below declines those guest bits with -EINVAL. */
+#ifdef O_DIRECT
+    { MIPS_O_DIRECT, O_DIRECT },
+#endif
+    { MIPS_O_DIRECTORY, O_DIRECTORY },
     { MIPS_O_NOFOLLOW, O_NOFOLLOW }, { MIPS_O_CLOEXEC, O_CLOEXEC },
-    { MIPS_O_NOATIME, O_NOATIME }, { MIPS_O_PATH, O_PATH },
+#ifdef O_NOATIME
+    { MIPS_O_NOATIME, O_NOATIME },
+#endif
+#ifdef O_PATH
+    { MIPS_O_PATH, O_PATH },
+#endif
 };
 
 /* Translate mf (masked to allowed) to host flags; -EINVAL on the rest. */
@@ -230,7 +244,12 @@ static int64_t map_open_flags(uint64_t mf, uint64_t allowed, int *host_out)
      * __O_TMPFILE bit is EINVAL on Linux, so reject it the same way. */
     h = (int)(mf & (uint64_t)MIPS_O_ACCMODE);
     if ((mf & (uint64_t)MIPS_O_TMPFILE) == (uint64_t)MIPS_O_TMPFILE) {
+#ifdef O_TMPFILE
         h |= O_TMPFILE;
+#else
+        /* No O_TMPFILE on this host: the combination is not admittable. */
+        return -(int64_t)EINVAL;
+#endif
     } else if ((mf & (uint64_t)(MIPS_O_TMPFILE ^ MIPS_O_DIRECTORY)) !=
                0U) {
         return -(int64_t)EINVAL;
@@ -324,9 +343,14 @@ int64_t mips_sc_fcntl(mips64_ctx_t *ctx, uint64_t fd, uint64_t cmd,
             ((rc & O_APPEND) != 0 ? (int)MIPS_O_APPEND : 0) |
             ((rc & O_NONBLOCK) != 0 ? (int)MIPS_O_NONBLOCK : 0) |
             ((rc & O_SYNC) != 0 ? (int)MIPS_O_SYNC :
-             (rc & O_DSYNC) != 0 ? (int)MIPS_O_DSYNC : 0) |
-            ((rc & O_DIRECT) != 0 ? (int)MIPS_O_DIRECT : 0) |
-            ((rc & O_NOATIME) != 0 ? (int)MIPS_O_NOATIME : 0)));
+             (rc & O_DSYNC) != 0 ? (int)MIPS_O_DSYNC : 0)
+#ifdef O_DIRECT
+            | ((rc & O_DIRECT) != 0 ? (int)MIPS_O_DIRECT : 0)
+#endif
+#ifdef O_NOATIME
+            | ((rc & O_NOATIME) != 0 ? (int)MIPS_O_NOATIME : 0)
+#endif
+            ));
     case MIPS_F_SETFL: {
         const uint64_t settable = (uint64_t)(MIPS_O_APPEND |
             MIPS_O_NONBLOCK | MIPS_O_DIRECT | MIPS_O_NOATIME |
@@ -395,9 +419,14 @@ int64_t mips_sc_dup(mips64_ctx_t *ctx, uint64_t oldfd, uint64_t newfd,
             oldfd == newfd) {
             return l2a_ret(ctx, -(int64_t)EINVAL);
         }
+#if defined(__linux__)
         rc = dup3((int)oldfd, (int)newfd,
                   (flags & (uint64_t)MIPS_O_CLOEXEC) != 0U ? O_CLOEXEC :
                                                              0);
+#else
+        rc = l2a_dup_cloexec((int)oldfd, (int)newfd,
+                             (flags & (uint64_t)MIPS_O_CLOEXEC) != 0U);
+#endif
     } else if (op == L2A_DUP_DUP2) {
         rc = dup2((int)oldfd, (int)newfd);
     } else {
@@ -430,9 +459,18 @@ int64_t mips_sc_pipe2(mips64_ctx_t *ctx, uint64_t fds_va, uint64_t flags)
     if (p == NULL) {
         return l2a_ret(ctx, -(int64_t)EFAULT);
     }
+#if defined(__linux__)
     if (pipe2(fds, hflags) != 0) {
         return l2a_ret(ctx, -(int64_t)errno);
     }
+#else
+    /* No pipe2(2) on this host: pipe plus fcntl (`hflags` only ever
+     * carries O_CLOEXEC/O_NONBLOCK; the O_DIRECT row compiles out
+     * where the host lacks it). */
+    if (l2a_pipe_flags(fds, hflags) != 0) {
+        return l2a_ret(ctx, -(int64_t)errno);
+    }
+#endif
     putn(p, (uint64_t)(uint32_t)fds[0], 4, ctx->is_be != 0U);
     putn(p + 4, (uint64_t)(uint32_t)fds[1], 4, ctx->is_be != 0U);
     return l2a_ret(ctx, 0);
@@ -526,8 +564,6 @@ int64_t mips_sc_unlinkat(mips64_ctx_t *ctx, uint64_t dirfd, uint64_t path_va,
 int64_t mips_sc_close_range(mips64_ctx_t *ctx, uint64_t first, uint64_t last,
                             uint64_t flags)
 {
-    long rc;
-
     if ((flags & ~(uint64_t)(CLOSE_RANGE_UNSHARE |
                              CLOSE_RANGE_CLOEXEC)) != 0U) {
         return l2a_ret(ctx, -(int64_t)EINVAL);
@@ -536,12 +572,7 @@ int64_t mips_sc_close_range(mips64_ctx_t *ctx, uint64_t first, uint64_t last,
         last > (uint64_t)UINT_MAX) {
         return l2a_ret(ctx, -(int64_t)EINVAL);
     }
-    rc = syscall(SYS_close_range, (unsigned)first, (unsigned)last,
-                 (unsigned)flags);
-    if (rc < 0) {
-        return l2a_ret(ctx, -(int64_t)errno);
-    }
-    return l2a_ret(ctx, rc);
+    return l2a_ret(ctx, l2a_close_range_host(first, last, flags));
 }
 
 int64_t mips_sc_getid(mips64_ctx_t *ctx, int which)
@@ -568,7 +599,7 @@ int64_t mips_sc_getid(mips64_ctx_t *ctx, int which)
         v = (int64_t)getegid();
         break;
     case L2A_ID_TID:
-        v = (int64_t)gettid();
+        v = l2a_host_tid();
         break;
     default:
         return l2a_ret(ctx, -(int64_t)EINVAL);
@@ -586,14 +617,23 @@ int64_t mips_sc_getrandom(mips64_ctx_t *ctx, uint64_t buf_va, uint64_t len,
                           uint64_t flags)
 {
     uint8_t *p;
+#if defined(__linux__)
     ssize_t n;
+#endif
     const char *env = getenv("MIPS64RT_RANDSEED");
     uint64_t i;
 
+#if defined(GRND_NONBLOCK) && defined(GRND_RANDOM) && \
+    defined(GRND_INSECURE)
     if ((flags & ~(uint64_t)(GRND_NONBLOCK | GRND_RANDOM |
                              GRND_INSECURE)) != 0U) {
         return l2a_ret(ctx, -(int64_t)EINVAL);
     }
+#else
+    if ((flags & ~(uint64_t)L2A_GRND_KNOWN_MASK) != 0U) {
+        return l2a_ret(ctx, -(int64_t)EINVAL);
+    }
+#endif
     p = guest_range(ctx, buf_va, len, 1);
     if (len != 0U && p == NULL) {
         return l2a_ret(ctx, -(int64_t)EFAULT);
@@ -613,11 +653,15 @@ int64_t mips_sc_getrandom(mips64_ctx_t *ctx, uint64_t buf_va, uint64_t len,
         }
         return l2a_ret(ctx, (int64_t)len);
     }
+#if defined(__linux__)
     n = getrandom(p, (size_t)len, (unsigned)flags);
     if (n < 0) {
         return l2a_ret(ctx, -(int64_t)errno);
     }
     return l2a_ret(ctx, (int64_t)n);
+#else
+    return l2a_ret(ctx, l2a_getentropy_fill(p, (size_t)len));
+#endif
 }
 
 /* getdents64 records are arch-independent; only BE guests need a
@@ -635,7 +679,7 @@ int64_t mips_sc_getdents64(mips64_ctx_t *ctx, uint64_t fd, uint64_t dirp_va,
     if (p == NULL) {
         return l2a_ret(ctx, -(int64_t)EFAULT);
     }
-    n = syscall(SYS_getdents64, (int)fd, p, (size_t)count);
+    n = l2a_getdents64_host((int)fd, p, (size_t)count);
     if (n < 0) {
         return l2a_ret(ctx, -(int64_t)errno);
     }
@@ -810,8 +854,15 @@ int64_t mips_sc_clock_nanosleep(mips64_ctx_t *ctx, uint64_t clk,
     if (rq.tv_nsec < 0 || rq.tv_nsec >= 1000000000L) {
         return l2a_ret(ctx, -(int64_t)EINVAL);
     }
+#if defined(__linux__)
     rc = (int64_t)clock_nanosleep((clockid_t)(int)clk, (int)flags, &rq,
                                   remp);
+#else
+    /* No clock_nanosleep(2) on this host (absolute sleeps wait for
+     * Phase 4 even on Linux); the shared block below converts the
+     * raw result exactly like the clock path. */
+    rc = l2a_clock_sleep_fallback(clk, flags, &rq, remp);
+#endif
     if (rc != 0) {
         rc = -(int64_t)errno;
         if (remp != NULL && errno == EINTR) {

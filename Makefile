@@ -20,7 +20,7 @@ HOST_CC ?= cc
 # `-pthread` for the Phase 4 thread runtime; glibc >= 2.34 and macOS link
 # without it, older glibc needs it.
 CFLAGS := -std=c11 -Werror=vla -pedantic -Wall -Wextra -Werror -pthread
-INCLUDES := -Isrc -Isrc/rt64
+INCLUDES := -Isrc
 BUILD := _build
 
 # Phase 2 binary: CLI + engine dispatch + interp + AArch64 DBT.
@@ -31,13 +31,15 @@ BUILD := _build
 # RC6 integration adds the L6a host-contract surface (arg parsing) and
 # the Class-B cache/family providers it consumes (digest, leaf,
 # broker rendezvous).
+# Lane U12 (unwind `src/rt64/`): the AOT digest/identity TUs now live
+# under `src/dbt/aot/` and the host-contract runtime TUs under `src/os/`.
 BOOT_SRCS := src/main.c \
 	src/os/host_args.c \
-	src/rt64/aot/sha256.c \
-	src/rt64/aot/identity.c \
-	src/rt64/runtime/family_broker.c \
-	src/rt64/runtime/worker_loop.c \
-	src/rt64/linux/signal_core.c \
+	src/dbt/aot/sha256.c \
+	src/dbt/aot/identity.c \
+	src/os/family_broker.c \
+	src/os/worker_loop.c \
+	src/os/signal_core.c \
 	src/interp/decode.c \
 	src/interp/interp.c \
 	src/interp/unaligned.c \
@@ -67,12 +69,13 @@ BOOT_SRCS := src/main.c \
 	src/dbt/trampoline_a64.S \
 	src/loader.c
 
-.PHONY: help build build-cross check check-line-limits check-abi-invariants clean
+.PHONY: help build build-cross build-darwin check check-line-limits check-abi-invariants clean
 
 help:
 	@echo "Targets:"
 	@echo "  build                 build $(BUILD)/mips64rt with \$$(CC)"
 	@echo "  build-cross           build static-PIE with \$$(CROSS_CC)"
+	@echo "  build-darwin          build $(BUILD)/mips64rt-darwin with \$$(HOST_CC) (no -static-pie)"
 	@echo "  check                 build + check-line-limits + self-checks"
 	@echo "  check-line-limits     every .c/.h/.S under src/ is <= 900 lines"
 	@echo "  check-abi-invariants  build+run tests/check_abi_invariants (lane L0b)"
@@ -80,13 +83,22 @@ help:
 
 build: $(BUILD)/mips64rt
 
-$(BUILD)/mips64rt: $(BOOT_SRCS) src/core/cpu.h src/os/syscall_nr.h
+$(BUILD)/mips64rt: $(BOOT_SRCS) src/core/cpu.h src/os/syscall_nr.h src/os/host_compat.h src/dbt/emit_mem.h
 	@mkdir -p $(BUILD)
 	$(CC) -static-pie -fPIE $(CFLAGS) $(INCLUDES) $(BOOT_SRCS) -o $@
 
 build-cross:
 	@mkdir -p $(BUILD)
 	$(CROSS_CC) -static-pie -fPIE $(CFLAGS) $(INCLUDES) $(BOOT_SRCS) -o $(BUILD)/mips64rt-aarch64
+
+# Lane U12: host-native sibling of `build` for macOS/Apple Silicon.
+# Same TU list, host C compiler, PIE without `-static-pie` (the macOS
+# linker rejects it). AArch64-only (the trampoline is A64 assembly).
+build-darwin: $(BUILD)/mips64rt-darwin
+
+$(BUILD)/mips64rt-darwin: $(BOOT_SRCS) src/core/cpu.h src/os/syscall_nr.h src/os/host_compat.h src/dbt/emit_mem.h
+	@mkdir -p $(BUILD)
+	$(HOST_CC) -fPIE $(CFLAGS) $(INCLUDES) $(BOOT_SRCS) -o $@
 
 check: build check-line-limits
 	@$(CC) $(CFLAGS) $(INCLUDES) -fsyntax-only src/core/cpu.h src/os/syscall_nr.h

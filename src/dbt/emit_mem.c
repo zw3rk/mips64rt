@@ -11,6 +11,7 @@
  */
 
 #include "dbt/emit_int.h"
+#include "dbt/emit_mem.h"
 
 /* Shared fault epilogue for one memory word: the alignment and
  * bounds checks branch here with the address in EI_A. Slots holding
@@ -450,4 +451,94 @@ int ei_atomic(a64_emit_t *e, const mips_dec_t *d, uint64_t pc, int be)
     ei_strb(e, EI_XZR, EI_CTX, MIPS64_CTX_LLBIT_OFFSET);
     ei_patch26(e, done, e == NULL ? 0u : e->len);
     return 0;
+}
+
+/* ---- Lane U12: 24-byte miss-site table + 2-insn miss stub ---- */
+
+void dbt_mem_sites_init(dbt_mem_sites_t *t)
+{
+    size_t i;
+
+    if (t == NULL)
+        return;
+    for (i = 0u; i < DBT_MEM_SITES_MAX; i++) {
+        t->sites[i].guest_pc = 0u;
+        t->sites[i].miss_kind = 0u;
+        t->sites[i].host_off = 0u;
+        t->sites[i].disp = 0u;
+    }
+    t->count = 0u;
+}
+
+int dbt_mem_site_bump(dbt_mem_sites_t *t, uint64_t guest_pc,
+                      uint32_t miss_kind, uint32_t host_off)
+{
+    size_t at;
+
+    if (t == NULL || t->count >= DBT_MEM_SITES_MAX)
+        return -1;
+    at = t->count;
+    t->sites[at].guest_pc = guest_pc;
+    t->sites[at].miss_kind = miss_kind;
+    t->sites[at].host_off = host_off;
+    t->sites[at].disp = 0u;
+    t->count = at + 1u;
+    return (int)at;
+}
+
+static void put_u64le(uint8_t *out, uint64_t v)
+{
+    unsigned i;
+
+    for (i = 0u; i < 8u; i++)
+        out[i] = (uint8_t)(v >> (8u * i));
+}
+
+static void put_u32le(uint8_t *out, uint32_t v)
+{
+    unsigned i;
+
+    for (i = 0u; i < 4u; i++)
+        out[i] = (uint8_t)(v >> (8u * i));
+}
+
+size_t dbt_mem_sites_serialize(const dbt_mem_sites_t *t, uint8_t *out,
+                               size_t cap)
+{
+    size_t need;
+    size_t i;
+
+    if (t == NULL)
+        return 0u;
+    need = t->count * 24u;
+    if (need == 0u)
+        return 0u;
+    if (out == NULL || cap < need)
+        return 0u;
+    for (i = 0u; i < t->count; i++) {
+        uint8_t *row = out + i * 24u;
+
+        put_u64le(row, t->sites[i].guest_pc);
+        put_u32le(row + 8u, t->sites[i].miss_kind);
+        put_u32le(row + 12u, t->sites[i].host_off);
+        put_u64le(row + 16u, t->sites[i].disp);
+    }
+    return need;
+}
+
+size_t ei_mem_miss_stub(a64_emit_t *e, unsigned site)
+{
+    size_t at;
+
+    if (e == NULL || e->buf == NULL || site > 0xFFFFu) {
+        if (e != NULL)
+            e->err = 1;
+        return (size_t)-1;
+    }
+    at = e->len;
+    /* `movz w0, #site`: only w0 is written, x18 never appears. */
+    ei_fwd(e, 0x52800000u | ((uint32_t)site << 5u));
+    /* `brk #DBT_MEM_SITE_BRK_IMM`: the trap handler reads w0. */
+    ei_fwd(e, 0xD4200000u | ((uint32_t)DBT_MEM_SITE_BRK_IMM << 5u));
+    return at;
 }

@@ -37,10 +37,10 @@
 #include "os/host_args.c"
 #include "os/mem.c"
 #include "os/mem_table.c"
-#include "rt64/aot/sha256.c"
-#include "rt64/aot/identity.c"
-#include "rt64/runtime/family_broker.c"
-#include "rt64/linux/page_rules.c"
+#include "dbt/aot/sha256.c"
+#include "dbt/aot/identity.c"
+#include "os/family_broker.c"
+#include "os/page_rules.c"
 
 static int failures = 0;
 static int checks = 0;
