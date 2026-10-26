@@ -27,6 +27,12 @@
 #include <sys/uio.h>
 #include <unistd.h>
 
+/* Lane U12 Provider A write hooks (src/vm/vm_file.c). */
+extern void mips_vm_file_post_write(mips64_ctx_t *ctx, int fd, uint64_t off,
+                                    uint64_t n);
+extern void mips_vm_file_post_write_seq(mips64_ctx_t *ctx, int fd,
+                                        uint64_t n);
+
 /* Shared helpers owned by src/os/syscalls.c. */
 extern int mips_mem_ok(const mips64_ctx_t *ctx, uint64_t va, uint64_t len,
                        uint32_t need);
@@ -245,6 +251,15 @@ int64_t mips_sc_vec(mips64_ctx_t *ctx, uint64_t fd, uint64_t iov_va,
         }
         if (rc < 0) {
             if (total != 0U) {
+                if (is_write != 0) {
+                    if (is_p != 0) {
+                        mips_vm_file_post_write(ctx, (int)fd, off,
+                                                total);
+                    } else {
+                        mips_vm_file_post_write_seq(ctx, (int)fd,
+                                                    total);
+                    }
+                }
                 return l2a_ret(ctx, (int64_t)total);
             }
             return l2a_ret(ctx, -(int64_t)errno);
@@ -254,6 +269,13 @@ int64_t mips_sc_vec(mips64_ctx_t *ctx, uint64_t fd, uint64_t iov_va,
         idx += n;
         if ((uint64_t)rc < want || rc == 0) {
             break;
+        }
+    }
+    if (total != 0U && is_write != 0) {
+        if (is_p != 0) {
+            mips_vm_file_post_write(ctx, (int)fd, off, total);
+        } else {
+            mips_vm_file_post_write_seq(ctx, (int)fd, total);
         }
     }
     return l2a_ret(ctx, (int64_t)total);
@@ -300,6 +322,9 @@ int64_t mips_sc_write(mips64_ctx_t *ctx, uint64_t fd, uint64_t buf,
     if (n < 0) {
         return l2a_ret(ctx, -(int64_t)errno);
     }
+    if (n > 0) {
+        mips_vm_file_post_write_seq(ctx, (int)fd, (uint64_t)n);
+    }
     return l2a_ret(ctx, (int64_t)n);
 }
 
@@ -325,6 +350,9 @@ static int64_t l2a_pio(mips64_ctx_t *ctx, uint64_t fd, uint64_t buf_va,
                     pread((int)fd, p, (size_t)count, (off_t)off);
     if (rc < 0) {
         return l2a_ret(ctx, -(int64_t)errno);
+    }
+    if (rc > 0 && is_write != 0) {
+        mips_vm_file_post_write(ctx, (int)fd, off, (uint64_t)rc);
     }
     return l2a_ret(ctx, (int64_t)rc);
 }

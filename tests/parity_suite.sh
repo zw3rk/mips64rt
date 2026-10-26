@@ -56,7 +56,7 @@ if "$CC_HOST" -std=c11 -Werror=vla -pedantic -Wall -Wextra -Werror \
     src/dbt/aot/sites.c \
     src/dbt/emit_enc.c src/dbt/a64_emit.c src/dbt/emit_int.c \
     src/dbt/emit_alu.c src/dbt/emit_fp.c src/interp/decode.c \
-    src/os/mem.c src/os/mem_table.c "$OS_BACKEND" tests/stubs_signal.c \
+    src/os/mem.c src/os/mem_table.c src/vm/vm_pages.c "$OS_BACKEND" tests/stubs_signal.c \
     -o _build/test_mem_sites && _build/test_mem_sites >/dev/null; then
     ok "test_mem_sites (24B relative rows + AOT file round-trip)"
 else
@@ -65,7 +65,7 @@ fi
 
 if "$CC_HOST" -std=c11 -Werror=vla -pedantic -Wall -Wextra -Werror \
     -pthread -Isrc -o _build/check_host_contract \
-    tests/check_host_contract.c "$OS_BACKEND" \
+    tests/check_host_contract.c "$OS_BACKEND" src/vm/vm_pages.c \
     && _build/check_host_contract >/dev/null; then
     ok "check_host_contract"
 else
@@ -82,7 +82,7 @@ fi
 
 if "$CC_HOST" -std=c11 -Werror=vla -pedantic -Wall -Wextra -Werror \
     -pthread -Isrc tests/test_decode.c src/interp/decode.c src/os/mem.c \
-    src/os/mem_table.c "$OS_BACKEND" tests/stubs_signal.c -o _build/test_decode \
+    src/os/mem_table.c src/vm/vm_pages.c "$OS_BACKEND" tests/stubs_signal.c -o _build/test_decode \
     && _build/test_decode >/dev/null; then
     ok "test_decode"
 else

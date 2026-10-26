@@ -17,10 +17,16 @@
 
 #include "vm/vm_file.h"
 
+#include <fcntl.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
+
+#include "dbt/dbt.h"
+#include "vm/vm_pages.h"
 
 #ifndef MAP_NORESERVE
 #define MAP_NORESERVE 0
@@ -260,4 +266,462 @@ int mips_vmfile_map(mips_vm64_t *vm, int fd, uint64_t off, uint64_t va,
         return MIPS_FAULT;
     }
     return u0f_record(vm, va, va + len, prot, MIPS_VM_TAG_FILE);
+}
+
+/* ---- Lane U12 family-shared inode/EOF tracking ---- */
+
+#define VM_INODE_MAX 64u
+#define VM_INODE_MAPS 8u
+
+typedef struct {
+    uint64_t va;
+    uint64_t len;
+    uint64_t file_offset;
+    int shared;
+    int native;
+} vm_inode_map_t;
+
+typedef struct {
+    int used;
+    uint64_t dev;
+    uint64_t ino;
+    uint64_t size;
+    uint64_t resize_seq;
+    vm_inode_map_t maps[VM_INODE_MAPS];
+    int nmaps;
+    int wide;
+} vm_inode_t;
+
+static vm_inode_t *vm_inode_table_ptr;
+static int vm_inode_table_tried;
+static pthread_mutex_t vm_inode_mu = PTHREAD_MUTEX_INITIALIZER;
+
+/* MAP_SHARED backing: fork children inherit the table and observe
+ * the parent's updates (and vice versa). The mutex is usable as long
+ * as no fork lands mid-mutation (already unsupported); children that
+ * only exec or exit never touch it. */
+static vm_inode_t *vm_inode_table(void)
+{
+    if (vm_inode_table_ptr == NULL && !vm_inode_table_tried) {
+        void *p;
+
+        vm_inode_table_tried = 1;
+        p = mmap(NULL, sizeof(vm_inode_t) * VM_INODE_MAX,
+                 PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS,
+                 -1, 0);
+        if (p != MAP_FAILED) {
+            vm_inode_table_ptr = (vm_inode_t *)p;
+        }
+    }
+    return vm_inode_table_ptr;
+}
+
+static vm_inode_t *vm_inode_lookup(uint64_t dev, uint64_t ino, int create,
+                                   uint64_t size)
+{
+    vm_inode_t *tab = vm_inode_table();
+    size_t i;
+
+    if (tab == NULL) {
+        return NULL;
+    }
+    for (i = 0u; i < VM_INODE_MAX; i++) {
+        if (tab[i].used != 0 && tab[i].dev == dev && tab[i].ino == ino) {
+            return &tab[i];
+        }
+    }
+    if (!create) {
+        return NULL;
+    }
+    for (i = 0u; i < VM_INODE_MAX; i++) {
+        if (tab[i].used == 0) {
+            (void)memset(&tab[i], 0, sizeof tab[i]);
+            tab[i].used = 1;
+            tab[i].dev = dev;
+            tab[i].ino = ino;
+            tab[i].size = size;
+            return &tab[i];
+        }
+    }
+    return NULL;
+}
+
+/* Host protection covering one guest page (for the RO zeroing
+ * toggle); -1 when the page is not mapped. */
+static int vm_inode_page_host_prot(uint64_t page_va)
+{
+    size_t n = mips_mem_region_count();
+    size_t i;
+
+    for (i = 0u; i < n; i++) {
+        uint64_t s = 0u;
+        uint64_t e = 0u;
+        uint32_t prot = 0u;
+
+        if (mips_mem_region_at(i, &s, &e, &prot) != 0) {
+            break;
+        }
+        if (s <= page_va && page_va < e) {
+            int h = 0;
+
+            if ((prot & (uint32_t)MIPS_PROT_READ) != 0u) {
+                h |= PROT_READ;
+            }
+            if ((prot & (uint32_t)MIPS_PROT_WRITE) != 0u) {
+                h |= PROT_WRITE;
+            }
+            return h;
+        }
+    }
+    return -1;
+}
+
+/* Zero [page_va + from, page_va + to) through a temporary RW window
+ * when the page is not already writable. */
+static void vm_inode_zero_span(mips64_ctx_t *ctx, uint64_t page_va,
+                               uint64_t from, uint64_t to)
+{
+    uint8_t *p;
+    int hp;
+
+    if (ctx == NULL || from >= to || to > 4096u) {
+        return;
+    }
+    p = (uint8_t *)mips64_guest_ptr(ctx, page_va);
+    if (p == NULL) {
+        return;
+    }
+    hp = vm_inode_page_host_prot(page_va);
+    if (hp < 0) {
+        return;
+    }
+    if ((hp & PROT_WRITE) == 0) {
+        if (mprotect(p, 4096u, PROT_READ | PROT_WRITE) != 0) {
+            return;
+        }
+        (void)memset(p + from, 0, (size_t)(to - from));
+        (void)mprotect(p, 4096u, hp);
+        return;
+    }
+    (void)memset(p + from, 0, (size_t)(to - from));
+}
+
+/* Refresh one CLEAN guest span [glo, ghi) from the file at fpos
+ * (zeros past EOF). DIRTY pages never reach here. */
+static void vm_inode_refresh_span(mips64_ctx_t *ctx, int fd, uint64_t page_va,
+                                  uint64_t glo, uint64_t ghi, uint64_t fpos)
+{
+    uint8_t *p;
+    uint64_t from;
+    uint64_t to;
+    int hp;
+    ssize_t got;
+
+    if (ctx == NULL || fd < 0 || glo >= ghi) {
+        return;
+    }
+    from = glo - (page_va & ~(uint64_t)4095U);
+    to = ghi - (page_va & ~(uint64_t)4095U);
+    if (to > 4096u) {
+        return;
+    }
+    p = (uint8_t *)mips64_guest_ptr(ctx, page_va & ~(uint64_t)4095U);
+    if (p == NULL) {
+        return;
+    }
+    hp = vm_inode_page_host_prot(page_va & ~(uint64_t)4095U);
+    if (hp < 0) {
+        return;
+    }
+    if ((hp & PROT_WRITE) == 0 &&
+        mprotect(p, 4096u, PROT_READ | PROT_WRITE) != 0) {
+        return;
+    }
+    got = pread(fd, p + from, (size_t)(to - from), (off_t)fpos);
+    if (got < 0) {
+        got = 0;
+    }
+    if ((uint64_t)got < to - from) {
+        (void)memset(p + from + (uint64_t)got, 0,
+                     (size_t)(to - from - (uint64_t)got));
+    }
+    if ((hp & PROT_WRITE) == 0) {
+        (void)mprotect(p, 4096u, hp);
+    }
+}
+
+void mips_vm_file_map_hook(mips64_ctx_t *ctx, int fd, uint64_t va,
+                           uint64_t len, uint64_t file_offset,
+                           uint32_t prot, int is_shared)
+{
+    struct stat st;
+    vm_inode_t *in;
+    long hps;
+    int native = 0;
+
+    (void)prot;
+    if (ctx == NULL || fd < 0 || len == 0u) {
+        return;
+    }
+    if (fstat(fd, &st) != 0) {
+        return;
+    }
+    (void)pthread_mutex_lock(&vm_inode_mu);
+    in = vm_inode_lookup((uint64_t)st.st_dev, (uint64_t)st.st_ino, 1,
+                         (uint64_t)st.st_size);
+    if (in == NULL) {
+        (void)pthread_mutex_unlock(&vm_inode_mu);
+        return;
+    }
+    if (in->size != (uint64_t)st.st_size) {
+        in->size = (uint64_t)st.st_size;
+        in->resize_seq++;
+    }
+    /* MAP_SHARED goes native (writes through) when the host page
+     * size divides everything: the fixed mapping preserves the
+     * uniform arena addend and the kernel owns coherence. */
+    hps = sysconf(_SC_PAGESIZE);
+    if (is_shared != 0 && hps == 4096L && (va & 4095u) == 0u &&
+        (len & 4095u) == 0u && (file_offset & 4095u) == 0u) {
+        void *at = mmap((void *)(uintptr_t)(ctx->guest_base + va),
+                        (size_t)len, PROT_READ | PROT_WRITE,
+                        MAP_SHARED | MAP_FIXED, fd,
+                        (off_t)file_offset);
+
+        if (at != MAP_FAILED) {
+            native = 1;
+        }
+    }
+    if ((unsigned)in->nmaps < VM_INODE_MAPS) {
+        vm_inode_map_t *m = &in->maps[in->nmaps];
+
+        m->va = va;
+        m->len = len;
+        m->file_offset = file_offset;
+        m->shared = is_shared;
+        m->native = native;
+        in->nmaps++;
+    } else {
+        in->wide = 1;
+    }
+    (void)pthread_mutex_unlock(&vm_inode_mu);
+    /* Private maps start COW_CLEAN (never guest-written): the first
+     * store promotes through the miss path. Shared-anon fallbacks
+     * stay unmarked (direct-mapped, like any anonymous page). */
+    if (native == 0 && is_shared == 0) {
+        mips_vm_pages_mark(va, len, (unsigned)MIPS_VM_PAGE_COW_CLEAN);
+    }
+}
+
+static void vm_inode_invalidate_maps(vm_inode_t *in, uint64_t lo,
+                                       uint64_t hi)
+{
+    int i;
+
+    if (in->wide != 0) {
+        dbt_invalidate_all();
+        return;
+    }
+    for (i = 0; i < in->nmaps; i++) {
+        uint64_t s = in->maps[i].va;
+        uint64_t e = s + in->maps[i].len;
+
+        if (e <= lo || s >= hi) {
+            continue;
+        }
+        dbt_invalidate_range(s, e - s);
+    }
+}
+
+void mips_vm_file_post_write(mips64_ctx_t *ctx, int fd, uint64_t off,
+                             uint64_t n)
+{
+    struct stat st;
+    vm_inode_t *in;
+    int i;
+
+    if (ctx == NULL || fd < 0 || n == 0u) {
+        return;
+    }
+    if (fstat(fd, &st) != 0) {
+        return;
+    }
+    (void)pthread_mutex_lock(&vm_inode_mu);
+    in = vm_inode_lookup((uint64_t)st.st_dev, (uint64_t)st.st_ino, 0, 0u);
+    if (in == NULL) {
+        (void)pthread_mutex_unlock(&vm_inode_mu);
+        return;
+    }
+    if (in->size != (uint64_t)st.st_size) {
+        in->size = (uint64_t)st.st_size;
+        in->resize_seq++;
+    }
+    uint64_t wend = (off + n < off) ? ~(uint64_t)0u : off + n;
+
+    for (i = 0; i < in->nmaps; i++) {
+        vm_inode_map_t *m = &in->maps[i];
+        uint64_t mlo = m->va;
+        uint64_t mhi = m->va + m->len;
+        uint64_t page;
+
+        if (m->native != 0) {
+            continue;
+        }
+        for (page = mlo & ~(uint64_t)4095U; page < mhi;
+             page += 4096u) {
+            /* Mapped span of this host page (sub-page edges when
+             * the record itself is unaligned). */
+            uint64_t ps = page < mlo ? mlo : page;
+            uint64_t pe = page + 4096u > mhi ? mhi : page + 4096u;
+            uint64_t fbase;
+            uint64_t flo;
+            uint64_t fhi;
+            unsigned fl;
+
+            if (ps >= pe || page + 4096u < page) {
+                if (page + 4096u < page) {
+                    break;
+                }
+                continue;
+            }
+            fbase = m->file_offset + (ps - mlo);
+            flo = fbase > off ? fbase : off;
+            fhi = fbase + (pe - ps) < wend ? fbase + (pe - ps) : wend;
+            if (flo >= fhi) {
+                continue;
+            }
+            /* CLEAN pages show the file: refresh the overlapped
+             * span (zeros past EOF). DIRTY pages stay. */
+            fl = mips_vm_page_flags(page >> 12);
+            if ((fl & (unsigned)MIPS_VM_PAGE_COW_CLEAN) != 0u) {
+                vm_inode_refresh_span(ctx, fd, page, ps + (flo - fbase),
+                                      ps + (fhi - fbase), flo);
+            }
+        }
+    }
+    vm_inode_invalidate_maps(in, off, wend);
+    (void)pthread_mutex_unlock(&vm_inode_mu);
+}
+
+static void vm_inode_post_truncate_locked(mips64_ctx_t *ctx, vm_inode_t *in,
+                                          uint64_t newsize)
+{
+    int i;
+
+    in->size = newsize;
+    in->resize_seq++;
+    for (i = 0; i < in->nmaps; i++) {
+        vm_inode_map_t *m = &in->maps[i];
+        uint64_t mlo = m->va;
+        uint64_t mhi = m->va + m->len;
+        uint64_t page;
+
+        if (m->native != 0) {
+            continue;
+        }
+        for (page = mlo & ~(uint64_t)4095U; page < mhi;
+             page += 4096u) {
+            /* Mapped span of this host page (sub-page edges when
+             * the record itself is unaligned). */
+            uint64_t ps = page < mlo ? mlo : page;
+            uint64_t pe = page + 4096u > mhi ? mhi : page + 4096u;
+            uint64_t fbase;
+            unsigned fl;
+
+            if (ps >= pe || page + 4096u < page) {
+                if (page + 4096u < page) {
+                    break;
+                }
+                continue;
+            }
+            fbase = m->file_offset + (ps - mlo);
+            fl = mips_vm_page_flags(page >> 12);
+            if (fbase >= newsize) {
+                /* Wholly removed: CLEAN pages observe clean bytes
+                 * (zero); DIRTY private pages are the guest's. */
+                if ((fl & (unsigned)MIPS_VM_PAGE_COW_CLEAN) != 0u) {
+                    vm_inode_zero_span(ctx, page, ps - page, pe - page);
+                }
+            } else if (fbase + (pe - ps) > newsize) {
+                /* Partial tail: zero MAP_SHARED and CLEAN pages,
+                 * leave DIRTY private pages intact. */
+                if (m->shared != 0 ||
+                    (fl & (unsigned)MIPS_VM_PAGE_COW_CLEAN) != 0u) {
+                    vm_inode_zero_span(ctx, page,
+                                       ps - page + (newsize - fbase),
+                                       pe - page);
+                }
+            }
+        }
+    }
+    vm_inode_invalidate_maps(in, 0u, ~(uint64_t)0u);
+}
+
+/* Sequential-write variant: recover the range from the current
+ * file position (position after the write minus the byte count).
+ * Falls back to a full-inode refresh when the position is
+ * unknowable. */
+void mips_vm_file_post_write_seq(mips64_ctx_t *ctx, int fd, uint64_t n)
+{
+    off_t cur;
+
+    if (ctx == NULL || fd < 0 || n == 0u) {
+        return;
+    }
+    cur = lseek(fd, 0, SEEK_CUR);
+    if (cur < 0 || (uint64_t)cur < n) {
+        /* Unknowable position: refresh the whole inode rather than
+         * risk a stale CLEAN page. */
+        mips_vm_file_post_write(ctx, fd, 0u, ~(uint64_t)0u);
+        return;
+    }
+    mips_vm_file_post_write(ctx, fd, (uint64_t)cur - n, n);
+}
+
+void mips_vm_file_post_truncate_fd(mips64_ctx_t *ctx, int fd,
+                                   uint64_t newsize)
+{
+    struct stat st;
+    vm_inode_t *in;
+
+    if (ctx == NULL || fd < 0) {
+        return;
+    }
+    if (fstat(fd, &st) != 0) {
+        return;
+    }
+    (void)pthread_mutex_lock(&vm_inode_mu);
+    in = vm_inode_lookup((uint64_t)st.st_dev, (uint64_t)st.st_ino, 0, 0u);
+    if (in != NULL) {
+        vm_inode_post_truncate_locked(ctx, in, newsize);
+    }
+    (void)pthread_mutex_unlock(&vm_inode_mu);
+}
+
+void mips_vm_file_post_truncate_path(mips64_ctx_t *ctx,
+                                     const char *host_path,
+                                     uint64_t newsize)
+{
+    struct stat st;
+    vm_inode_t *in;
+    int fd;
+
+    if (ctx == NULL || host_path == NULL) {
+        return;
+    }
+    fd = open(host_path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        return;
+    }
+    if (fstat(fd, &st) != 0) {
+        (void)close(fd);
+        return;
+    }
+    (void)close(fd);
+    (void)pthread_mutex_lock(&vm_inode_mu);
+    in = vm_inode_lookup((uint64_t)st.st_dev, (uint64_t)st.st_ino, 0, 0u);
+    if (in != NULL) {
+        vm_inode_post_truncate_locked(ctx, in, newsize);
+    }
+    (void)pthread_mutex_unlock(&vm_inode_mu);
 }

@@ -24,6 +24,7 @@
  */
 
 #include "core/cpu.h"
+#include "vm/vm_pages.h"
 
 #include <errno.h>
 #include <pthread.h>
@@ -406,6 +407,11 @@ int mips_mem_unmap(mips64_ctx_t *ctx, uint64_t va, uint64_t len)
     }
     g_region_count = w;
     dbt_invalidate_range(va, len);
+    /* Drop the released pages' gate flags (stale rows are safe but
+     * unbounded growth is not). */
+    mips_vm_pages_clear(va, len,
+                        (unsigned)(MIPS_VM_PAGE_COW_CLEAN |
+                                   MIPS_VM_PAGE_HAS_CODE));
     mem_unlock();
     mips_qs_commit(ctx);
     return 0;

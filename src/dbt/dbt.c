@@ -31,6 +31,7 @@
 #include "dbt/emit_mem.h"
 #include "interp/decode.h"
 #include "os/backend.h"
+#include "vm/vm_pages.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -76,16 +77,22 @@ void dbt_invalidate_all(void)
     dbt_smc_epoch++;
     if (dbt_smc_epoch == 0)
         dbt_smc_epoch = 1;
+    /* Drop every code mark with the translations: the next fill
+     * re-marks whatever recompiles (the write gate reopens). */
+    mips_vm_pages_clear(0u, ~(uint64_t)0u,
+                        (unsigned)MIPS_VM_PAGE_HAS_CODE);
 }
 
 void dbt_invalidate_range(uint64_t va, uint64_t len)
 {
-    (void)va;
-    (void)len;
-    /* Range-granular SMC tracking lands with the L2a syscall hooks; a
-     * full epoch bump keeps every stale translation unreachable, and
-     * the per-entry guest-word snapshot below retires translations
-     * clobbered by plain stores without any hook. */
+    /* Retire the code marks first so a racing fill cannot repopulate
+     * a write tag over a page whose translation just died; the epoch
+     * bump below keeps stale translations unreachable, and the
+     * per-entry guest-word snapshot retires translations clobbered
+     * by plain stores without any hook. */
+    if (len != 0u) {
+        mips_vm_pages_clear(va, len, (unsigned)MIPS_VM_PAGE_HAS_CODE);
+    }
     dbt_invalidate_all();
 }
 
@@ -460,6 +467,13 @@ int dbt_compile(mips64_ctx_t *ctx, uint64_t pc)
                      * worker leaf). The loader side lands with the
                      * code cache. */
                     mips_aot_note_block(pc, copy, nrows);
+                    /* The block's pages now carry translated code:
+                     * the write gate closes for them until an
+                     * invalidation retires the translation. */
+                    if (out_end > pc) {
+                        mips_vm_pages_mark(pc, out_end - pc,
+                                           (unsigned)MIPS_VM_PAGE_HAS_CODE);
+                    }
                 }
             }
         }

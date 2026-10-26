@@ -117,6 +117,10 @@ extern int64_t mips_sc_write(mips64_ctx_t *ctx, uint64_t fd, uint64_t buf,
 /* Lane U12 quiescence lease (src/os/quiesce.c). */
 extern void mips_qs_lease_enter(mips64_ctx_t *ctx);
 extern void mips_qs_lease_exit(mips64_ctx_t *ctx);
+/* Lane U12 Provider A file-map hook (src/vm/vm_file.c). */
+extern void mips_vm_file_map_hook(mips64_ctx_t *ctx, int fd, uint64_t va,
+                                  uint64_t len, uint64_t file_offset,
+                                  uint32_t prot, int is_shared);
 /* Phase 4 seams (lanes L4a/L4b/L4c). The (ctx, sp) signal seams read
  * their arguments from the guest registers; sp is reserved. */
 extern int64_t mips_sc_rt_sigaction(mips64_ctx_t *ctx, uint64_t sp);
@@ -402,6 +406,12 @@ static int64_t sc_mmap(mips64_ctx_t *ctx, uint64_t addr, uint64_t len,
             (void)mips_mem_unmap(ctx, va, size);
             return sc_ret(ctx, -(int64_t)ENOMEM);
         }
+        /* Lane U12 Provider A hook: inode/EOF tracking, COW_CLEAN
+         * marking for private maps, native shared remap when
+         * H-aligned. Best-effort; never fails the mapping. */
+        mips_vm_file_map_hook(ctx, (int)fd, va, size, offset,
+                              (uint32_t)(prot & 7U),
+                              (flags & MIPS_MAP_SHARED) != 0U ? 1 : 0);
     }
     return sc_ret(ctx, (int64_t)va);
 }

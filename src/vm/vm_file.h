@@ -30,4 +30,29 @@ extern const mips_provider_ops_t mips_provider_f;
 int mips_vmfile_map(mips_vm64_t *vm, int fd, uint64_t off, uint64_t va,
                     uint64_t len, uint32_t prot);
 
+/* Lane U12 live file-map hook: record the (dev, ino) identity and
+ * the mapping for EOF tracking, mark private pages COW_CLEAN, and
+ * take MAP_SHARED native (writes through) when the host page size
+ * divides va, len, and file_offset. Best-effort: never fails the
+ * mapping. is_shared mirrors the guest MAP_SHARED bit. */
+void mips_vm_file_map_hook(mips64_ctx_t *ctx, int fd, uint64_t va,
+                           uint64_t len, uint64_t file_offset,
+                           uint32_t prot, int is_shared);
+
+/* File-mutation hooks (called after a successful host mutation):
+ * grow/refresh CLEAN pages, zero discarded tails, drop wholly
+ * removed CLEAN pages, and retire translated code over the touched
+ * ranges. post_write covers write/pwrite64/pwritev (off_known selects
+ * the range; sequential writes pass off_known 0 and the hook reads
+ * the current file position). The truncate variants cover
+ * ftruncate (fd) and truncate (resolved host path). */
+void mips_vm_file_post_write(mips64_ctx_t *ctx, int fd, uint64_t off,
+                             uint64_t n);
+void mips_vm_file_post_write_seq(mips64_ctx_t *ctx, int fd, uint64_t n);
+void mips_vm_file_post_truncate_fd(mips64_ctx_t *ctx, int fd,
+                                   uint64_t newsize);
+void mips_vm_file_post_truncate_path(mips64_ctx_t *ctx,
+                                     const char *host_path,
+                                     uint64_t newsize);
+
 #endif /* MIPS64RT_VM_VM_FILE_H */

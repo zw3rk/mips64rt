@@ -74,6 +74,7 @@ BOOT_COMMON := src/main.c \
 	src/os/quiesce.c \
 	src/vm/vm64.c \
 	src/vm/vm_file.c \
+	src/vm/vm_pages.c \
 	src/dbt/a64_emit.c \
 	src/dbt/dbt.c \
 	src/dbt/mem_recover.c \
@@ -119,9 +120,11 @@ U0_SRCS := tests/test_u0_delay_tlb.c \
 	src/os/mem.c \
 	src/os/mem_table.c \
 	src/os/quiesce.c \
+	src/os/signal_core.c \
 	$(HOST_BACKEND) \
 	src/vm/vm64.c \
 	src/vm/vm_file.c \
+	src/vm/vm_pages.c \
 	src/dbt/aot/sites.c \
 	src/interp/decode.c \
 	src/dbt/a64_emit.c \
@@ -139,10 +142,22 @@ U0_SRCS := tests/test_u0_delay_tlb.c \
 FILL_SRCS := tests/test_u0_fill_retry.c \
 	$(filter-out tests/test_u0_delay_tlb.c,$(U0_SRCS))
 
+# Write-gate + Provider A gate: the U0 TU set plus the real
+# interpreter core (the gate test single-steps through recover with
+# interp_step, so the interp stubs used elsewhere will not do).
+GATE_SRCS := tests/test_u0_gate.c \
+	$(filter-out tests/test_u0_delay_tlb.c,$(U0_SRCS)) \
+	src/interp/interp.c \
+	src/interp/unaligned.c \
+	src/interp/fpmove.c \
+	src/interp/fp.c \
+	src/interp/fp_cvt.c \
+	src/interp/fp_ps.c
+
 # Lane U12: host-native sibling of `build` for macOS/Apple Silicon.
 # Same TU list, host C compiler, PIE without `-static-pie` (the macOS
 # linker rejects it). AArch64-only (the trampoline is A64 assembly).
-build-darwin: $(BUILD)/mips64rt-darwin $(BUILD)/test_u0_delay_tlb $(BUILD)/test_u0_fill_retry
+build-darwin: $(BUILD)/mips64rt-darwin $(BUILD)/test_u0_delay_tlb $(BUILD)/test_u0_fill_retry $(BUILD)/test_u0_gate
 
 $(BUILD)/mips64rt-darwin: $(DARWIN_SRCS) src/core/cpu.h src/os/syscall_nr.h src/os/host_compat.h src/dbt/emit_mem.h
 	@mkdir -p $(BUILD)
@@ -156,6 +171,10 @@ $(BUILD)/test_u0_fill_retry: $(FILL_SRCS) src/core/cpu.h src/os/backend.h src/vm
 	@mkdir -p $(BUILD)
 	$(HOST_CC) -std=c11 -Werror=vla -pedantic -Wall -Wextra -Werror -pthread $(INCLUDES) $(FILL_SRCS) -o $@
 
+$(BUILD)/test_u0_gate: $(GATE_SRCS) src/core/cpu.h src/os/backend.h src/vm/vm64.h src/vm/vm_file.h src/vm/vm_pages.h src/dbt/dbt.h
+	@mkdir -p $(BUILD)
+	$(HOST_CC) -std=c11 -Werror=vla -pedantic -Wall -Wextra -Werror -pthread $(INCLUDES) $(GATE_SRCS) -o $@
+
 check: build check-line-limits
 	@$(CC) $(CFLAGS) $(INCLUDES) -fsyntax-only src/core/cpu.h src/os/syscall_nr.h
 	@if [ "$$(uname -s)" = "Linux" ] && [ "$$(uname -m)" = "aarch64" ]; then \
@@ -166,7 +185,7 @@ check: build check-line-limits
 	fi
 	@if [ -f tests/check_abi_invariants.c ]; then $(MAKE) check-abi-invariants; fi
 	@if [ -f tests/test_decode.c ]; then \
-		$(HOST_CC) -std=c11 -Werror=vla -pedantic -Wall -Wextra -Werror -pthread -Isrc tests/test_decode.c src/interp/decode.c src/os/mem.c src/os/mem_table.c $(HOST_BACKEND) tests/stubs_signal.c -o $(BUILD)/test_decode && $(BUILD)/test_decode; \
+		$(HOST_CC) -std=c11 -Werror=vla -pedantic -Wall -Wextra -Werror -pthread -Isrc tests/test_decode.c src/interp/decode.c src/os/mem.c src/os/mem_table.c src/vm/vm_pages.c $(HOST_BACKEND) tests/stubs_signal.c -o $(BUILD)/test_decode && $(BUILD)/test_decode; \
 	fi
 
 check-line-limits:

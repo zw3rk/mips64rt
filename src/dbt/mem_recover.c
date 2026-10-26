@@ -28,6 +28,8 @@
 #include "dbt/emit_mem.h"
 #include "interp/decode.h"
 #include "os/backend.h"
+#include "os/signal_core.h"
+#include "vm/vm_pages.h"
 
 /* Retry/step contract: 0 means the word ran again (retry
  * scheduled: the caller clears the exit and continues), 1 means a
@@ -418,6 +420,59 @@ int dbt_mem_recover(mips64_ctx_t *ctx, const dbt_mem_site_t *site,
     mips_soft_tlb_fill(ctx, base);
     if (((base + len - 1u) >> 12) != (base >> 12)) {
         mips_soft_tlb_fill(ctx, base + len - 1u);
+    }
+    if (need == (uint32_t)MIPS_PROT_WRITE &&
+        d.op != 0x38u && d.op != 0x3Cu) {
+        /* Write-gate remedies (plain stores only; the interp
+         * validates SC exclusives itself). The fill above may still
+         * leave write_tag closed: COW_CLEAN promotes, HAS_CODE
+         * retires the translation first (SMC), and a same-page LL
+         * reservation clears (any store does). Refill afterwards;
+         * if the gate is still closed the page state changed under
+         * us and the fault is genuine. */
+        uint64_t p0 = base >> 12;
+        uint64_t p1 = (base + len - 1u) >> 12;
+        unsigned f0 = mips_vm_page_flags(p0);
+        unsigned f1 = (p1 == p0) ? 0u : mips_vm_page_flags(p1);
+        unsigned both = f0 | f1;
+        int fixed = 0;
+
+        if ((both & (unsigned)MIPS_VM_PAGE_COW_CLEAN) != 0u) {
+            mips_vm_pages_clear(base, len,
+                                (unsigned)MIPS_VM_PAGE_COW_CLEAN);
+            fixed = 1;
+        }
+        if ((both & (unsigned)MIPS_VM_PAGE_HAS_CODE) != 0u) {
+            dbt_invalidate_range(base, len);
+            fixed = 1;
+        }
+        if (ctx->llbit != 0u &&
+            ((ctx->lladdr >> 12) == p0 || (ctx->lladdr >> 12) == p1)) {
+            mips64_ctx_clear_ll(ctx);
+            fixed = 1;
+        }
+        if (fixed != 0) {
+            mips_soft_tlb_fill(ctx, base);
+            if (p1 != p0) {
+                mips_soft_tlb_fill(ctx, base + len - 1u);
+            }
+        }
+        {
+            mips_soft_tlb_entry_t *tlb =
+                (mips_soft_tlb_entry_t *)mips_soft_tlb_base(ctx);
+
+            if (tlb == NULL ||
+                tlb[p0 & MIPS64_SOFT_TLB_INDEX_MASK].write_tag !=
+                    (p0 << 12) ||
+                (p1 != p0 &&
+                 tlb[p1 & MIPS64_SOFT_TLB_INDEX_MASK].write_tag !=
+                     (p1 << 12))) {
+                ctx->pc = slot_pc;
+                dbt_trace_fault_prefix(ctx, block_pc, slot_pc);
+                mips_fault(ctx, base);
+                return 2;
+            }
+        }
     }
     if (site != NULL &&
         (site->flags & (uint8_t)DBT_MEM_F_IN_DELAY_SLOT) != 0u) {

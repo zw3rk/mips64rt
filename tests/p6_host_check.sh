@@ -99,6 +99,10 @@ timeout --kill-after=30s 200s $NIX_GCC -static-pie -fPIE \
 	src/os/futex.c \
 	src/os/exec.c \
 	src/os/quiesce.c \
+	src/vm/vm64.c \
+	src/vm/vm_file.c \
+	src/vm/vm_pages.c \
+	src/os/backend_linux.c \
 	src/dbt/a64_emit.c \
 	src/dbt/dbt.c \
 	src/dbt/mem_recover.c \

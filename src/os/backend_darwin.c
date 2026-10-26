@@ -13,6 +13,7 @@
  */
 
 #include "os/backend.h"
+#include "vm/vm_pages.h"
 
 #include <pthread.h>
 #include <stddef.h>
@@ -215,8 +216,8 @@ void mips_soft_tlb_fill(mips64_ctx_t *ctx, uint64_t va)
     /* The write gate fires here: write_tag is populated only for
      * region-writable pages that also pass the page-state gate (no
      * COW-clean/file page, no translated code, no LL reservation).
-     * The page-state restrictions land with the Provider A wiring;
-     * until then the region prot decides. */
+     * The reservation is the filler's inline check (per-thread ctx,
+     * no table); the page flags live in src/vm/vm_pages.c. */
     if (mips_mem_ok(ctx, page, 4096U, (uint32_t)MIPS_PROT_READ)) {
         e->read_tag = page;
         e->addend = (uintptr_t)ctx->guest_base;
@@ -224,7 +225,9 @@ void mips_soft_tlb_fill(mips64_ctx_t *ctx, uint64_t va)
         e->read_tag = UINT64_MAX;
         e->addend = 0U;
     }
-    if (mips_mem_ok(ctx, page, 4096U, (uint32_t)MIPS_PROT_WRITE)) {
+    if (mips_mem_ok(ctx, page, 4096U, (uint32_t)MIPS_PROT_WRITE) &&
+        mips_vm_page_writable(vpn) &&
+        (ctx->llbit == 0U || (ctx->lladdr >> 12) != vpn)) {
         e->write_tag = page;
     } else {
         e->write_tag = UINT64_MAX;

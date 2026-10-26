@@ -725,6 +725,13 @@ int64_t mips_sc_unlink(mips64_ctx_t *ctx, uint64_t path_va)
     return mips_sc_unlinkat(ctx, (uint64_t)(int64_t)-100, path_va, 0U);
 }
 
+/* Lane U12 Provider A mutation hooks (src/vm/vm_file.c). */
+extern void mips_vm_file_post_truncate_path(mips64_ctx_t *ctx,
+                                            const char *host_path,
+                                            uint64_t newsize);
+extern void mips_vm_file_post_truncate_fd(mips64_ctx_t *ctx, int fd,
+                                          uint64_t newsize);
+
 int64_t mips_sc_truncate(mips64_ctx_t *ctx, uint64_t path_va,
                          uint64_t len)
 {
@@ -742,6 +749,8 @@ int64_t mips_sc_truncate(mips64_ctx_t *ctx, uint64_t path_va,
     if (truncate(full, (off_t)len) != 0) {
         return l2a_ret(ctx, -(int64_t)errno);
     }
+    /* Lane U12: EOF tracking + discarded-tail zeroing + SMC retire. */
+    mips_vm_file_post_truncate_path(ctx, full, len);
     return l2a_ret(ctx, 0);
 }
 
@@ -750,6 +759,7 @@ int64_t mips_sc_ftruncate(mips64_ctx_t *ctx, uint64_t fd, uint64_t len)
     if (ftruncate((int)fd, (off_t)len) != 0) {
         return l2a_ret(ctx, -(int64_t)errno);
     }
+    mips_vm_file_post_truncate_fd(ctx, (int)fd, len);
     return l2a_ret(ctx, 0);
 }
 
