@@ -1,11 +1,12 @@
 /* Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0
  *
- * Phase 2 lane L2b: AArch64 enter/exit trampoline. Saves the host
- * callee-saved registers, pins `x19` to the `mips64_ctx_t *` and
- * `x20` to the guest window base across compiled code, dispatches to
- * cached code, and returns the block's `w0` exit code to the C
- * dispatcher.
+ * Phase 2 lane L2b + U0 lane L-U0-C: AArch64 enter/exit trampoline.
+ * Saves the host callee-saved registers, pins `x19` to the
+ * `mips64_ctx_t *` and `x20` to the U0 soft-TLB base (`&tlb[0]` from
+ * `mips_soft_tlb_base(ctx)`, passed in `x1`) across compiled code,
+ * dispatches to cached code, and returns the block's `w0` exit code
+ * to the C dispatcher.
  *
  * Pure GAS assembly (no C preprocessor): the lane acceptance
  * assembles this file with raw `aarch64-unknown-linux-musl-as`, so
@@ -18,7 +19,7 @@
  *
  * `x18` is deliberately never touched here (it is the platform
  * register and may hold the host's thread state). The ctx layout is
- * not consulted: the base arrives as a plain argument, so no asm
+ * not consulted: the TLB base arrives as a plain argument, so no asm
  * offset can drift from `src/core/cpu.h`.
  */
 
@@ -38,7 +39,7 @@ mips64_dbt_enter:
     stp x23, x24, [sp, #-16]!
     stp x25, x26, [sp, #-16]!
     stp x27, x28, [sp, #-16]!
-    /* Pin the guest context and window base, enter generated code. */
+    /* Pin the guest context and U0 soft-TLB base, enter code. */
     mov x19, x0
     mov x20, x1
     blr x2

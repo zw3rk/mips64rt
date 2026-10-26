@@ -170,6 +170,10 @@ int ei_regimm_trap(a64_emit_t *e, const mips_dec_t *d, uint64_t pc, int slot);
 int ei_cop(a64_emit_t *e, const mips_dec_t *d, uint64_t pc, int slot);
 
 /* ---- emit_mem.c: loads, stores, unaligned words, LL/SC ---- */
+/* U0 7-instruction soft-TLB probe (entry EI_A = guest VA, x20 = TLB
+ * base; hit falls through with x4 = entry pointer, miss slot
+ * returned for the shared fault epilogue). Preserves x0, never x18. */
+size_t ei_tlb_probe(a64_emit_t *e);
 int ei_mem_aligned(a64_emit_t *e, const mips_dec_t *d, uint64_t pc, int be);
 int ei_unaligned(a64_emit_t *e, const mips_dec_t *d, uint64_t pc, int is_load,
                  int is_d, int be, int mode, int dir, unsigned cval);

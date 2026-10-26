@@ -13,11 +13,15 @@
  * (per-context copies go stale at clone, so they are not consulted).
  *
  * Endianness (mips_is_be): bytes are assembled explicitly so the code is
- * host-endian independent. guest_ld/st16/32/64 are aligned-only and
- * report MIPS_FAULT on a misaligned address; unaligned pairs compose via
- * guest_ld/st8 (lane L1b). Accesses outside recorded regions (or with
- * insufficient permission) report MIPS_FAULT via mips_fault, which
- * records EXIT_FAULT and stashes the fault address in exit_info.
+ * host-endian independent. guest_ld/st16/32/64 fault on a misaligned
+ * address through the U0 TIF_FIXADE gate (lane L-U0-C): when
+ * mips_fixade_enabled(ctx) (default 1) the access is emulated
+ * byte-wise via guest_ld/st8; when disabled it traps guest SIGBUS
+ * with the BUS_ADRALN code via mips_bus_fault — never SIGSEGV.
+ * The sysmips MIPS_FIXADE hook is mips_fixade_ctl (backend.h).
+ * Accesses outside recorded regions (or with insufficient
+ * permission) report MIPS_FAULT via mips_fault, which records
+ * EXIT_FAULT and stashes the fault address in exit_info.
  * 64-bit guest VAs are never truncated.
  *
  * W^X: host PROT_EXEC is never granted; the interpreter fetches via
@@ -25,6 +29,7 @@
  */
 
 #include "core/cpu.h"
+#include "os/backend.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -63,6 +68,72 @@ void mips_fault(mips64_ctx_t *ctx, uint64_t addr)
                       (unsigned long long)ctx->pc,
                       (unsigned long long)addr);
     }
+}
+
+/* U0 TIF_FIXADE gate: emulate one unaligned integer load/store
+ * byte-wise (kernel do_ade semantics) when fixade is enabled;
+ * otherwise trap guest SIGBUS/BUS_ADRALN. The byte loop re-checks
+ * permissions per byte, so a span crossing an unmapped page still
+ * faults (as SIGSEGV, the page-fault signal) on the missing byte. */
+static int mem_fix_emulate(mips64_ctx_t *ctx, uint64_t va)
+{
+    if (ctx == NULL) {
+        return MIPS_FAULT;
+    }
+    if (mips_fixade_enabled(ctx) != 0) {
+        return 0;
+    }
+    mips_bus_fault(ctx, va);
+    return MIPS_FAULT;
+}
+
+static int mem_fix_ld(mips64_ctx_t *ctx, uint64_t va, unsigned size,
+                      uint64_t *out)
+{
+    unsigned i;
+    uint64_t v = 0U;
+
+    if (mem_fix_emulate(ctx, va) != 0 || out == NULL) {
+        return MIPS_FAULT;
+    }
+    for (i = 0U; i < size; i++) {
+        uint64_t t = 0U;
+
+        if (guest_ld8(ctx, va + (uint64_t)i, &t) != 0) {
+            return MIPS_FAULT;
+        }
+        if (mips_is_be(ctx) != 0) {
+            v = (v << 8) | (t & 0xFFU);
+        } else {
+            v |= (t & 0xFFU) << (8U * i);
+        }
+    }
+    *out = v;
+    return 0;
+}
+
+static int mem_fix_st(mips64_ctx_t *ctx, uint64_t va, unsigned size,
+                      uint64_t val)
+{
+    unsigned i;
+
+    if (mem_fix_emulate(ctx, va) != 0) {
+        return MIPS_FAULT;
+    }
+    for (i = 0U; i < size; i++) {
+        uint64_t b;
+
+        if (mips_is_be(ctx) != 0) {
+            b = (val >> (8U * (size - 1U - i))) & 0xFFU;
+        } else {
+            b = (val >> (8U * i)) & 0xFFU;
+        }
+        if (guest_st8(ctx, va + (uint64_t)i, b) != 0) {
+            return MIPS_FAULT;
+        }
+    }
+    ctx->llbit = 0U; /* E05: any ordinary store clears the reservation */
+    return 0;
 }
 
 int guest_ld8(mips64_ctx_t *ctx, uint64_t va, uint64_t *out)
@@ -106,8 +177,7 @@ int guest_ld16(mips64_ctx_t *ctx, uint64_t va, uint64_t *out)
         return MIPS_FAULT;
     }
     if ((va & 1U) != 0U) {
-        mips_fault(ctx, va);
-        return MIPS_FAULT;
+        return mem_fix_ld(ctx, va, 2U, out);
     }
     if (!mips_mem_ok(ctx, va, 2U, MIPS_PROT_READ)) {
         mips_fault(ctx, va);
@@ -130,8 +200,7 @@ int guest_st16(mips64_ctx_t *ctx, uint64_t va, uint64_t val)
         return MIPS_FAULT;
     }
     if ((va & 1U) != 0U) {
-        mips_fault(ctx, va);
-        return MIPS_FAULT;
+        return mem_fix_st(ctx, va, 2U, val);
     }
     if (!mips_mem_ok(ctx, va, 2U, MIPS_PROT_WRITE)) {
         mips_fault(ctx, va);
@@ -157,8 +226,7 @@ int guest_ld32(mips64_ctx_t *ctx, uint64_t va, uint64_t *out)
         return MIPS_FAULT;
     }
     if ((va & 3U) != 0U) {
-        mips_fault(ctx, va);
-        return MIPS_FAULT;
+        return mem_fix_ld(ctx, va, 4U, out);
     }
     if (!mips_mem_ok(ctx, va, 4U, MIPS_PROT_READ)) {
         mips_fault(ctx, va);
@@ -183,8 +251,7 @@ int guest_st32(mips64_ctx_t *ctx, uint64_t va, uint64_t val)
         return MIPS_FAULT;
     }
     if ((va & 3U) != 0U) {
-        mips_fault(ctx, va);
-        return MIPS_FAULT;
+        return mem_fix_st(ctx, va, 4U, val);
     }
     if (!mips_mem_ok(ctx, va, 4U, MIPS_PROT_WRITE)) {
         mips_fault(ctx, va);
@@ -214,8 +281,7 @@ int guest_ld64(mips64_ctx_t *ctx, uint64_t va, uint64_t *out)
         return MIPS_FAULT;
     }
     if ((va & 7U) != 0U) {
-        mips_fault(ctx, va);
-        return MIPS_FAULT;
+        return mem_fix_ld(ctx, va, 8U, out);
     }
     if (!mips_mem_ok(ctx, va, 8U, MIPS_PROT_READ)) {
         mips_fault(ctx, va);
@@ -244,8 +310,7 @@ int guest_st64(mips64_ctx_t *ctx, uint64_t va, uint64_t val)
         return MIPS_FAULT;
     }
     if ((va & 7U) != 0U) {
-        mips_fault(ctx, va);
-        return MIPS_FAULT;
+        return mem_fix_st(ctx, va, 8U, val);
     }
     if (!mips_mem_ok(ctx, va, 8U, MIPS_PROT_WRITE)) {
         mips_fault(ctx, va);

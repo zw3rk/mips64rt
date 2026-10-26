@@ -31,8 +31,15 @@ BUILD := _build
 # RC6 integration adds the L6a host-contract surface (arg parsing) and
 # the Class-B cache/family providers it consumes (digest, leaf,
 # broker rendezvous).
+# U0 lane L-U0-C: exactly one OS backend links into the binary.
+ifeq ($(shell uname -s),Darwin)
+OS_BACKEND := src/os/backend_darwin.c
+else
+OS_BACKEND := src/os/backend_linux.c
+endif
 BOOT_SRCS := src/main.c \
 	src/os/host_args.c \
+	$(OS_BACKEND) \
 	src/rt64/aot/sha256.c \
 	src/rt64/aot/identity.c \
 	src/rt64/runtime/family_broker.c \
@@ -67,12 +74,13 @@ BOOT_SRCS := src/main.c \
 	src/dbt/trampoline_a64.S \
 	src/loader.c
 
-.PHONY: help build build-cross check check-line-limits check-abi-invariants clean
+.PHONY: help build build-cross build-darwin check check-line-limits check-abi-invariants clean
 
 help:
 	@echo "Targets:"
 	@echo "  build                 build $(BUILD)/mips64rt with \$$(CC)"
 	@echo "  build-cross           build static-PIE with \$$(CROSS_CC)"
+	@echo "  build-darwin          build native test_u0_delay_tlb (lane L-U0-C)"
 	@echo "  check                 build + check-line-limits + self-checks"
 	@echo "  check-line-limits     every .c/.h/.S under src/ is <= 900 lines"
 	@echo "  check-abi-invariants  build+run tests/check_abi_invariants (lane L0b)"
@@ -88,6 +96,31 @@ build-cross:
 	@mkdir -p $(BUILD)
 	$(CROSS_CC) -static-pie -fPIE $(CFLAGS) $(INCLUDES) $(BOOT_SRCS) -o $(BUILD)/mips64rt-aarch64
 
+# Lane L-U0-C: native host build of the delay-slot + TIF_FIXADE
+# prototype gate (no cross toolchain, no guest execution; the DBT
+# words are asserted structurally, never executed).
+U0_SRCS := tests/test_u0_delay_tlb.c \
+	src/os/mem.c \
+	src/os/mem_table.c \
+	$(OS_BACKEND) \
+	src/vm/vm64.c \
+	src/vm/vm_file.c \
+	src/interp/decode.c \
+	src/dbt/a64_emit.c \
+	src/dbt/emit_enc.c \
+	src/dbt/emit_alu.c \
+	src/dbt/emit_mem.c \
+	src/dbt/emit_int.c \
+	src/dbt/emit_fp.c \
+	src/dbt/dbt.c \
+	src/dbt/trampoline_a64.S
+
+build-darwin: $(BUILD)/test_u0_delay_tlb
+
+$(BUILD)/test_u0_delay_tlb: $(U0_SRCS) src/core/cpu.h src/os/backend.h src/vm/vm64.h src/vm/vm_file.h src/dbt/dbt.h
+	@mkdir -p $(BUILD)
+	$(HOST_CC) -std=c11 -Werror=vla -pedantic -Wall -Wextra -Werror -pthread $(INCLUDES) $(U0_SRCS) -o $@
+
 check: build check-line-limits
 	@$(CC) $(CFLAGS) $(INCLUDES) -fsyntax-only src/core/cpu.h src/os/syscall_nr.h
 	@if [ "$$(uname -s)" = "Linux" ] && [ "$$(uname -m)" = "aarch64" ]; then \
@@ -98,7 +131,7 @@ check: build check-line-limits
 	fi
 	@if [ -f tests/check_abi_invariants.c ]; then $(MAKE) check-abi-invariants; fi
 	@if [ -f tests/test_decode.c ]; then \
-		$(HOST_CC) -std=c11 -Werror=vla -pedantic -Wall -Wextra -Werror -pthread -Isrc tests/test_decode.c src/interp/decode.c src/os/mem.c src/os/mem_table.c tests/stubs_signal.c -o $(BUILD)/test_decode && $(BUILD)/test_decode; \
+		$(HOST_CC) -std=c11 -Werror=vla -pedantic -Wall -Wextra -Werror -pthread -Isrc tests/test_decode.c src/interp/decode.c src/os/mem.c src/os/mem_table.c $(OS_BACKEND) tests/stubs_signal.c -o $(BUILD)/test_decode && $(BUILD)/test_decode; \
 	fi
 
 check-line-limits:
