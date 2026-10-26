@@ -13,8 +13,9 @@
  * construction. FP/COP1 blocks never reach the emitter: the compile
  * scan hands them to `interp_step` until Phase 3.
  *
- * Host register discipline (frozen, see `src/dbt/dbt.h`): `x19` pins
- * the `mips64_ctx_t *`, `x20` pins `ctx->guest_base`, guest `$0`
+ * Host register discipline (see `src/dbt/dbt.h`; U0 lane rebinds
+ * `x20`): `x19` pins the `mips64_ctx_t *`, `x20` pins the U0
+ * soft-TLB base, guest `$0`
  * reads as `wzr`, everything else is memory-backed in `ctx`, and
  * `x18` is never touched anywhere in `src/dbt/`.
  */
@@ -27,6 +28,7 @@
 
 #include "core/cpu.h"
 #include "interp/decode.h"
+#include "os/backend.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -88,6 +90,37 @@ void dbt_invalidate_range(uint64_t va, uint64_t len)
 uint64_t dbt_epoch(void)
 {
     return dbt_smc_epoch;
+}
+
+/* ------------------------------------------------------------------ */
+/* U0 delay-slot NPC + soft-TLB prefill (lane L-U0-C).                */
+/* ------------------------------------------------------------------ */
+
+int dbt_npc_resume(mips64_ctx_t *ctx)
+{
+    uint64_t applied = 0U;
+
+    return mips_npc_resume_step(ctx, &applied);
+}
+
+void dbt_u0_prefill(mips64_ctx_t *ctx, uint64_t start, uint64_t end)
+{
+    uint64_t va;
+
+    if (ctx == NULL || end <= start) {
+        return;
+    }
+    /* One fill per 4 KiB page in the block span; misses fault to
+     * the interp_step fallback by construction, so a short span
+     * stays correct even without this loop. */
+    va = start & ~(uint64_t)4095U;
+    while (va < end) {
+        mips_soft_tlb_fill(ctx, va);
+        if (va + 4096U < va) {
+            break;
+        }
+        va += 4096U;
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -564,6 +597,10 @@ int dbt_run(mips64_ctx_t *ctx)
 
         if (ctx->exit_reason != MIPS64_EXIT_NONE)
             return 1;
+        /* U0 dynamic NPC: a pending delay target (x25 in emitted
+         * code) selects the resume pc before the cache probe. */
+        dbt_npc_resume(ctx);
+        pc = ctx->pc;
         code = dbt_lookup(ctx, pc);
         if (code == NULL) {
             if (dbt_compile(ctx, pc) != 0) {
@@ -590,7 +627,10 @@ int dbt_run(mips64_ctx_t *ctx)
                 return rc;
             continue;
         }
-        dbt_ge.base = ctx->guest_base;
+        /* U0: x20 binds the soft-TLB base; prefill the block span
+         * so the inlined probe hits. */
+        dbt_u0_prefill(ctx, start, end);
+        dbt_ge.base = (uint64_t)(uintptr_t)mips_soft_tlb_base(ctx);
         dbt_ge.code = code;
         dbt_ge.ex = MIPS64_DBT_EXIT_FAULT;
         {

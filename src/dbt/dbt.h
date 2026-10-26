@@ -13,8 +13,10 @@
  * Host register map (frozen for lane L2c — `src/dbt/emit_int.c` codes
  * against exactly this):
  *   `x19` pins the `mips64_ctx_t *` across compiled code;
- *   `x20` pins the guest window base (`ctx->guest_base`), so guest
- *     effective addresses lower to `[x20, #addr]`-style sequences;
+ *   `x20` pins the U0 soft-TLB base (`mips_soft_tlb_base(ctx)` from
+ *     `src/os/backend.h`); guest addresses resolve through the
+ *     7-instruction probe in `src/dbt/emit_mem.c` (host address into
+ *     `x4`, `x0` preserved) instead of the legacy `[x20, #addr]` map;
  *   guest `$0` reads as `wzr` and writes to it are dropped;
  *   all other guest state stays spilled to `[x19, #off]` using the
  *     frozen `MIPS64_CTX_*_OFFSET` values from `src/core/cpu.h`;
@@ -95,6 +97,18 @@ typedef struct {
 /* True when this build can execute translated code (AArch64 host);
  * otherwise `--dbt` must report unavailable. */
 int mips64_dbt_available(void);
+
+/* U0 delay-slot NPC resume (lane L-U0-C): when a delay-target is
+ * pending (npc_mode RT_NPC_DYNAMIC_CTX, parked in x25 by emitted
+ * code), move it into pc/next_pc, clear it, and report 1; else 0.
+ * Called at the top of the dispatch loop; shares the backend
+ * mips_npc_resume_step helper so tests cover the same path. */
+int dbt_npc_resume(mips64_ctx_t *ctx);
+
+/* U0 soft-TLB prefill for one block span: fill every page in
+ * [start, end) so the probe hits inline (misses fault to the
+ * interp_step fallback by construction). */
+void dbt_u0_prefill(mips64_ctx_t *ctx, uint64_t start, uint64_t end);
 
 /* Enter compiled code: saves host callee-saved registers, pins
  * `x19 = ctx` and `x20 = base`, calls `code`, restores, and returns
