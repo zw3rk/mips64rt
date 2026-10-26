@@ -44,9 +44,8 @@ HOST_BACKEND := src/os/backend_linux.c
 ifeq ($(findstring darwin,$(shell $(HOST_CC) -dumpmachine 2>/dev/null)),darwin)
 HOST_BACKEND := src/os/backend_darwin.c
 endif
-BOOT_SRCS := src/main.c \
+BOOT_COMMON := src/main.c \
 	src/os/host_args.c \
-	$(OS_BACKEND) \
 	src/dbt/aot/sha256.c \
 	src/dbt/aot/identity.c \
 	src/os/family_broker.c \
@@ -71,6 +70,8 @@ BOOT_SRCS := src/main.c \
 	src/os/threads.c \
 	src/os/futex.c \
 	src/os/exec.c \
+	src/vm/vm64.c \
+	src/vm/vm_file.c \
 	src/dbt/a64_emit.c \
 	src/dbt/dbt.c \
 	src/dbt/emit_int.c \
@@ -80,6 +81,11 @@ BOOT_SRCS := src/main.c \
 	src/dbt/emit_fp.c \
 	src/dbt/trampoline_a64.S \
 	src/loader.c
+# Each artifact links the backend matching the compiler that builds
+# it: the cross/static-PIE binary uses OS_BACKEND (selected from CC),
+# the host-native Darwin binary uses HOST_BACKEND (from HOST_CC).
+BOOT_SRCS := $(BOOT_COMMON) $(OS_BACKEND)
+DARWIN_SRCS := $(BOOT_COMMON) $(HOST_BACKEND)
 
 .PHONY: help build build-cross build-darwin check check-line-limits check-abi-invariants clean
 
@@ -132,9 +138,9 @@ FILL_SRCS := tests/test_u0_fill_retry.c \
 # linker rejects it). AArch64-only (the trampoline is A64 assembly).
 build-darwin: $(BUILD)/mips64rt-darwin $(BUILD)/test_u0_delay_tlb $(BUILD)/test_u0_fill_retry
 
-$(BUILD)/mips64rt-darwin: $(BOOT_SRCS) src/core/cpu.h src/os/syscall_nr.h src/os/host_compat.h src/dbt/emit_mem.h
+$(BUILD)/mips64rt-darwin: $(DARWIN_SRCS) src/core/cpu.h src/os/syscall_nr.h src/os/host_compat.h src/dbt/emit_mem.h
 	@mkdir -p $(BUILD)
-	$(HOST_CC) -fPIE $(CFLAGS) $(INCLUDES) $(BOOT_SRCS) -o $@
+	$(HOST_CC) -fPIE $(CFLAGS) $(INCLUDES) $(DARWIN_SRCS) -o $@
 
 $(BUILD)/test_u0_delay_tlb: $(U0_SRCS) src/core/cpu.h src/os/backend.h src/vm/vm64.h src/vm/vm_file.h src/dbt/dbt.h
 	@mkdir -p $(BUILD)

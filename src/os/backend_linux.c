@@ -117,8 +117,8 @@ void mips_bus_fault(mips64_ctx_t *ctx, uint64_t addr)
     }
     ctx->llbit = 0U; /* fault clears the reservation, like mips_fault */
     before = ctx->pc;
-    /* Guest SIGBUS (7); the frozen trap assigns si_code 1, the
-     * BUS_ADRALN family value — never SIGSEGV. */
+    /* Guest SIGBUS (10, MIPS UAPI); the frozen trap assigns si_code
+     * 1, the BUS_ADRALN family value — never SIGSEGV. */
     mips_trap(ctx, (int)MIPS64_SIGBUS, addr);
     if (ctx->pc != before) {
         ctx->exit_reason = MIPS64_EXIT_NONE;

@@ -309,7 +309,7 @@ static void test_soft_tlb(void)
     CHECK(MIPS64RT_BACKEND_REV == 4u);
     CHECK(mips_backend_name() != NULL);
     CHECK(MIPS64_BUS_ADRALN == 1u);
-    CHECK(MIPS64_SIGBUS == 7u);
+    CHECK(MIPS64_SIGBUS == 10u);
 }
 
 /* ---- DBT word structure (never executed) ---- */

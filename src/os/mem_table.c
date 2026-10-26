@@ -325,12 +325,18 @@ int mips_mem_map(mips64_ctx_t *ctx, uint64_t va, uint64_t len, uint32_t prot,
 
 /* Release [va, va+len): drop covered region records and punch a
  * PROT_NONE hole so the reservation stays contiguous. Valid aligned
- * args always succeed (Linux munmap semantics on unmapped pages). */
+ * args always succeed (Linux munmap semantics on unmapped pages).
+ * Staged commit: the PROT_NONE replacement mapping runs first; only
+ * after it lands are the records dropped and the SMC epoch bumped,
+ * so a failed host operation leaves the metadata (and the guest
+ * view) untouched. The boundary splits are coverage-neutral and may
+ * stay in place on the failure path. */
 int mips_mem_unmap(mips64_ctx_t *ctx, uint64_t va, uint64_t len)
 {
     uint64_t end;
     size_t i;
     size_t w;
+    void *got;
 
     if (ctx == NULL || ctx->guest_base == 0U) {
         return -EINVAL;
@@ -352,6 +358,14 @@ int mips_mem_unmap(mips64_ctx_t *ctx, uint64_t va, uint64_t len)
         mem_unlock();
         return -ENOMEM;
     }
+    got = mmap((void *)(uintptr_t)(ctx->guest_base + va), (size_t)len,
+               PROT_NONE, MAP_PRIVATE | MAP_FIXED | MAP_ANONYMOUS, -1, 0);
+    if (got == MAP_FAILED) {
+        int e = errno;
+
+        mem_unlock();
+        return -e;
+    }
     w = 0U;
     for (i = 0; i < g_region_count; i++) {
         if (g_regions[i].start >= va && g_regions[i].end <= end) {
@@ -361,8 +375,6 @@ int mips_mem_unmap(mips64_ctx_t *ctx, uint64_t va, uint64_t len)
         w++;
     }
     g_region_count = w;
-    (void)mmap((void *)(uintptr_t)(ctx->guest_base + va), (size_t)len,
-               PROT_NONE, MAP_PRIVATE | MAP_FIXED | MAP_ANONYMOUS, -1, 0);
     dbt_invalidate_range(va, len);
     mem_unlock();
     return 0;
@@ -405,18 +417,20 @@ int mips_mem_protect(mips64_ctx_t *ctx, uint64_t va, uint64_t len,
                (end < ctx->task_size &&
                 split_at(ctx->task_size, end) != 0)) {
         rc = -ENOMEM;
+    } else if (mprotect((void *)(uintptr_t)(ctx->guest_base + va),
+                        (size_t)len, host_prot(prot)) != 0) {
+        /* Staged commit: the host operation runs before any prot is
+         * published. On failure the recorded prots (and the SMC
+         * epoch) are untouched; only the coverage-neutral boundary
+         * splits stay behind. */
+        rc = -errno;
     } else {
         for (i = 0; i < g_region_count; i++) {
             if (g_regions[i].start >= va && g_regions[i].end <= end) {
                 g_regions[i].prot = prot;
             }
         }
-        if (mprotect((void *)(uintptr_t)(ctx->guest_base + va),
-                     (size_t)len, host_prot(prot)) != 0) {
-            rc = -ENOMEM;
-        } else {
-            dbt_invalidate_range(va, len);
-        }
+        dbt_invalidate_range(va, len);
     }
     mem_unlock();
     return rc;

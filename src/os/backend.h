@@ -38,11 +38,11 @@ const char *mips_backend_name(void);
 /* ---- §2 guest signal constants (MIPS Linux UAPI) ---- */
 
 /* Guest signal numbers: identical on both hosts because they name
- * MIPS UAPI signals, not host signals. SIGBUS is 7 on MIPS Linux
- * (asm-generic uapi) and on the MIPS N64/N32 UAPI the translator
- * implements; the host mapping (Linux 7, Darwin 10) is the backend's
- * private concern. */
-#define MIPS64_SIGBUS 7u
+ * MIPS UAPI signals, not host signals. SIGBUS is 10 on MIPS Linux
+ * (arch/mips/include/uapi/asm/signal.h: SIGBUS 10, matching
+ * src/os/sigframe.c); the host mapping (Linux 7, Darwin 10) is the
+ * backend's private concern. */
+#define MIPS64_SIGBUS 10u
 #define MIPS64_SIGSEGV 11u
 
 /* si_code for an alignment fault (Linux BUS_ADRALN == 1, same on the
