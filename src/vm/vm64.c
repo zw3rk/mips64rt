@@ -16,6 +16,8 @@
 #define _DARWIN_C_SOURCE 1
 
 #include "vm/vm64.h"
+#include "vm/vm_file.h"
+#include "core/cpu.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -261,6 +263,130 @@ const mips_provider_ops_t mips_provider_a = {
     u0_a_unmap,
     u0_a_release
 };
+
+static int u0_f_map(mips_vm64_t *vm, uint64_t va, uint64_t len,
+                    uint32_t prot, uint32_t tag)
+{
+    (void)vm; (void)va; (void)len; (void)prot; (void)tag;
+    return MIPS_FAULT;
+}
+
+static int u0_f_protect(mips_vm64_t *vm, uint64_t va, uint64_t len,
+                        uint32_t prot)
+{
+    uint64_t ps = (uint64_t)u0_page_size();
+    uint64_t start = u0_down(va, ps), end = u0_up(va + len, ps);
+
+    if (vm == NULL || vm->base == 0U || len == 0U || end < start ||
+        va + len < va || end > vm->size || (prot & 4u) != 0u ||
+        mips_vm64_query(vm, start, NULL) != 0 ||
+        mprotect((void *)(uintptr_t)(vm->base + start),
+                 (size_t)(end - start), u0_host_prot(prot)) != 0)
+        return MIPS_FAULT;
+    u0_forget(vm, start, end);
+    return u0_record(vm, start, end, prot, MIPS_VM_TAG_FILE);
+}
+
+const mips_provider_ops_t mips_provider_f = {
+    "provider-f-file",
+    u0_a_reserve,
+    u0_f_map,
+    u0_f_protect,
+    u0_a_query,
+    u0_a_unmap,
+    u0_a_release
+};
+
+int mips_vmfile_map(mips_vm64_t *vm, int fd, uint64_t off, uint64_t va,
+                    uint64_t len, uint32_t prot)
+{
+    uint64_t ps = (uint64_t)u0_page_size();
+    void *at;
+
+    if (vm == NULL || vm->base == 0U || fd < 0 || len == 0U ||
+        (va & (ps - 1u)) != 0U || (len & (ps - 1u)) != 0U ||
+        (off & (ps - 1u)) != 0U || va + len < va || va + len > vm->size ||
+        (prot & 4u) != 0u)
+        return MIPS_FAULT;
+    at = mmap((void *)(uintptr_t)(vm->base + va), (size_t)len,
+              u0_host_prot(prot), MAP_SHARED | MAP_FIXED, fd, (off_t)off);
+    if (at == MAP_FAILED)
+        return MIPS_FAULT;
+    return u0_record(vm, va, va + len, prot, MIPS_VM_TAG_FILE);
+}
+
+int mips_vm_inode_page_host_prot(uint64_t page_va)
+{
+    size_t n = mips_mem_region_count(), i;
+
+    for (i = 0u; i < n; i++) {
+        uint64_t s = 0u, e = 0u;
+        uint32_t prot = 0u;
+
+        if (mips_mem_region_at(i, &s, &e, &prot) != 0)
+            break;
+        if (s <= page_va && page_va < e) {
+            return (((prot & (uint32_t)MIPS_PROT_READ) != 0u) ? PROT_READ : 0) |
+                   (((prot & (uint32_t)MIPS_PROT_WRITE) != 0u) ? PROT_WRITE : 0);
+        }
+    }
+    return -1;
+}
+
+void mips_vm_inode_zero_span(mips64_ctx_t *ctx, uint64_t page_va,
+                             uint64_t from, uint64_t to)
+{
+    uint8_t *p;
+    int hp;
+
+    if (ctx == NULL || from >= to || to > 4096u)
+        return;
+    p = (uint8_t *)mips64_guest_ptr(ctx, page_va);
+    hp = (p != NULL) ? mips_vm_inode_page_host_prot(page_va) : -1;
+    if (hp < 0)
+        return;
+    if ((hp & PROT_WRITE) == 0) {
+        if (mprotect(p, 4096u, PROT_READ | PROT_WRITE) != 0)
+            return;
+        (void)memset(p + from, 0, (size_t)(to - from));
+        (void)mprotect(p, 4096u, hp);
+        return;
+    }
+    (void)memset(p + from, 0, (size_t)(to - from));
+}
+
+void mips_vm_inode_refresh_span(mips64_ctx_t *ctx, int fd, uint64_t page_va,
+                                uint64_t glo, uint64_t ghi, uint64_t fpos)
+{
+    uint8_t *p;
+    uint64_t from, to;
+    int hp;
+    ssize_t got;
+
+    if (ctx == NULL || fd < 0 || glo >= ghi)
+        return;
+    from = glo - (page_va & ~(uint64_t)4095U);
+    to = ghi - (page_va & ~(uint64_t)4095U);
+    if (to > 4096u)
+        return;
+    p = (uint8_t *)mips64_guest_ptr(ctx, page_va & ~(uint64_t)4095U);
+    hp = (p != NULL) ?
+         mips_vm_inode_page_host_prot(page_va & ~(uint64_t)4095U) : -1;
+    if (hp < 0)
+        return;
+    if ((hp & PROT_WRITE) == 0 &&
+        mprotect(p, 4096u, PROT_READ | PROT_WRITE) != 0)
+        return;
+    got = pread(fd, p + from, (size_t)(to - from), (off_t)fpos);
+    if (got < 0)
+        got = 0;
+    if ((uint64_t)got < to - from) {
+        (void)memset(p + from + (uint64_t)got, 0,
+                     (size_t)(to - from - (uint64_t)got));
+    }
+    if ((hp & PROT_WRITE) == 0)
+        (void)mprotect(p, 4096u, hp);
+}
 
 int mips_vm64_reserve(mips_vm64_t *vm, const mips_provider_ops_t *ops,
                       uint64_t size)

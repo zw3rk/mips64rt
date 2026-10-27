@@ -36,4 +36,9 @@ unsigned mips_vm_page_flags(uint64_t vpn);
  * check runs first; reservation state is the filler's inline job. */
 int mips_vm_page_writable(uint64_t vpn);
 
+void mips_vm_pages_snapshot(void);
+void mips_vm_pages_restore(void);
+void mips_vm_pages_remap(uint64_t old_va, uint64_t old_size,
+                         uint64_t dst_va, uint64_t new_size);
+
 #endif /* MIPS64RT_VM_VM_PAGES_H */

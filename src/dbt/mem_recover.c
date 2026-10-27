@@ -396,6 +396,8 @@ int dbt_mem_recover(mips64_ctx_t *ctx, const dbt_mem_site_t *site,
     if (site != NULL) {
         mips_decode(site->insn_word, &d);
         slot_pc = block_pc + (uint64_t)site->guest_pc_delta;
+        if ((site->flags & (uint8_t)DBT_MEM_F_IN_DELAY_SLOT) != 0u)
+            ctx->in_delay_slot = 1U;
     } else {
         uint32_t w;
 
@@ -489,6 +491,7 @@ int dbt_mem_recover(mips64_ctx_t *ctx, const dbt_mem_site_t *site,
         }
         ctx->pc = branch_pc;
         ctx->next_pc = slot_pc;
+        ctx->in_delay_slot = 0U;
         dbt_trace_fault_prefix(ctx, block_pc, branch_pc);
         if (mips_fetch(ctx, branch_pc, &bw) == 0) {
             mips64_dbt_trace(ctx, branch_pc, bw);
@@ -498,8 +501,9 @@ int dbt_mem_recover(mips64_ctx_t *ctx, const dbt_mem_site_t *site,
         ctx->in_delay_slot = 1U;
         mips_delay_target_set(ctx, target);
         rc = interp_step(ctx);
-        if (rc != 0) {
-            return 1;
+        if (rc != 0 || ctx->in_delay_slot == 0U) {
+            mips_delay_target_clear(ctx);
+            return rc == 0 ? 0 : 1;
         }
         {
             uint64_t applied = 0U;

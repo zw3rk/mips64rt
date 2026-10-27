@@ -586,7 +586,6 @@ int ei_atomic(a64_emit_t *e, const mips_dec_t *d, uint64_t pc, int be,
     size_t s3;
     size_t dead;
     size_t done;
-    size_t top;
 
     flags = (unsigned)DBT_MEM_F_ATOMIC |
         (is_load != 0 ? 0u : (unsigned)DBT_MEM_F_STORE) |
@@ -631,14 +630,13 @@ int ei_atomic(a64_emit_t *e, const mips_dec_t *d, uint64_t pc, int be,
     if (be != 0) {
         ei_rev(e, is_d != 0 ? 0xDAC00C00u : 0x5AC00800u, EI_B, EI_B);
     }
-    top = e == NULL ? 0u : e->len;
     ei_ldxr(e, is_d == 0, EI_C, EI_H);
     ei_ldr(e, 0, EI_A, EI_CTX, MIPS64_CTX_LLVAL_OFFSET);
     ei_cmp(e, 0, EI_C, EI_A);
     s3 = ei_bcc(e, EI_NE);
     ei_probe_mark_insn(e);
     ei_stxr(e, is_d == 0, EI_C, EI_B, EI_H);
-    ei_cbnz_back(e, 0, EI_C, top);
+    ei_cbnz_back(e, 1, EI_C, entry / 4u);
     ei_mov32(e, EI_B, 1u);
     ei_gst(e, EI_B, d->rt);
     ei_strb(e, EI_XZR, EI_CTX, MIPS64_CTX_LLBIT_OFFSET);
@@ -646,7 +644,6 @@ int ei_atomic(a64_emit_t *e, const mips_dec_t *d, uint64_t pc, int be,
     ei_patch_at(e, dead, e == NULL ? 0u : e->len, 0);
     ei_patch_at(e, s1, e == NULL ? 0u : e->len, 0);
     ei_patch_at(e, s3, e == NULL ? 0u : e->len, 0);
-    ei_ldr(e, is_d == 0, EI_T, EI_H, 0u);
     ei_mov(e, EI_B, EI_XZR);
     ei_gst(e, EI_B, d->rt);
     ei_strb(e, EI_XZR, EI_CTX, MIPS64_CTX_LLBIT_OFFSET);
