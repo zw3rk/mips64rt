@@ -72,13 +72,11 @@ static uint64_t page_up(uint64_t v)
 {
     return (v + (MIPS64_PAGE_SIZE - 1U)) & MIPS64_PAGE_MASK;
 }
-
 static int host_prot(uint32_t prot)
 {
     return ((prot & MIPS_PROT_READ) ? PROT_READ : 0) |
            ((prot & MIPS_PROT_WRITE) ? PROT_WRITE : 0);
 }
-
 static void copy_tag(char *dst, const char *tag)
 {
     size_t i = 0;
@@ -90,23 +88,12 @@ static void copy_tag(char *dst, const char *tag)
     }
     dst[i] = '\0';
 }
-
-__attribute__((weak)) void dbt_invalidate_range(uint64_t va, uint64_t len)
-{
-    (void)va; (void)len;
-}
+__attribute__((weak)) void dbt_invalidate_range(uint64_t va, uint64_t len) { (void)va; (void)len; }
 __attribute__((weak)) void mips_qs_begin(mips64_ctx_t *ctx) { (void)ctx; }
 __attribute__((weak)) void mips_qs_commit(mips64_ctx_t *ctx) { (void)ctx; }
 __attribute__((weak)) void mips_qs_abort(mips64_ctx_t *ctx) { (void)ctx; }
-__attribute__((weak)) void mips_vm_file_unmap_hook(uint64_t va, uint64_t len)
-{
-    (void)va; (void)len;
-}
-__attribute__((weak)) void mips_vm_file_protect_hook(uint64_t va, uint64_t len,
-                                                     uint32_t prot)
-{
-    (void)va; (void)len; (void)prot;
-}
+__attribute__((weak)) void mips_vm_file_unmap_hook(uint64_t va, uint64_t len) { (void)va; (void)len; }
+__attribute__((weak)) void mips_vm_file_protect_hook(uint64_t va, uint64_t len, uint32_t prot) { (void)va; (void)len; (void)prot; }
 __attribute__((weak)) int mips_vm_file_read_page(mips64_ctx_t *ctx,
                                                  uint64_t page_va,
                                                  uint8_t *out_page)
@@ -274,9 +261,16 @@ int mips_mem_map(mips64_ctx_t *ctx, uint64_t va, uint64_t len, uint32_t prot,
         if (g_region_count >= MIPS64_MAX_REGIONS) {
             rc = -ENOMEM;
         } else {
-            got = mmap((void *)(uintptr_t)(ctx->guest_base + va),
-                       (size_t)len, host_prot(prot),
-                       MAP_PRIVATE | MAP_FIXED | MAP_ANONYMOUS, -1, 0);
+            uint64_t hps = (uint64_t)sysconf(_SC_PAGESIZE);
+            uint64_t hlo = va & ~(hps - 1u), hhi = (va + len + hps - 1u) & ~(hps - 1u);
+            got = mmap((void *)(uintptr_t)(ctx->guest_base + va), (size_t)len,
+                       host_prot(prot), MAP_PRIVATE | MAP_FIXED | MAP_ANONYMOUS, -1, 0);
+            if (got == MAP_FAILED && hps > MIPS64_PAGE_SIZE &&
+                mprotect((void *)(uintptr_t)(ctx->guest_base + hlo),
+                         (size_t)(hhi - hlo), PROT_READ | PROT_WRITE) == 0) {
+                memset((void *)(uintptr_t)(ctx->guest_base + va), 0, (size_t)len);
+                got = (void *)(uintptr_t)(ctx->guest_base + va);
+            }
             if (got == MAP_FAILED) {
                 rc = -ENOMEM;
             } else {
@@ -286,11 +280,10 @@ int mips_mem_map(mips64_ctx_t *ctx, uint64_t va, uint64_t len, uint32_t prot,
         }
     }
     mem_unlock();
-    if (rc != 0) {
+    if (rc != 0)
         mips_qs_abort(ctx);
-    } else {
+    else
         mips_qs_commit(ctx);
-    }
     return rc;
 }
 
@@ -445,7 +438,8 @@ int mips_mem_protect(mips64_ctx_t *ctx, uint64_t va, uint64_t len,
                 split_at(ctx->task_size, end) != 0)) {
         rc = -ENOMEM;
     } else if (mprotect((void *)(uintptr_t)(ctx->guest_base + va),
-                        (size_t)len, host_prot(prot)) != 0) {
+                        (size_t)len, host_prot(prot)) != 0 &&
+               sysconf(_SC_PAGESIZE) <= (long)MIPS64_PAGE_SIZE) {
         rc = -errno;
     } else {
         for (i = 0; i < g_region_count; i++) {
