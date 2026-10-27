@@ -71,8 +71,12 @@ int64_t mips_sc_clock_gettime(mips64_ctx_t *ctx, uint64_t clk,
                               uint64_t ts_va, int is64)
 {
     struct timespec ts;
+    clockid_t host_clk = (clockid_t)(int)clk;
+#ifdef __APPLE__
+    host_clk = (clk == 0U) ? CLOCK_REALTIME : CLOCK_MONOTONIC;
+#endif
 
-    if (clock_gettime((clockid_t)(int)clk, &ts) != 0) {
+    if (clock_gettime(host_clk, &ts) != 0) {
         return l2a_ret(ctx, -(int64_t)errno);
     }
     if (xfer_ts(ctx, ts_va, is64, &ts, 1) != 0) {
