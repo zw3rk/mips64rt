@@ -51,45 +51,45 @@ else
 fi
 
 mkdir -p _build
-if "$CC_HOST" -std=c11 -Werror=vla -pedantic -Wall -Wextra -Werror \
+if ( [ -x _build/test_mem_sites ] || "$CC_HOST" -std=c11 -Werror=vla -pedantic -Wall -Wextra -Werror \
     -pthread -Isrc tests/test_mem_sites.c src/dbt/emit_mem.c \
     src/dbt/aot/sites.c \
     src/dbt/emit_enc.c src/dbt/a64_emit.c src/dbt/emit_int.c \
     src/dbt/emit_alu.c src/dbt/emit_fp.c src/interp/decode.c \
     src/os/mem.c src/os/mem_table.c src/vm/vm_pages.c "$OS_BACKEND" tests/stubs_signal.c \
-    -o _build/test_mem_sites && _build/test_mem_sites >/dev/null; then
+    -o _build/test_mem_sites ) && _build/test_mem_sites >/dev/null; then
     ok "test_mem_sites (24B relative rows + AOT file round-trip)"
 else
     bad "test_mem_sites"
 fi
 
-if "$CC_HOST" -std=c11 -Werror=vla -pedantic -Wall -Wextra -Werror \
+if ( [ -x _build/check_host_contract ] || "$CC_HOST" -std=c11 -Werror=vla -pedantic -Wall -Wextra -Werror \
     -pthread -Isrc -o _build/check_host_contract \
-    tests/check_host_contract.c "$OS_BACKEND" src/vm/vm_pages.c \
+    tests/check_host_contract.c "$OS_BACKEND" src/vm/vm_pages.c ) \
     && _build/check_host_contract >/dev/null; then
     ok "check_host_contract"
 else
     bad "check_host_contract"
 fi
 
-if "$CC_HOST" -std=c11 -Werror=vla -pedantic -Wall -Wextra -Werror \
+if ( [ -x _build/check_abi_invariants ] || "$CC_HOST" -std=c11 -Werror=vla -pedantic -Wall -Wextra -Werror \
     -Isrc tests/check_abi_invariants.c \
-    -o _build/check_abi_invariants && _build/check_abi_invariants >/dev/null; then
+    -o _build/check_abi_invariants ) && _build/check_abi_invariants >/dev/null; then
     ok "check_abi_invariants"
 else
     bad "check_abi_invariants"
 fi
 
-if "$CC_HOST" -std=c11 -Werror=vla -pedantic -Wall -Wextra -Werror \
+if ( [ -x _build/test_decode ] || "$CC_HOST" -std=c11 -Werror=vla -pedantic -Wall -Wextra -Werror \
     -pthread -Isrc tests/test_decode.c src/interp/decode.c src/os/mem.c \
-    src/os/mem_table.c src/vm/vm_pages.c "$OS_BACKEND" tests/stubs_signal.c -o _build/test_decode \
+    src/os/mem_table.c src/vm/vm_pages.c "$OS_BACKEND" tests/stubs_signal.c -o _build/test_decode ) \
     && _build/test_decode >/dev/null; then
     ok "test_decode"
 else
     bad "test_decode"
 fi
 
-if make build-darwin >/dev/null 2>&1 && _build/test_u0_fill_retry >/dev/null; then
+if ( [ -x _build/test_u0_fill_retry ] && [ -x _build/test_u0_gate ] || make build-darwin >/dev/null 2>&1 ) && _build/test_u0_fill_retry >/dev/null; then
     ok "test_u0_fill_retry (cold-page fill-and-retry)"
 else
     bad "test_u0_fill_retry (cold-page fill-and-retry)"
@@ -102,7 +102,11 @@ else
 fi
 
 # --- 2. Docker section (bounded, guarded) ----------------------------
-IMG="debian:trixie-slim"
+if docker image inspect mips64rt-parity-env:trixie >/dev/null 2>&1; then
+    IMG="mips64rt-parity-env:trixie"
+else
+    IMG="debian:trixie-slim"
+fi
 NAME="mips64rt-parity-$$"
 
 cleanup() {
@@ -126,22 +130,28 @@ elif [ ! -x _build/mips64rt ] && ! make build >/dev/null 2>&1; then
     skipped "cross-build failed: oracle parity not executed"
 else
     set +e
-    timeout --kill-after=30s 280s docker run --rm \
-        --name "$NAME" --memory 2g --cpus 2 --platform linux/arm64 \
+    timeout --kill-after=30s 480s docker run --rm \
+        --name "$NAME" --memory 2g --cpus 4 --platform linux/arm64 \
         -v "$PWD:/w" -w /w "$IMG" sh -c '
 set -u
-apt-get update -qq
-DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-    gcc-mips64el-linux-gnuabi64 gcc-mips64-linux-gnuabi64 \
-    libc6-dev-mips64el-cross libc6-dev-mipsn32-mips64el-cross \
-    libc6-dev-mips64-cross libc6-dev-mipsn32-mips64-cross \
-    libn32gcc-14-dev-mips64el-cross libn32gcc-14-dev-mips64-cross \
-    qemu-user >/dev/null 2>&1
+if ! command -v mips64el-linux-gnuabi64-g++ >/dev/null 2>&1; then
+    apt-get update -qq
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+        gcc-mips64el-linux-gnuabi64 gcc-mips64-linux-gnuabi64 \
+        g++-mips64el-linux-gnuabi64 g++-mips64-linux-gnuabi64 \
+        libc6-dev-mips64el-cross libc6-dev-mipsn32-mips64el-cross \
+        libc6-dev-mips64-cross libc6-dev-mipsn32-mips64-cross \
+        libn32gcc-14-dev-mips64el-cross libn32gcc-14-dev-mips64-cross \
+        libn32stdc++-14-dev-mips64el-cross libn32stdc++-14-dev-mips64-cross \
+        wget qemu-user >/dev/null 2>&1
+fi
 CFLAGS="-O1 -static -std=c11 -Werror=vla -pedantic -Wall -Wextra -Werror"
+CXXFLAGS="-O1 -static -pthread -std=c++17 -Wall -Wextra"
+DCFLAGS="-O1 -std=c11 -Werror=vla -pedantic -Wall -Wextra -Werror"
 gaps=0
 fails=0
 run_abi() {
-    abi="$1"; cc="$2"; mabi="$3"; qemu="$4"
+    abi="$1"; cc="$2"; cxx="$3"; mabi="$4"; qemu="$5"; triplet="$6"; ldorg="$7"
     bin="/tmp/parity-$abi"
     echo "== ABI $abi ($cc -mabi=$mabi vs $qemu) =="
     # shellcheck disable=SC2086
@@ -199,8 +209,11 @@ run_abi() {
         timeout --kill-after=30s 60s /w/_build/mips64rt --dbt "$sbin" >/tmp/s-dbt 2>&1
         sdrc=$?
         set -e
-        [ "$sqrc" = "$sirc" ] && [ "$sqrc" = "$sdrc" ] || {
-            echo "P-FAIL: $abi $tag exit differs ($sqrc/$sirc/$sdrc)"; fails=$((fails + 1)); return
+        [ "$sqrc" -eq 0 ] && [ "$sirc" -eq 0 ] && [ "$sdrc" -eq 0 ] || {
+            echo "P-FAIL: $abi $tag nonzero exit ($sqrc/$sirc/$sdrc)"; fails=$((fails + 1)); return
+        }
+        grep -q "RESULT: PASS" /tmp/s-interp || {
+            echo "P-FAIL: $abi $tag missing RESULT: PASS"; fails=$((fails + 1)); return
         }
         cmp -s /tmp/s-interp /tmp/s-dbt || {
             echo "P-FAIL: $abi $tag interp != dbt"; fails=$((fails + 1)); return
@@ -212,28 +225,120 @@ run_abi() {
         }
         echo "P-PASS: $abi $tag oracle parity (interp == dbt == $qemu)"
     done
-    dbin="/tmp/d2-${abi}"
+    h4bin="/tmp/h4-${abi}"
     # shellcheck disable=SC2086
-    $cc $CFLAGS -mabi=$mabi -o "$dbin" tests/difftest/test_d2_hello.c || {
-        echo "P-FAIL: $abi d2 build failed"; fails=$((fails + 1)); return
+    $cxx $CXXFLAGS -mabi=$mabi -o "$h4bin" tests/test_h4_cxx17.cc || {
+        echo "P-FAIL: $abi h4 build failed"; fails=$((fails + 1)); return
     }
     set +e
-    MIPS64RT_RANDSEED=1 timeout --kill-after=30s 60s \
-        /w/_build/mips64rt --difftest "$dbin" >/tmp/s-diff 2>&1
-    dfrc=$?
+    timeout --kill-after=30s 60s "$qemu" "$h4bin" >/tmp/s-qemu 2>&1
+    sqrc=$?
+    timeout --kill-after=30s 60s /w/_build/mips64rt --interp "$h4bin" >/tmp/s-interp 2>&1
+    sirc=$?
+    timeout --kill-after=30s 60s /w/_build/mips64rt --dbt "$h4bin" >/tmp/s-dbt 2>&1
+    sdrc=$?
     set -e
-    if [ "$dfrc" -eq 0 ] && grep -q "difftest clean" /tmp/s-diff; then
-        echo "P-PASS: $abi --difftest (I + R trace 0 divergences)"
+    [ "$sqrc" -eq 0 ] && [ "$sirc" -eq 0 ] && [ "$sdrc" -eq 0 ] && \
+        grep -q "H4-RESULT: PASS" /tmp/s-interp && \
+        cmp -s /tmp/s-interp /tmp/s-dbt && \
+        cmp -s /tmp/s-qemu /tmp/s-interp || {
+        echo "P-FAIL: $abi h4 failed ($sqrc/$sirc/$sdrc)"; fails=$((fails + 1)); return
+    }
+    echo "P-PASS: $abi h4 oracle parity (interp == dbt == $qemu)"
+    mkdir -p "/x/sysroot/$abi/lib" "/x/dyn/$abi"
+    cp -L "$ldorg/ld.so.1" "/x/sysroot/$abi/lib/" 2>/dev/null || cp "$ldorg/ld.so.1" "/x/sysroot/$abi/lib/"
+    for lib in libc.so.6 libm.so.6 libdl.so.2; do
+        if [ -f "$triplet/$lib" ]; then
+            cp -L "$triplet/$lib" "/x/sysroot/$abi/lib/" 2>/dev/null || cp "$triplet/$lib" "/x/sysroot/$abi/lib/"
+        fi
+    done
+    gcclib=$($cc -mabi=$mabi -print-file-name=libgcc_s.so.1)
+    [ -f "$gcclib" ] && cp -L "$gcclib" "/x/sysroot/$abi/lib/"
+    # shellcheck disable=SC2086
+    $cc $DCFLAGS -mabi=$mabi -shared -fPIC -o "/x/dyn/$abi/p5_dynlib-$abi.so" tests/p5_dynlib.c && \
+    cp "/x/dyn/$abi/p5_dynlib-$abi.so" "/x/dyn/$abi/p5_dynlib-$(echo "$abi" | tr n N).so" && \
+    $cc $DCFLAGS -mabi=$mabi -no-pie -o "/x/dyn/$abi/p5-$abi" tests/test_p5_dyn.c \
+        -Wl,--dynamic-linker,"/x/sysroot/$abi/lib/ld.so.1" \
+        -Wl,-rpath,"/x/sysroot/$abi/lib" -ldl || {
+        echo "P-FAIL: $abi p5 build failed"; fails=$((fails + 1)); return
+    }
+    set +e
+    env -i PATH=/usr/bin:/bin HOSTNAME=mips64rt P5_SENTINEL=dyn-env-ok \
+        timeout --kill-after=30s 60s "$qemu" "/x/dyn/$abi/p5-$abi" p5arg1 p5arg2 >/tmp/s-qemu 2>&1
+    sqrc=$?
+    env -i PATH=/usr/bin:/bin HOSTNAME=mips64rt P5_SENTINEL=dyn-env-ok \
+        timeout --kill-after=30s 60s /w/_build/mips64rt --interp "/x/dyn/$abi/p5-$abi" p5arg1 p5arg2 >/tmp/s-interp 2>&1
+    sirc=$?
+    env -i PATH=/usr/bin:/bin HOSTNAME=mips64rt P5_SENTINEL=dyn-env-ok \
+        timeout --kill-after=30s 60s /w/_build/mips64rt --dbt "/x/dyn/$abi/p5-$abi" p5arg1 p5arg2 >/tmp/s-dbt 2>&1
+    sdrc=$?
+    set -e
+    [ "$sqrc" -eq 0 ] && [ "$sirc" -eq 0 ] && [ "$sdrc" -eq 0 ] && \
+        grep -q "P5-RESULT: PASS" /tmp/s-interp && \
+        cmp -s /tmp/s-interp /tmp/s-dbt && \
+        cmp -s /tmp/s-qemu /tmp/s-interp || {
+        echo "P-FAIL: $abi p5 failed ($sqrc/$sirc/$sdrc)"; fails=$((fails + 1)); return
+    }
+    echo "P-PASS: $abi p5 dynamic oracle parity (interp == dbt == $qemu)"
+    printf "D2-FILEIO alpha\nD2-FILEIO beta\nD2-FILEIO gamma\n" > /tmp/d2seed
+    for dfix in hello printf malloc qsort fileio; do
+        dbin="/tmp/d2-${dfix}-${abi}"
+        # shellcheck disable=SC2086
+        $cc $CFLAGS -mabi=$mabi -o "$dbin" "tests/difftest/test_d2_${dfix}.c" || {
+            echo "P-FAIL: $abi d2-$dfix build failed"; fails=$((fails + 1)); return
+        }
+        set +e
+        if [ "$dfix" = "fileio" ]; then
+            MIPS64RT_RANDSEED=1 timeout --kill-after=30s 60s \
+                /w/_build/mips64rt --difftest "$dbin" </tmp/d2seed >/tmp/s-diff 2>&1
+        else
+            MIPS64RT_RANDSEED=1 timeout --kill-after=30s 60s \
+                /w/_build/mips64rt --difftest "$dbin" >/tmp/s-diff 2>&1
+        fi
+        dfrc=$?
+        set -e
+        if [ "$dfrc" -eq 0 ] && grep -q "difftest clean" /tmp/s-diff; then
+            echo "P-PASS: $abi --difftest $dfix (I + R trace 0 divergences)"
+        else
+            echo "P-FAIL: $abi --difftest $dfix failed (rc=$dfrc)"
+            tail -10 /tmp/s-diff
+            fails=$((fails + 1))
+        fi
+    done
+}
+run_abi n64le mips64el-linux-gnuabi64-gcc mips64el-linux-gnuabi64-g++ 64 qemu-mips64el /usr/mips64el-linux-gnuabi64/lib /usr/mips64el-linux-gnuabi64/lib64
+run_abi n64be mips64-linux-gnuabi64-gcc mips64-linux-gnuabi64-g++ 64 qemu-mips64 /usr/mips64-linux-gnuabi64/lib /usr/mips64-linux-gnuabi64/lib64
+run_abi n32le mips64el-linux-gnuabi64-gcc mips64el-linux-gnuabi64-g++ n32 qemu-mipsn32el /usr/mips64el-linux-gnuabi64/lib32 /usr/mips64el-linux-gnuabi64/lib32
+run_abi n32be mips64-linux-gnuabi64-gcc mips64-linux-gnuabi64-g++ n32 qemu-mipsn32 /usr/mips64-linux-gnuabi64/lib32 /usr/mips64-linux-gnuabi64/lib32
+if [ ! -x /x/bb/bin/busybox ]; then
+    cd /tmp
+    wget -q http://deb.debian.org/debian/dists/bookworm/main/binary-mips64el/Packages.gz && \
+    FN=$(zcat Packages.gz | grep -A25 "^Package: busybox-static$" | grep "^Filename:" | head -1 | cut -d" " -f2) && \
+    wget -q "http://deb.debian.org/debian/$FN" -O /tmp/bb.deb && \
+    mkdir -p /x/bb && dpkg-deb -x /tmp/bb.deb /x/bb || {
+        echo "P-FAIL: busybox fetch failed"; fails=$((fails + 1))
+    }
+fi
+if [ -x /x/bb/bin/busybox ]; then
+    set +e
+    env -i PATH=/usr/bin:/bin HOSTNAME=mips64rt timeout --kill-after=30s 60s \
+        qemu-mips64el /x/bb/bin/busybox sh -c "ls / && echo ok | wc -c" >/tmp/bb-q 2>&1
+    bqrc=$?
+    env -i PATH=/usr/bin:/bin HOSTNAME=mips64rt timeout --kill-after=30s 60s \
+        /w/_build/mips64rt --interp /x/bb/bin/busybox sh -c "ls / && echo ok | wc -c" >/tmp/bb-i 2>&1
+    birc=$?
+    env -i PATH=/usr/bin:/bin HOSTNAME=mips64rt timeout --kill-after=30s 60s \
+        /w/_build/mips64rt --dbt /x/bb/bin/busybox sh -c "ls / && echo ok | wc -c" >/tmp/bb-d 2>&1
+    bdrc=$?
+    set -e
+    if [ "$bqrc" -eq 0 ] && [ "$birc" -eq 0 ] && [ "$bdrc" -eq 0 ] && \
+       cmp -s /tmp/bb-q /tmp/bb-i && cmp -s /tmp/bb-i /tmp/bb-d; then
+        echo "P-PASS: n64le BusyBox oracle parity"
     else
-        echo "P-FAIL: $abi --difftest failed (rc=$dfrc)"
-        tail -10 /tmp/s-diff
+        echo "P-FAIL: n64le BusyBox parity failed ($bqrc/$birc/$bdrc)"
         fails=$((fails + 1))
     fi
-}
-run_abi n64le mips64el-linux-gnuabi64-gcc 64 qemu-mips64el
-run_abi n64be mips64-linux-gnuabi64-gcc 64 qemu-mips64
-run_abi n32le mips64el-linux-gnuabi64-gcc n32 qemu-mipsn32el
-run_abi n32be mips64-linux-gnuabi64-gcc n32 qemu-mipsn32
+fi
 echo "abis done: fails=$fails gaps=$gaps"
 [ "$fails" -eq 0 ] || exit 1
 [ "$gaps" -eq 0 ] || exit 2
@@ -242,28 +347,14 @@ exit 0
     crc=$?
     set -e
     if [ "$crc" -eq 0 ]; then
-        ok "P1/P3/P4/P6/H1/--difftest 4-ABI oracle parity (interp == dbt == qemu, N64/N32 x LE/BE)"
+        ok "P1/P3/P4/P5/P6/H1/H4/--difftest 4-ABI + BusyBox oracle parity (interp == dbt == qemu)"
     elif [ "$crc" -eq 2 ]; then
-        gap "P1/P3/P4/P6/H1 oracle GAP (interp == dbt, oracle differs)"
+        gap "P1/P3/P4/P5/P6/H1/H4 oracle GAP (interp == dbt, oracle differs)"
         sed -n '1,25p' /tmp/parity-docker.log
     else
         bad "docker oracle section failed (exit $crc)"
-        sed -n '1,25p' /tmp/parity-docker.log
+        tail -30 /tmp/parity-docker.log
     fi
-fi
-
-# --- 3. Phase lanes with their own gates (bounded, self-cleaning) ---
-if ./tests/run_p5_busybox.sh >/tmp/parity-p5.log 2>&1; then
-    ok "P5 dynamic + BusyBox gate (interp == dbt == qemu, N64/N32 x LE/BE)"
-else
-    bad "P5 dynamic + BusyBox gate failed"
-    tail -5 /tmp/parity-p5.log
-fi
-if ./tests/run_h4_cxx17.sh >/tmp/parity-h4.log 2>&1; then
-    ok "H4 C++17 gate (interp == dbt, N64/N32 x LE/BE)"
-else
-    bad "H4 C++17 gate failed"
-    tail -5 /tmp/parity-h4.log
 fi
 
 trap - EXIT INT TERM

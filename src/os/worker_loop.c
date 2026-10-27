@@ -418,6 +418,14 @@ static int worker_difftest(mips64_ctx_t *ctx)
         worker_run_child(ctx, MIPS64_ENGINE_INTERP, ift, ifo);
         _Exit(127);
     }
+    {
+        int st;
+
+        while (waitpid(ci, &st, 0) < 0 && errno == EINTR) {
+        }
+        si = WIFEXITED(st) != 0 ? WEXITSTATUS(st) : 128;
+    }
+    (void)lseek(STDIN_FILENO, 0, SEEK_SET);
     cd = fork();
     if (cd < 0) {
         fprintf(stderr, "mips64rt: difftest fork failed\n");
@@ -434,9 +442,6 @@ static int worker_difftest(mips64_ctx_t *ctx)
     {
         int st;
 
-        while (waitpid(ci, &st, 0) < 0 && errno == EINTR) {
-        }
-        si = WIFEXITED(st) != 0 ? WEXITSTATUS(st) : 128;
         while (waitpid(cd, &st, 0) < 0 && errno == EINTR) {
         }
         sd = WIFEXITED(st) != 0 ? WEXITSTATUS(st) : 128;

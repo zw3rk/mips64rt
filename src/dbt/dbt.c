@@ -257,8 +257,7 @@ static const dbt_mem_site_t *dbt_aot_take_match(uint64_t pc,
     if (!p->used || p->pc != pc || p->sites == NULL || p->count != nrows)
         return NULL;
     for (i = 0u; i < nrows; i++) {
-        if (p->sites[i].guest_pc_delta != rows[i].guest_pc_delta ||
-            p->sites[i].insn_word != rows[i].insn_word ||
+        if (memcmp(&p->sites[i], &rows[i], sizeof(dbt_mem_site_t)) != 0 ||
             p->sites[i].seq_start_offset > p->sites[i].host_insn_offset ||
             p->sites[i].host_insn_offset >= p->sites[i].cont_insn_offset ||
             (size_t)p->sites[i].cont_insn_offset > code_len) {

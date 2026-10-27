@@ -128,11 +128,7 @@ static int u0f_reserve(mips_vm64_t *vm, uint64_t size)
 static int u0f_map(mips_vm64_t *vm, uint64_t va, uint64_t len,
                    uint32_t prot, uint32_t tag)
 {
-    (void)vm;
-    (void)va;
-    (void)len;
-    (void)prot;
-    (void)tag;
+    (void)vm; (void)va; (void)len; (void)prot; (void)tag;
     return MIPS_FAULT;
 }
 
@@ -252,6 +248,7 @@ typedef struct {
     uint64_t size;
     uint64_t write_seq;
     uint64_t resize_seq;
+    uint64_t trunc_hist[16];
     vm_inode_map_t maps[VM_INODE_MAPS];
     int nmaps;
     int wide;
@@ -782,30 +779,38 @@ void mips_vm_file_reconcile(mips64_ctx_t *ctx)
     tab = vm_inode_table_ptr;
     for (k = 0u; k < VM_INODE_MAX; k++) {
         vm_inode_t *in = &tab[k];
-        int i;
-        int need_trunc = 0;
-        int need_write = 0;
+        uint64_t min_sz = in->size;
+        int i, need_trunc = 0, need_write = 0;
 
-        if (in->used == 0) {
+        if (in->used == 0)
             continue;
-        }
         for (i = 0; i < in->nmaps; i++) {
-            if (in->maps[i].pid != self || in->maps[i].native != 0) {
+            uint64_t s = in->maps[i].seen_resize_seq;
+            if (in->maps[i].pid != self || in->maps[i].native != 0)
                 continue;
-            }
-            if (in->maps[i].seen_resize_seq != in->resize_seq) {
+            if (s < in->resize_seq) {
                 need_trunc = 1;
+                if (in->resize_seq - s > 16u) {
+                    min_sz = 0u;
+                } else {
+                    for (uint64_t r = s + 1u; r <= in->resize_seq; r++) {
+                        if (in->trunc_hist[r & 15u] < min_sz)
+                            min_sz = in->trunc_hist[r & 15u];
+                    }
+                }
             }
-            if (in->maps[i].seen_write_seq != in->write_seq) {
+            if (in->maps[i].seen_write_seq != in->write_seq)
+                need_write = 1;
+        }
+        if (need_trunc != 0) {
+            vm_inode_post_truncate_locked(ctx, in, min_sz);
+            if (in->size != min_sz) {
+                vm_inode_post_truncate_locked(ctx, in, in->size);
                 need_write = 1;
             }
         }
-        if (need_trunc != 0) {
-            vm_inode_post_truncate_locked(ctx, in, in->size);
-        }
-        if (need_write != 0) {
+        if (need_write != 0)
             vm_inode_apply_write_locked(ctx, in, -1, 0u, ~(uint64_t)0u);
-        }
     }
     (void)pthread_mutex_unlock(&vm_inode_mu);
 }
@@ -816,15 +821,15 @@ void mips_vm_file_post_write(mips64_ctx_t *ctx, int fd, uint64_t off,
     struct stat st;
     vm_inode_t *in;
 
-    if (ctx == NULL || fd < 0 || n == 0u || fstat(fd, &st) != 0) {
+    if (ctx == NULL || fd < 0 || n == 0u || fstat(fd, &st) != 0)
         return;
-    }
     (void)pthread_mutex_lock(&vm_inode_mu);
     in = vm_inode_lookup((uint64_t)st.st_dev, (uint64_t)st.st_ino, 0, 0u);
     if (in != NULL) {
         if (in->size != (uint64_t)st.st_size) {
             in->size = (uint64_t)st.st_size;
             in->resize_seq++;
+            in->trunc_hist[in->resize_seq & 15u] = in->size;
         }
         in->write_seq++;
         vm_inode_apply_write_locked(ctx, in, fd, off, n);
@@ -835,10 +840,8 @@ void mips_vm_file_post_write(mips64_ctx_t *ctx, int fd, uint64_t off,
 void mips_vm_file_post_write_seq(mips64_ctx_t *ctx, int fd, uint64_t n)
 {
     off_t cur;
-
-    if (ctx == NULL || fd < 0 || n == 0u) {
+    if (ctx == NULL || fd < 0 || n == 0u)
         return;
-    }
     cur = lseek(fd, 0, SEEK_CUR);
     if (cur < 0 || (uint64_t)cur < n) {
         mips_vm_file_post_write(ctx, fd, 0u, ~(uint64_t)0u);
@@ -852,15 +855,14 @@ void mips_vm_file_post_truncate_fd(mips64_ctx_t *ctx, int fd,
 {
     struct stat st;
     vm_inode_t *in;
-
-    if (ctx == NULL || fd < 0 || fstat(fd, &st) != 0) {
+    if (ctx == NULL || fd < 0 || fstat(fd, &st) != 0)
         return;
-    }
     (void)pthread_mutex_lock(&vm_inode_mu);
     in = vm_inode_lookup((uint64_t)st.st_dev, (uint64_t)st.st_ino, 0, 0u);
     if (in != NULL) {
         in->size = newsize;
         in->resize_seq++;
+        in->trunc_hist[in->resize_seq & 15u] = newsize;
         vm_inode_post_truncate_locked(ctx, in, newsize);
     }
     (void)pthread_mutex_unlock(&vm_inode_mu);
@@ -873,14 +875,11 @@ void mips_vm_file_post_truncate_path(mips64_ctx_t *ctx,
     struct stat st;
     vm_inode_t *in;
     int fd;
-
-    if (ctx == NULL || host_path == NULL) {
+    if (ctx == NULL || host_path == NULL)
         return;
-    }
     fd = open(host_path, O_RDONLY | O_CLOEXEC);
-    if (fd < 0) {
+    if (fd < 0)
         return;
-    }
     if (fstat(fd, &st) != 0) {
         (void)close(fd);
         return;
@@ -891,6 +890,7 @@ void mips_vm_file_post_truncate_path(mips64_ctx_t *ctx,
     if (in != NULL) {
         in->size = newsize;
         in->resize_seq++;
+        in->trunc_hist[in->resize_seq & 15u] = newsize;
         vm_inode_post_truncate_locked(ctx, in, newsize);
     }
     (void)pthread_mutex_unlock(&vm_inode_mu);

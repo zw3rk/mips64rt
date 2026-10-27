@@ -35,6 +35,7 @@ extern void mips_vm_file_post_write_seq(mips64_ctx_t *ctx, int fd,
                                         uint64_t n);
 extern void mips_vm_file_shared_sync(mips64_ctx_t *ctx, uint64_t va,
                                      uint64_t len);
+extern void mips_guest_range_flush(mips64_ctx_t *ctx);
 
 /* Shared helpers owned by src/os/syscalls.c. */
 extern int mips_mem_ok(const mips64_ctx_t *ctx, uint64_t va, uint64_t len,
@@ -266,6 +267,9 @@ int64_t mips_sc_vec(mips64_ctx_t *ctx, uint64_t fd, uint64_t iov_va,
                 return l2a_ret(ctx, (int64_t)total);
             }
             return l2a_ret(ctx, -(int64_t)errno);
+        }
+        if (rc > 0 && is_write == 0) {
+            mips_guest_range_flush(ctx);
         }
         total += (uint64_t)rc;
         cur += (uint64_t)rc;

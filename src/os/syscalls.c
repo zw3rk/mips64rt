@@ -137,7 +137,8 @@ uint64_t getn(const uint8_t *p, unsigned n, int be)
 
 extern void mips_vm_file_shared_sync(mips64_ctx_t *ctx, uint64_t va,
                                      uint64_t len);
-static _Thread_local uint64_t g_sync_va[8], g_sync_len[8];
+#define G_SYNC_MAX 64U
+static _Thread_local uint64_t g_sync_va[G_SYNC_MAX], g_sync_len[G_SYNC_MAX];
 static _Thread_local unsigned g_sync_cnt;
 
 void mips_guest_range_flush(mips64_ctx_t *ctx)
@@ -157,10 +158,10 @@ uint8_t *guest_range(mips64_ctx_t *ctx, uint64_t va, uint64_t len, int write)
         return NULL;
     if (write != 0) {
         mips_vm_pages_clear(va, len, (unsigned)MIPS_VM_PAGE_COW_CLEAN);
-        if (g_sync_cnt < 8U) {
-            g_sync_va[g_sync_cnt] = va;
-            g_sync_len[g_sync_cnt++] = len;
-        }
+        if (g_sync_cnt >= G_SYNC_MAX)
+            mips_guest_range_flush(ctx);
+        g_sync_va[g_sync_cnt] = va;
+        g_sync_len[g_sync_cnt++] = len;
     }
     return (uint8_t *)mips64_guest_ptr(ctx, va);
 }

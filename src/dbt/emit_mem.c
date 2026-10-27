@@ -483,6 +483,7 @@ int ei_unaligned(a64_emit_t *e, const mips_dec_t *d, uint64_t pc,
                  int is_load, int is_d, int be, int mode, int swap, unsigned cval,
                  int slot)
 {
+    size_t entry = (e == NULL) ? 0u : (e->len * 4u);
     size_t s;
     size_t miss;
     unsigned width = is_d != 0 ? 8u : 4u;
@@ -565,6 +566,7 @@ int ei_unaligned(a64_emit_t *e, const mips_dec_t *d, uint64_t pc,
         }
         return 0;
     }
+    ei_sites.sites[ei_sites.count - 1u].seq_start_offset = (uint16_t)entry;
     ei_span[ei_sites.count - 1u] = s;
     (void)miss;
     return 0;
@@ -574,6 +576,7 @@ int ei_unaligned(a64_emit_t *e, const mips_dec_t *d, uint64_t pc,
 int ei_atomic(a64_emit_t *e, const mips_dec_t *d, uint64_t pc, int be,
               int slot)
 {
+    size_t entry = (e == NULL) ? 0u : (e->len * 4u);
     int is_d = (d->op == 0x34u || d->op == 0x3Cu) ? 1 : 0;
     unsigned width = is_d != 0 ? 8u : 4u;
     unsigned flags;
@@ -613,6 +616,10 @@ int ei_atomic(a64_emit_t *e, const mips_dec_t *d, uint64_t pc, int be,
         }
         ei_gst(e, EI_C, d->rt);
         ei_probe_close(e);
+        if (ei_sites.count > 0u && ei_sites.count <= DBT_MEM_SITES_MAX) {
+            ei_sites.sites[ei_sites.count - 1u].seq_start_offset =
+                (uint16_t)entry;
+        }
         return 0;
     }
     ei_gld(e, EI_B, d->rt);
@@ -624,12 +631,12 @@ int ei_atomic(a64_emit_t *e, const mips_dec_t *d, uint64_t pc, int be,
     if (be != 0) {
         ei_rev(e, is_d != 0 ? 0xDAC00C00u : 0x5AC00800u, EI_B, EI_B);
     }
-    ei_probe_mark_insn(e);
     top = e == NULL ? 0u : e->len;
     ei_ldxr(e, is_d == 0, EI_C, EI_H);
     ei_ldr(e, 0, EI_A, EI_CTX, MIPS64_CTX_LLVAL_OFFSET);
     ei_cmp(e, 0, EI_C, EI_A);
     s3 = ei_bcc(e, EI_NE);
+    ei_probe_mark_insn(e);
     ei_stxr(e, is_d == 0, EI_C, EI_B, EI_H);
     ei_cbnz_back(e, 0, EI_C, top);
     ei_mov32(e, EI_B, 1u);
@@ -645,6 +652,10 @@ int ei_atomic(a64_emit_t *e, const mips_dec_t *d, uint64_t pc, int be,
     ei_strb(e, EI_XZR, EI_CTX, MIPS64_CTX_LLBIT_OFFSET);
     ei_patch26(e, done, e == NULL ? 0u : e->len);
     ei_probe_close(e);
+    if (ei_sites.count > 0u && ei_sites.count <= DBT_MEM_SITES_MAX) {
+        ei_sites.sites[ei_sites.count - 1u].seq_start_offset =
+            (uint16_t)entry;
+    }
     return 0;
 }
 

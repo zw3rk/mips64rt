@@ -35,12 +35,9 @@ static pthread_mutex_t g_mem_mu;
 static mips64_region_t g_regions[MIPS64_MAX_REGIONS];
 static size_t g_region_count = 0U;
 
-/* atfork child: only the forking thread survives, so drop whatever the
- * copied mutex thought about holders and start unlocked. */
 static void mem_atfork_child(void)
 {
     pthread_mutexattr_t at;
-
     (void)pthread_mutexattr_init(&at);
     (void)pthread_mutexattr_settype(&at, PTHREAD_MUTEX_RECURSIVE);
     (void)pthread_mutex_init(&g_mem_mu, &at);
@@ -49,12 +46,7 @@ static void mem_atfork_child(void)
 
 static void mem_lock_init(void)
 {
-    pthread_mutexattr_t at;
-
-    (void)pthread_mutexattr_init(&at);
-    (void)pthread_mutexattr_settype(&at, PTHREAD_MUTEX_RECURSIVE);
-    (void)pthread_mutex_init(&g_mem_mu, &at);
-    (void)pthread_mutexattr_destroy(&at);
+    mem_atfork_child();
     (void)pthread_atfork(NULL, NULL, mem_atfork_child);
 }
 
@@ -63,14 +55,8 @@ static _Thread_local sigset_t mem_preempt_saved;
 
 static void mem_lock(void)
 {
-    /* Block preemption across the table critical section (see
-     * quiesce.h): a peer parked holding this mutex would deadlock
-     * the mutator waiting for it. Depth-counted for the recursive
-     * mutex; the mask save/restore pairs nest. */
-    if (mem_preempt_depth == 0) {
+    if (mem_preempt_depth++ == 0)
         mips_qs_block_preempt(&mem_preempt_saved);
-    }
-    mem_preempt_depth++;
     (void)pthread_once(&g_mem_once, mem_lock_init);
     (void)pthread_mutex_lock(&g_mem_mu);
 }
@@ -78,10 +64,8 @@ static void mem_lock(void)
 static void mem_unlock(void)
 {
     (void)pthread_mutex_unlock(&g_mem_mu);
-    mem_preempt_depth--;
-    if (mem_preempt_depth == 0) {
+    if (--mem_preempt_depth == 0)
         mips_qs_unblock_preempt(&mem_preempt_saved);
-    }
 }
 
 static uint64_t page_up(uint64_t v)
@@ -89,60 +73,32 @@ static uint64_t page_up(uint64_t v)
     return (v + (MIPS64_PAGE_SIZE - 1U)) & MIPS64_PAGE_MASK;
 }
 
-/* Guest prot bits to host prot bits. PROT_EXEC is never granted: guest
- * code pages are data to the Phase 1 interpreter (W^X). */
 static int host_prot(uint32_t prot)
 {
-    int hp = 0;
-
-    if ((prot & MIPS_PROT_READ) != 0U) {
-        hp |= PROT_READ;
-    }
-    if ((prot & MIPS_PROT_WRITE) != 0U) {
-        hp |= PROT_WRITE;
-    }
-    return hp;
+    return ((prot & MIPS_PROT_READ) ? PROT_READ : 0) |
+           ((prot & MIPS_PROT_WRITE) ? PROT_WRITE : 0);
 }
 
 static void copy_tag(char *dst, const char *tag)
 {
     size_t i = 0;
-
-    if (tag == NULL) {
-        dst[0] = '\0';
-        return;
-    }
-    while (i + 1 < sizeof(((mips64_region_t *)0)->name) && tag[i] != '\0') {
-        dst[i] = tag[i];
-        i++;
+    if (tag != NULL) {
+        while (i + 1 < sizeof(((mips64_region_t *)0)->name) && tag[i] != '\0') {
+            dst[i] = tag[i];
+            i++;
+        }
     }
     dst[i] = '\0';
 }
 
-/* Phase 7 H1: DBT SMC hook. Weak default here so dbt-less unit links
- * (the test_decode host check, macOS ld has no ELF-style weak-undefined
- * reference) keep working; the strong definition in src/dbt/dbt.c
- * overrides it in the real translator, where the hook always fires.
- * Hooks fire only on map/protect/unmap — never on the common
- * store path. */
 __attribute__((weak)) void dbt_invalidate_range(uint64_t va, uint64_t len)
 {
     (void)va;
     (void)len;
 }
-
-__attribute__((weak)) void mips_qs_begin(mips64_ctx_t *ctx)
-{
-    (void)ctx;
-}
-__attribute__((weak)) void mips_qs_commit(mips64_ctx_t *ctx)
-{
-    (void)ctx;
-}
-__attribute__((weak)) void mips_qs_abort(mips64_ctx_t *ctx)
-{
-    (void)ctx;
-}
+__attribute__((weak)) void mips_qs_begin(mips64_ctx_t *ctx) { (void)ctx; }
+__attribute__((weak)) void mips_qs_commit(mips64_ctx_t *ctx) { (void)ctx; }
+__attribute__((weak)) void mips_qs_abort(mips64_ctx_t *ctx) { (void)ctx; }
 __attribute__((weak)) void mips_vm_file_unmap_hook(uint64_t va, uint64_t len)
 {
     (void)va;
@@ -635,69 +591,105 @@ int64_t mips_mem_remap(mips64_ctx_t *ctx, uint64_t old_va, uint64_t old_len,
         uint64_t kept = old_size < new_size ? old_size : new_size;
         uint8_t *from = (uint8_t *)mips64_guest_ptr(ctx, old_va);
         uint8_t *to = (uint8_t *)mips64_guest_ptr(ctx, dst);
-        uint8_t *rbuf = NULL;
+        uint8_t *rbuf = (uint8_t *)malloc((size_t)old_size);
+        uint8_t *dbuf = (uint8_t *)calloc(1u, (size_t)new_size);
+        size_t ri;
 
-        if (split_at(ctx->task_size, old_va) != 0 ||
+        if (rbuf == NULL || dbuf == NULL ||
+            split_at(ctx->task_size, old_va) != 0 ||
             (old_va + old_size < ctx->task_size &&
              split_at(ctx->task_size, old_va + old_size) != 0) ||
             split_at(ctx->task_size, dst) != 0 ||
             (dst + new_size < ctx->task_size &&
              split_at(ctx->task_size, dst + new_size) != 0)) {
-            mips_mem_restore(remap_saved, remap_saved_count);
-            mem_unlock();
-            mips_qs_abort(ctx);
-            return -(int64_t)ENOMEM;
-        }
-        rbuf = (uint8_t *)malloc((size_t)kept);
-        if (rbuf == NULL) {
+            free(rbuf);
+            free(dbuf);
             mips_mem_restore(remap_saved, remap_saved_count);
             mem_unlock();
             mips_qs_abort(ctx);
             return -(int64_t)ENOMEM;
         }
         if ((prot & MIPS_PROT_READ) == 0U &&
-            mprotect(from, (size_t)kept, PROT_READ) != 0) {
+            mprotect(from, (size_t)old_size, PROT_READ) != 0) {
             int e = errno;
-
             free(rbuf);
+            free(dbuf);
             mips_mem_restore(remap_saved, remap_saved_count);
             mem_unlock();
             mips_qs_abort(ctx);
             return -(int64_t)e;
         }
-        memcpy(rbuf, from, (size_t)kept);
-        /* Unmap old_va before replacing dst so any failure on the
-         * source unmap leaves dst completely untouched. */
-        rc = mips_mem_unmap(ctx, old_va, old_size);
-        if (rc != 0) {
-            if ((prot & MIPS_PROT_READ) == 0U) {
-                (void)mprotect(from, (size_t)kept, host_prot(prot));
+        memcpy(rbuf, from, (size_t)old_size);
+        if ((prot & MIPS_PROT_READ) == 0U)
+            (void)mprotect(from, (size_t)old_size, host_prot(prot));
+        for (ri = 0u; ri < remap_saved_count; ri++) {
+            uint64_t lo = remap_saved[ri].start > dst ? remap_saved[ri].start : dst;
+            uint64_t hi = remap_saved[ri].end < dst + new_size ?
+                          remap_saved[ri].end : dst + new_size;
+            if (lo < hi) {
+                uint8_t *hp = (uint8_t *)mips64_guest_ptr(ctx, lo);
+                (void)mprotect(hp, (size_t)(hi - lo), PROT_READ);
+                memcpy(dbuf + (lo - dst), hp, (size_t)(hi - lo));
+                (void)mprotect(hp, (size_t)(hi - lo),
+                               host_prot(remap_saved[ri].prot));
             }
-            free(rbuf);
-            mips_mem_restore(remap_saved, remap_saved_count);
-            mem_unlock();
-            mips_qs_abort(ctx);
-            return (int64_t)rc;
         }
-        rc = ((flags & (uint64_t)MIPS_MREMAP_FIXED) != 0U) ?
-             mips_mem_map_replace(ctx, dst, new_size,
-                                  prot | MIPS_PROT_WRITE, "remap") :
-             mips_mem_map(ctx, dst, new_size,
-                          prot | MIPS_PROT_WRITE, "remap");
+        rc = mips_mem_unmap(ctx, old_va, old_size);
+        if (rc == 0) {
+            rc = ((flags & (uint64_t)MIPS_MREMAP_FIXED) != 0U) ?
+                 mips_mem_map_replace(ctx, dst, new_size,
+                                      prot | MIPS_PROT_WRITE, "remap") :
+                 mips_mem_map(ctx, dst, new_size,
+                              prot | MIPS_PROT_WRITE, "remap");
+        }
+        if (rc == 0) {
+            memcpy(to, rbuf, (size_t)kept);
+            if ((prot & MIPS_PROT_WRITE) == 0U &&
+                mips_mem_protect(ctx, dst, new_size, prot) != 0) {
+                rc = -(int)ENOMEM;
+            }
+        }
         if (rc != 0) {
+            /* Full rollback of both source and destination mappings. */
+            (void)mmap(from, (size_t)old_size, PROT_NONE,
+                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED,
+                       -1, 0);
+            (void)mmap(to, (size_t)new_size, PROT_NONE,
+                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED,
+                       -1, 0);
+            for (ri = 0u; ri < remap_saved_count; ri++) {
+                uint64_t rlo = remap_saved[ri].start;
+                uint64_t rhi = remap_saved[ri].end;
+                uint64_t olo = rlo > old_va ? rlo : old_va;
+                uint64_t ohi = rhi < old_va + old_size ? rhi : old_va + old_size;
+                uint64_t dlo = rlo > dst ? rlo : dst;
+                uint64_t dhi = rhi < dst + new_size ? rhi : dst + new_size;
+                if ( dlo < dhi ) {
+                    uint8_t *hp = (uint8_t *)mips64_guest_ptr(ctx, dlo);
+                    (void)mmap(hp, (size_t)(dhi - dlo), PROT_READ | PROT_WRITE,
+                               MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+                    memcpy(hp, dbuf + (dlo - dst), (size_t)(dhi - dlo));
+                    (void)mprotect(hp, (size_t)(dhi - dlo),
+                                   host_prot(remap_saved[ri].prot));
+                }
+                if ( olo < ohi ) {
+                    uint8_t *hp = (uint8_t *)mips64_guest_ptr(ctx, olo);
+                    (void)mmap(hp, (size_t)(ohi - olo), PROT_READ | PROT_WRITE,
+                               MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+                    memcpy(hp, rbuf + (olo - old_va), (size_t)(ohi - olo));
+                    (void)mprotect(hp, (size_t)(ohi - olo),
+                                   host_prot(remap_saved[ri].prot));
+                }
+            }
+            mips_mem_restore(remap_saved, remap_saved_count);
             free(rbuf);
+            free(dbuf);
             mem_unlock();
             mips_qs_abort(ctx);
             return (int64_t)rc;
         }
-        memcpy(to, rbuf, (size_t)kept);
         free(rbuf);
-        if ((prot & MIPS_PROT_WRITE) == 0U &&
-            mips_mem_protect(ctx, dst, new_size, prot) != 0) {
-            mem_unlock();
-            mips_qs_abort(ctx);
-            return -(int64_t)ENOMEM;
-        }
+        free(dbuf);
     }
     mem_unlock();
     mips_qs_commit(ctx);
