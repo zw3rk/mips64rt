@@ -234,6 +234,7 @@ int main(void)
                            (uint32_t)(1u | 2u), "fpage") == 0);
         mips_vm_file_map_hook(&ctx, fd, fpage, UINT64_C(0x1000), 0u,
                               (uint32_t)(1u | 2u), 0);
+        CHECK(guest_st8(&ctx, fpage, 0x77u) == 0);
         CHECK(ftruncate(fd, 0) == 0);
         mips_vm_file_post_truncate_fd(&ctx, fd, 0u);
         CHECK(guest_ld8(&ctx, fpage, &v) == MIPS_FAULT);
@@ -241,6 +242,19 @@ int main(void)
         CHECK(write(fd, probe, sizeof probe) == (ssize_t)sizeof probe);
         mips_vm_file_post_write(&ctx, fd, 0u, sizeof probe);
         CHECK(guest_ld8(&ctx, fpage, &v) == 0 && v == 0xABu);
+
+        /* Interior unmap split: unmapping middle page of 3-page file map
+         * keeps outer pages tracked and leaves middle page untouched. */
+        CHECK(ftruncate(fd, 12288) == 0);
+        CHECK(mips_mem_map(&ctx, UINT64_C(0x30000), UINT64_C(0x3000),
+                           (uint32_t)(1u | 2u), "tri") == 0);
+        mips_vm_file_map_hook(&ctx, fd, UINT64_C(0x30000), UINT64_C(0x3000),
+                              0u, (uint32_t)(1u | 2u), 0);
+        mips_vm_file_unmap_hook(UINT64_C(0x31000), UINT64_C(0x1000));
+        (void)memset(mips64_guest_ptr(&ctx, UINT64_C(0x31000)), 0xEE, 16u);
+        mips_vm_file_post_write(&ctx, fd, 0u, 12288u);
+        CHECK(guest_ld8(&ctx, UINT64_C(0x31000), &v) == 0 && v == 0xEEu);
+        CHECK(guest_ld8(&ctx, UINT64_C(0x30000), &v) == 0 && v == 0xABu);
 
         CHECK(ftruncate(fd, 8192) == 0);
         CHECK(mips_mem_map(&ctx, spage, UINT64_C(0x1000),

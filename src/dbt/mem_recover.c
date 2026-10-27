@@ -31,6 +31,11 @@
 #include "os/signal_core.h"
 #include "vm/vm_pages.h"
 
+__attribute__((weak)) void mips_vm_file_reconcile(mips64_ctx_t *ctx)
+{
+    (void)ctx;
+}
+
 /* Retry/step contract: 0 means the word ran again (retry
  * scheduled: the caller clears the exit and continues), 1 means a
  * fault or exit was delivered with its trace lines already printed
@@ -387,6 +392,7 @@ int dbt_mem_recover(mips64_ctx_t *ctx, const dbt_mem_site_t *site,
     if (ctx == NULL) {
         return 1;
     }
+    mips_vm_file_reconcile(ctx);
     if (site != NULL) {
         mips_decode(site->insn_word, &d);
         slot_pc = block_pc + (uint64_t)site->guest_pc_delta;
@@ -407,21 +413,16 @@ int dbt_mem_recover(mips64_ctx_t *ctx, const dbt_mem_site_t *site,
         mips_fault(ctx, slot_pc);
         return 2;
     }
-    /* FIXADE class first: a misaligned integer access emulates
-     * through the interp (shared alignment handling) when enabled
-     * and delivers SIGBUS when disabled — before any fill. */
-    if (dbt_mem_is_fixade_word(&d, ea, &width) != 0) {
-        if (mips_fixade_enabled(ctx) == 0) {
-            ctx->pc = slot_pc;
-            dbt_trace_fault_prefix(ctx, block_pc, slot_pc);
-            mips_bus_fault(ctx, ea);
-            return 2;
-        }
+    /* FIXADE class first: when disabled, a misaligned integer access
+     * delivers SIGBUS before any fill; when enabled, it falls through
+     * to span validation, write-gate promotion, and delay-slot target
+     * restoration before executing via interp_step. */
+    if (dbt_mem_is_fixade_word(&d, ea, &width) != 0 &&
+        mips_fixade_enabled(ctx) == 0) {
         ctx->pc = slot_pc;
-        ctx->next_pc = slot_pc + 4u;
         dbt_trace_fault_prefix(ctx, block_pc, slot_pc);
-        rc = interp_step(ctx);
-        return rc == 0 ? 0 : 1;
+        mips_bus_fault(ctx, ea);
+        return 2;
     }
     /* Full-span validation before any retry: a span reaching an
      * unmapped (or wrong-prot) page faults genuinely instead of

@@ -51,6 +51,7 @@ typedef struct {
     long pid;
     _Atomic(int) state;
     _Atomic(int) leases;
+    int saved_leases;
     int depth;
 } qs_slot_t;
 
@@ -279,7 +280,19 @@ void mips_qs_begin(mips64_ctx_t *ctx)
         s->depth++;
         return;
     }
-    (void)pthread_mutex_lock(&qs_mu);
+    /* Step 1 (Rev 4 §4.5): drop any held dispatch lease and park
+     * before acquiring qs_mu so two concurrent mutating syscalls
+     * never deadlock waiting for each other's lease. */
+    {
+        int saved = atomic_exchange(&s->leases, 0);
+
+        if (saved > 0) {
+            atomic_fetch_sub(&qs_leases, saved);
+        }
+        atomic_store(&s->state, MIPS_QS_PARKED);
+        (void)pthread_mutex_lock(&qs_mu);
+        s->saved_leases = saved;
+    }
     s->depth = 1;
     atomic_store(&s->state, MIPS_QS_MUTATING);
     atomic_store(&qs_mutating, 1);
@@ -342,7 +355,16 @@ static void qs_end(mips64_ctx_t *ctx, int publish)
          * (fillers are parked or lease-gated throughout). */
         mips_soft_tlb_invalidate_all();
     }
-    atomic_store(&s->state, MIPS_QS_RUNNING);
+    if (s->saved_leases > 0) {
+        int saved = s->saved_leases;
+
+        s->saved_leases = 0;
+        atomic_store(&s->leases, saved);
+        atomic_fetch_add(&qs_leases, saved);
+        atomic_store(&s->state, MIPS_QS_LEASE);
+    } else {
+        atomic_store(&s->state, MIPS_QS_RUNNING);
+    }
     atomic_store(&qs_mutating, 0);
     (void)pthread_mutex_unlock(&qs_mu);
 }

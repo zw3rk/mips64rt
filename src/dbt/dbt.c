@@ -194,7 +194,7 @@ typedef struct {
 } dbt_aot_preload_t;
 
 static _Thread_local dbt_aot_preload_t aot_preload[DBT_AOT_PRELOAD_MAX];
-static _Thread_local int aot_preload_done;
+static _Thread_local char aot_preload_path[512];
 
 static int dbt_aot_visit(uint64_t guest_pc, const struct dbt_mem_site *sites,
                          size_t count, void *arg)
@@ -222,27 +222,50 @@ static int dbt_aot_visit(uint64_t guest_pc, const struct dbt_mem_site *sites,
 
 static void dbt_aot_ensure_loaded(void)
 {
-    const char *leaf;
+    const char *leaf = mips_aot_leaf_path();
+    size_t i;
 
-    if (aot_preload_done != 0)
+    if (leaf == NULL || leaf[0] == '\0') {
+        aot_preload_path[0] = '\0';
         return;
-    leaf = mips_aot_leaf_path();
-    if (leaf == NULL)
+    }
+    if (strcmp(aot_preload_path, leaf) == 0)
         return;
-    aot_preload_done = 1;
+    for (i = 0u; i < DBT_AOT_PRELOAD_MAX; i++) {
+        if (aot_preload[i].sites != NULL) {
+            free(aot_preload[i].sites);
+            aot_preload[i].sites = NULL;
+        }
+        aot_preload[i].used = 0;
+        aot_preload[i].count = 0u;
+    }
+    strncpy(aot_preload_path, leaf, sizeof aot_preload_path - 1u);
+    aot_preload_path[sizeof aot_preload_path - 1u] = '\0';
     (void)mips_aot_sites_load(leaf, dbt_aot_visit, NULL);
 }
 
-static int dbt_aot_has_match(uint64_t pc, const dbt_mem_site_t *rows,
-                             size_t nrows)
+static const dbt_mem_site_t *dbt_aot_take_match(uint64_t pc,
+                                                const dbt_mem_site_t *rows,
+                                                size_t nrows,
+                                                size_t code_len)
 {
     unsigned idx = (unsigned)((pc >> 2) ^ (pc >> 12)) &
                    (DBT_AOT_PRELOAD_MAX - 1u);
     const dbt_aot_preload_t *p = &aot_preload[idx];
+    size_t i;
 
     if (!p->used || p->pc != pc || p->sites == NULL || p->count != nrows)
-        return 0;
-    return memcmp(p->sites, rows, nrows * sizeof(dbt_mem_site_t)) == 0;
+        return NULL;
+    for (i = 0u; i < nrows; i++) {
+        if (p->sites[i].guest_pc_delta != rows[i].guest_pc_delta ||
+            p->sites[i].insn_word != rows[i].insn_word ||
+            p->sites[i].seq_start_offset > p->sites[i].host_insn_offset ||
+            p->sites[i].host_insn_offset >= p->sites[i].cont_insn_offset ||
+            (size_t)p->sites[i].cont_insn_offset > code_len) {
+            return NULL;
+        }
+    }
+    return p->sites;
 }
 
 static unsigned cache_index(uint64_t pc)
@@ -498,16 +521,18 @@ int dbt_compile(mips64_ctx_t *ctx, uint64_t pc)
             ei_mem_take_sites(&rows, &nrows);
             if (rows != NULL && nrows != 0u &&
                 nrows <= DBT_MEM_SITES_MAX) {
+                const dbt_mem_site_t *aot_rows =
+                    dbt_aot_take_match(pc, rows, nrows, out_len);
                 dbt_mem_site_t *copy =
                     (dbt_mem_site_t *)malloc(nrows *
                                              sizeof(dbt_mem_site_t));
 
                 if (copy != NULL) {
-                    memcpy(copy, rows,
+                    memcpy(copy, aot_rows != NULL ? aot_rows : rows,
                            nrows * sizeof(dbt_mem_site_t));
                     slot->sites = copy;
                     slot->site_count = nrows;
-                    if (!dbt_aot_has_match(pc, copy, nrows)) {
+                    if (aot_rows == NULL) {
                         mips_aot_note_block(pc, copy, nrows);
                         (void)dbt_aot_visit(pc, copy, nrows, NULL);
                     }

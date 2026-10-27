@@ -516,7 +516,9 @@ int ei_unaligned(a64_emit_t *e, const mips_dec_t *d, uint64_t pc,
     ei_add(e, 0, EI_H, EI_A, EI_H);
     ei_ldr(e, 0, EI_T, EI_CTX, EI_OFF_SCRATCH);
     ei_gld(e, EI_C, d->rt);
-    ei_probe_mark_insn(e);
+    if (is_load != 0) {
+        ei_probe_mark_insn(e);
+    }
     if (is_d != 0) {
         ei_ldr(e, 0, EI_A, EI_H, 0u);
     } else {
@@ -547,6 +549,7 @@ int ei_unaligned(a64_emit_t *e, const mips_dec_t *d, uint64_t pc,
         if (be != 0) {
             ei_rev(e, is_d != 0 ? 0xDAC00C00u : 0x5AC00800u, EI_A, EI_A);
         }
+        ei_probe_mark_insn(e);
         if (is_d != 0) {
             ei_str(e, 0, EI_A, EI_H, 0u);
         } else {

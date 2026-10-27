@@ -19,6 +19,7 @@
 #include <pthread.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -466,10 +467,7 @@ int mips_mem_map_replace(mips64_ctx_t *ctx, uint64_t va, uint64_t len,
 }
 
 /* Change protection on a fully mapped range; -ENOMEM when any byte is
- * unmapped. The host mapping keeps PROT_EXEC stripped (W^X). A zero
- * length succeeds as a no-op and a positive length rounds up to a 4
- * KiB multiple (contract section 2.1: `mprotect` alignment, `munmap`
- * `len == 0` differs). */
+ * unmapped. Zero length is a no-op; positive length rounds up to 4 KiB. */
 int mips_mem_protect(mips64_ctx_t *ctx, uint64_t va, uint64_t len,
                      uint32_t prot)
 {
@@ -477,13 +475,9 @@ int mips_mem_protect(mips64_ctx_t *ctx, uint64_t va, uint64_t len,
     size_t i;
     int rc = 0;
 
-    if (ctx == NULL || ctx->guest_base == 0U) {
-        return -EINVAL;
-    }
-    if ((va & (MIPS64_PAGE_SIZE - 1U)) != 0U) {
-        return -EINVAL;
-    }
-    if ((prot & ~(MIPS_PROT_READ | MIPS_PROT_WRITE | MIPS_PROT_EXEC)) != 0U) {
+    if (ctx == NULL || ctx->guest_base == 0U ||
+        (va & (MIPS64_PAGE_SIZE - 1U)) != 0U ||
+        (prot & ~(MIPS_PROT_READ | MIPS_PROT_WRITE | MIPS_PROT_EXEC)) != 0U) {
         return -EINVAL;
     }
     if (len == 0U) {
@@ -505,10 +499,6 @@ int mips_mem_protect(mips64_ctx_t *ctx, uint64_t va, uint64_t len,
         rc = -ENOMEM;
     } else if (mprotect((void *)(uintptr_t)(ctx->guest_base + va),
                         (size_t)len, host_prot(prot)) != 0) {
-        /* Staged commit: the host operation runs before any prot is
-         * published. On failure the recorded prots (and the SMC
-         * epoch) are untouched; only the coverage-neutral boundary
-         * splits stay behind. */
         rc = -errno;
     } else {
         for (i = 0; i < g_region_count; i++) {
@@ -527,14 +517,9 @@ int mips_mem_protect(mips64_ctx_t *ctx, uint64_t va, uint64_t len,
     return rc;
 }
 
-/* mremap flags (Linux uapi, arch-independent values). */
 #define MIPS_MREMAP_MAYMOVE 1U
 #define MIPS_MREMAP_FIXED 2U
 
-/* First hole of at least size bytes at or after cand; 0 when none.
- * Unlocked read: a concurrent mutation may yield a stale hole, but
- * the acting mips_mem_map re-checks overlap under the lock, so the
- * worst case is a spurious -ENOMEM, never a clobber. */
 static uint64_t remap_hole(uint64_t task_size, uint64_t cand, uint64_t size)
 {
     size_t i;
@@ -557,7 +542,6 @@ static uint64_t remap_hole(uint64_t task_size, uint64_t cand, uint64_t size)
     return cand;
 }
 
-/* Protection of the region covering va (caller guarantees mapped). */
 static uint32_t remap_prot(uint64_t va)
 {
     size_t i;
@@ -570,11 +554,6 @@ static uint32_t remap_prot(uint64_t va)
     return 0U;
 }
 
-/*
- * Resize/move a mapping (contract section 2.1): non-destructive on
- * error (pre-splits source boundaries and uses mips_mem_map_replace
- * for FIXED moves).
- */
 int64_t mips_mem_remap(mips64_ctx_t *ctx, uint64_t old_va, uint64_t old_len,
                        uint64_t new_len, uint64_t flags, uint64_t new_va)
 {
@@ -584,25 +563,15 @@ int64_t mips_mem_remap(mips64_ctx_t *ctx, uint64_t old_va, uint64_t old_len,
     uint64_t dst;
     int rc;
 
-    if (ctx == NULL || ctx->guest_base == 0U) {
+    if (ctx == NULL || ctx->guest_base == 0U || old_len == 0U ||
+        new_len == 0U || (old_va & (MIPS64_PAGE_SIZE - 1U)) != 0U) {
         return -(int64_t)EINVAL;
     }
     if ((flags & ~(uint64_t)(MIPS_MREMAP_MAYMOVE |
-                             MIPS_MREMAP_FIXED)) != 0U) {
-        return -(int64_t)EINVAL;
-    }
-    if (((flags & (uint64_t)MIPS_MREMAP_FIXED) != 0U) &&
-        ((flags & (uint64_t)MIPS_MREMAP_MAYMOVE) == 0U)) {
-        return -(int64_t)EINVAL;
-    }
-    if (old_len == 0U || new_len == 0U) {
-        return -(int64_t)EINVAL;
-    }
-    if ((old_va & (MIPS64_PAGE_SIZE - 1U)) != 0U) {
-        return -(int64_t)EINVAL;
-    }
-    if (((flags & (uint64_t)MIPS_MREMAP_FIXED) != 0U) &&
-        ((new_va & (MIPS64_PAGE_SIZE - 1U)) != 0U)) {
+                             MIPS_MREMAP_FIXED)) != 0U ||
+        (((flags & (uint64_t)MIPS_MREMAP_FIXED) != 0U) &&
+         (((flags & (uint64_t)MIPS_MREMAP_MAYMOVE) == 0U) ||
+          ((new_va & (MIPS64_PAGE_SIZE - 1U)) != 0U)))) {
         return -(int64_t)EINVAL;
     }
     old_size = page_up(old_len);
@@ -663,53 +632,79 @@ int64_t mips_mem_remap(mips64_ctx_t *ctx, uint64_t old_va, uint64_t old_len,
         static mips64_region_t remap_saved[MIPS64_MAX_REGIONS];
         size_t remap_saved_count =
             mips_mem_snapshot(remap_saved, MIPS64_MAX_REGIONS);
+        uint64_t kept = old_size < new_size ? old_size : new_size;
+        uint8_t *from = (uint8_t *)mips64_guest_ptr(ctx, old_va);
+        uint8_t *to = (uint8_t *)mips64_guest_ptr(ctx, dst);
+        uint8_t *rbuf = NULL;
 
         if (split_at(ctx->task_size, old_va) != 0 ||
             (old_va + old_size < ctx->task_size &&
-             split_at(ctx->task_size, old_va + old_size) != 0)) {
+             split_at(ctx->task_size, old_va + old_size) != 0) ||
+            split_at(ctx->task_size, dst) != 0 ||
+            (dst + new_size < ctx->task_size &&
+             split_at(ctx->task_size, dst + new_size) != 0)) {
             mips_mem_restore(remap_saved, remap_saved_count);
             mem_unlock();
             mips_qs_abort(ctx);
             return -(int64_t)ENOMEM;
         }
-        rc = ((flags & (uint64_t)MIPS_MREMAP_FIXED) != 0U) ?
-             mips_mem_map_replace(ctx, dst, new_size, prot, "remap") :
-             mips_mem_map(ctx, dst, new_size, prot, "remap");
+        rbuf = (uint8_t *)malloc((size_t)kept);
+        if (rbuf == NULL) {
+            mips_mem_restore(remap_saved, remap_saved_count);
+            mem_unlock();
+            mips_qs_abort(ctx);
+            return -(int64_t)ENOMEM;
+        }
+        if ((prot & MIPS_PROT_READ) == 0U &&
+            mprotect(from, (size_t)kept, PROT_READ) != 0) {
+            int e = errno;
+
+            free(rbuf);
+            mips_mem_restore(remap_saved, remap_saved_count);
+            mem_unlock();
+            mips_qs_abort(ctx);
+            return -(int64_t)e;
+        }
+        memcpy(rbuf, from, (size_t)kept);
+        /* Unmap old_va before replacing dst so any failure on the
+         * source unmap leaves dst completely untouched. */
+        rc = mips_mem_unmap(ctx, old_va, old_size);
         if (rc != 0) {
+            if ((prot & MIPS_PROT_READ) == 0U) {
+                (void)mprotect(from, (size_t)kept, host_prot(prot));
+            }
+            free(rbuf);
             mips_mem_restore(remap_saved, remap_saved_count);
             mem_unlock();
             mips_qs_abort(ctx);
             return (int64_t)rc;
         }
+        rc = ((flags & (uint64_t)MIPS_MREMAP_FIXED) != 0U) ?
+             mips_mem_map_replace(ctx, dst, new_size,
+                                  prot | MIPS_PROT_WRITE, "remap") :
+             mips_mem_map(ctx, dst, new_size,
+                          prot | MIPS_PROT_WRITE, "remap");
+        if (rc != 0) {
+            free(rbuf);
+            mem_unlock();
+            mips_qs_abort(ctx);
+            return (int64_t)rc;
+        }
+        memcpy(to, rbuf, (size_t)kept);
+        free(rbuf);
+        if ((prot & MIPS_PROT_WRITE) == 0U &&
+            mips_mem_protect(ctx, dst, new_size, prot) != 0) {
+            mem_unlock();
+            mips_qs_abort(ctx);
+            return -(int64_t)ENOMEM;
+        }
     }
-    {
-        uint64_t kept = old_size < new_size ? old_size : new_size;
-        uint8_t *to = (uint8_t *)mips64_guest_ptr(ctx, dst);
-        uint8_t *from = (uint8_t *)mips64_guest_ptr(ctx, old_va);
-
-        if ((prot & MIPS_PROT_READ) == 0U) {
-            (void)mprotect(from, (size_t)kept, PROT_READ);
-        }
-        if ((prot & MIPS_PROT_WRITE) == 0U) {
-            (void)mprotect(to, (size_t)new_size, PROT_READ | PROT_WRITE);
-        }
-        memcpy(to, from, (size_t)kept);
-        if ((prot & MIPS_PROT_WRITE) == 0U) {
-            (void)mprotect(to, (size_t)new_size, host_prot(prot));
-        }
-    }
-    rc = mips_mem_unmap(ctx, old_va, old_size);
     mem_unlock();
     mips_qs_commit(ctx);
-    return rc != 0 ? (int64_t)rc : (int64_t)dst;
+    return (int64_t)dst;
 }
 
-/*
- * Reserve task_size host VA (PROT_NONE, MAP_NORESERVE) and record
- * guest_base. The size follows ctx->is_n32 (N64 1ULL<<40, N32
- * 0x7fff8000); ctx->task_size records the choice. Re-init drops the
- * previous reservation and the global region records.
- */
+/* Reserve task_size host VA (PROT_NONE, MAP_NORESERVE) and record guest_base. */
 int guest_mem_init(mips64_ctx_t *ctx)
 {
     uint64_t size;
@@ -851,6 +846,7 @@ void mips_mem_reset(void)
 {
     mem_lock();
     g_region_count = 0U;
+    mips_vm_file_unmap_hook(0U, ~(uint64_t)0U);
     mem_unlock();
 }
 

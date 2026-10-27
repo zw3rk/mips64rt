@@ -33,6 +33,8 @@ extern void mips_vm_file_post_write(mips64_ctx_t *ctx, int fd, uint64_t off,
                                     uint64_t n);
 extern void mips_vm_file_post_write_seq(mips64_ctx_t *ctx, int fd,
                                         uint64_t n);
+extern void mips_vm_file_shared_sync(mips64_ctx_t *ctx, uint64_t va,
+                                     uint64_t len);
 
 /* Shared helpers owned by src/os/syscalls.c. */
 extern int mips_mem_ok(const mips64_ctx_t *ctx, uint64_t va, uint64_t len,
@@ -306,6 +308,7 @@ int64_t mips_sc_read(mips64_ctx_t *ctx, uint64_t fd, uint64_t buf,
     if (n > 0) {
         mips_vm_pages_clear(buf, (uint64_t)n,
                             (unsigned)MIPS_VM_PAGE_COW_CLEAN);
+        mips_vm_file_shared_sync(ctx, buf, (uint64_t)n);
     }
     return l2a_ret(ctx, (int64_t)n);
 }

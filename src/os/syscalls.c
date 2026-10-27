@@ -121,44 +121,46 @@ int64_t l2a_ret(mips64_ctx_t *ctx, int64_t raw)
     return raw;
 }
 
-/* Alignment-free endian-aware field access (n = 2, 4, or 8). Shared
- * with the sibling syscalls_*.c files. */
 void putn(uint8_t *p, uint64_t v, unsigned n, int be)
 {
-    unsigned i;
-
-    for (i = 0U; i < n; i++) {
+    for (unsigned i = 0U; i < n; i++)
         p[be ? n - 1U - i : i] = (uint8_t)(v >> (8U * i));
-    }
 }
 
 uint64_t getn(const uint8_t *p, unsigned n, int be)
 {
     uint64_t v = 0U;
-    unsigned i;
-
-    for (i = 0U; i < n; i++) {
+    for (unsigned i = 0U; i < n; i++)
         v |= (uint64_t)p[be ? n - 1U - i : i] << (8U * i);
-    }
     return v;
 }
 
-/* Validated guest window (NULL with len>0 means -EFAULT). Zero length
- * never touches memory. Shared with the sibling syscalls_*.c files. */
-uint8_t *guest_range(mips64_ctx_t *ctx, uint64_t va, uint64_t len,
-                     int write)
+extern void mips_vm_file_shared_sync(mips64_ctx_t *ctx, uint64_t va,
+                                     uint64_t len);
+static _Thread_local uint64_t g_sync_va[8], g_sync_len[8];
+static _Thread_local unsigned g_sync_cnt;
+
+void mips_guest_range_flush(mips64_ctx_t *ctx)
+{
+    for (unsigned i = 0U; i < g_sync_cnt; i++)
+        mips_vm_file_shared_sync(ctx, g_sync_va[i], g_sync_len[i]);
+    g_sync_cnt = 0U;
+}
+
+uint8_t *guest_range(mips64_ctx_t *ctx, uint64_t va, uint64_t len, int write)
 {
     uint32_t need =
         write ? (uint32_t)MIPS_PROT_WRITE : (uint32_t)MIPS_PROT_READ;
-
-    if (len == 0U) {
+    if (len == 0U)
         return (uint8_t *)mips64_guest_ptr(ctx, va);
-    }
-    if (!mips_mem_ok(ctx, va, len, need)) {
+    if (!mips_mem_ok(ctx, va, len, need))
         return NULL;
-    }
     if (write != 0) {
         mips_vm_pages_clear(va, len, (unsigned)MIPS_VM_PAGE_COW_CLEAN);
+        if (g_sync_cnt < 8U) {
+            g_sync_va[g_sync_cnt] = va;
+            g_sync_len[g_sync_cnt++] = len;
+        }
     }
     return (uint8_t *)mips64_guest_ptr(ctx, va);
 }
@@ -569,7 +571,7 @@ int64_t mips_sc_getid(mips64_ctx_t *ctx, int which)
 
     switch (which) {
     case L2A_ID_PID:
-        v = (int64_t)getpid();
+        v = (int64_t)(ctx->difftest_enabled ? getppid() : getpid());
         break;
     case L2A_ID_PPID:
         v = (int64_t)getppid();
@@ -587,7 +589,7 @@ int64_t mips_sc_getid(mips64_ctx_t *ctx, int which)
         v = (int64_t)getegid();
         break;
     case L2A_ID_TID:
-        v = l2a_host_tid();
+        v = ctx->difftest_enabled ? (int64_t)getppid() : l2a_host_tid();
         break;
     default:
         return l2a_ret(ctx, -(int64_t)EINVAL);

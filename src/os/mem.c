@@ -373,11 +373,15 @@ void mips64_difftest_checkpoint(const mips64_ctx_t *ctx)
     uint64_t h = UINT64_C(0xcbf29ce484222325);
     unsigned i;
 
-    if (ctx == NULL || !ctx->difftest_enabled) {
+    if (ctx == NULL || !ctx->difftest_enabled || ctx->in_delay_slot != 0U) {
         return;
     }
     for (i = 1u; i < 32u; i++) {
         h ^= ctx->gpr[i];
+        h *= UINT64_C(0x100000001b3);
+    }
+    for (i = 0u; i < 32u; i++) {
+        h ^= ctx->fpr[i];
         h *= UINT64_C(0x100000001b3);
     }
     h ^= ctx->hi;

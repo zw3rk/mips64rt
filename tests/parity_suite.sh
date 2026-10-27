@@ -172,12 +172,63 @@ run_abi() {
     grep -v "^P1-INFO pageend-offset=" /tmp/o-qemu > /tmp/o-qemu-n
     grep -v "^P1-INFO pageend-offset=" /tmp/o-interp > /tmp/o-interp-n
     if cmp -s /tmp/o-qemu-n /tmp/o-interp-n; then
-        echo "P-PASS: $abi oracle parity (interp == dbt == $qemu)"
-        return
+        echo "P-PASS: $abi P1 oracle parity (interp == dbt == $qemu)"
+    else
+        echo "P-GAP: $abi P1 oracle differs, engines agree (see diff)"
+        diff /tmp/o-qemu /tmp/o-interp | head -20
+        gaps=$((gaps + 1))
     fi
-    echo "P-GAP: $abi oracle differs, engines agree (see diff)"
-    diff /tmp/o-qemu /tmp/o-interp | head -20
-    gaps=$((gaps + 1))
+    for suite in "p3:tests/test_p3_fp_simd.c:-lm" \
+                 "p4:tests/test_p4_threads_signals.c:-pthread" \
+                 "p6:tests/test_p6_perms.c:" \
+                 "h1:tests/test_h1_smc.c:"; do
+        tag="${suite%%:*}"
+        rest="${suite#*:}"
+        src="${rest%%:*}"
+        libs="${rest#*:}"
+        sbin="/tmp/${tag}-${abi}"
+        # shellcheck disable=SC2086
+        $cc $CFLAGS -mabi=$mabi -o "$sbin" "$src" $libs || {
+            echo "P-FAIL: $abi $tag build failed"; fails=$((fails + 1)); return
+        }
+        set +e
+        timeout --kill-after=30s 60s "$qemu" "$sbin" >/tmp/s-qemu 2>&1
+        sqrc=$?
+        timeout --kill-after=30s 60s /w/_build/mips64rt --interp "$sbin" >/tmp/s-interp 2>&1
+        sirc=$?
+        timeout --kill-after=30s 60s /w/_build/mips64rt --dbt "$sbin" >/tmp/s-dbt 2>&1
+        sdrc=$?
+        set -e
+        [ "$sqrc" = "$sirc" ] && [ "$sqrc" = "$sdrc" ] || {
+            echo "P-FAIL: $abi $tag exit differs ($sqrc/$sirc/$sdrc)"; fails=$((fails + 1)); return
+        }
+        cmp -s /tmp/s-interp /tmp/s-dbt || {
+            echo "P-FAIL: $abi $tag interp != dbt"; fails=$((fails + 1)); return
+        }
+        grep -v "^P4-INFO " /tmp/s-qemu > /tmp/s-qemu-n
+        grep -v "^P4-INFO " /tmp/s-interp > /tmp/s-interp-n
+        cmp -s /tmp/s-qemu-n /tmp/s-interp-n || {
+            echo "P-GAP: $abi $tag oracle differs"; gaps=$((gaps + 1)); return
+        }
+        echo "P-PASS: $abi $tag oracle parity (interp == dbt == $qemu)"
+    done
+    dbin="/tmp/d2-${abi}"
+    # shellcheck disable=SC2086
+    $cc $CFLAGS -mabi=$mabi -o "$dbin" tests/difftest/test_d2_hello.c || {
+        echo "P-FAIL: $abi d2 build failed"; fails=$((fails + 1)); return
+    }
+    set +e
+    MIPS64RT_RANDSEED=1 timeout --kill-after=30s 60s \
+        /w/_build/mips64rt --difftest "$dbin" >/tmp/s-diff 2>&1
+    dfrc=$?
+    set -e
+    if [ "$dfrc" -eq 0 ] && grep -q "difftest clean" /tmp/s-diff; then
+        echo "P-PASS: $abi --difftest (I + R trace 0 divergences)"
+    else
+        echo "P-FAIL: $abi --difftest failed (rc=$dfrc)"
+        tail -10 /tmp/s-diff
+        fails=$((fails + 1))
+    fi
 }
 run_abi n64le mips64el-linux-gnuabi64-gcc 64 qemu-mips64el
 run_abi n64be mips64-linux-gnuabi64-gcc 64 qemu-mips64
@@ -191,9 +242,9 @@ exit 0
     crc=$?
     set -e
     if [ "$crc" -eq 0 ]; then
-        ok "P1 4-ABI oracle parity (interp == dbt == qemu, N64/N32 x LE/BE)"
+        ok "P1/P3/P4/P6/H1/--difftest 4-ABI oracle parity (interp == dbt == qemu, N64/N32 x LE/BE)"
     elif [ "$crc" -eq 2 ]; then
-        gap "P1 oracle GAP (interp == dbt, oracle differs)"
+        gap "P1/P3/P4/P6/H1 oracle GAP (interp == dbt, oracle differs)"
         sed -n '1,25p' /tmp/parity-docker.log
     else
         bad "docker oracle section failed (exit $crc)"
@@ -202,11 +253,11 @@ exit 0
 fi
 
 # --- 3. Phase lanes with their own gates (bounded, self-cleaning) ---
-if ./tests/run_h1_smc.sh >/tmp/parity-h1.log 2>&1; then
-    ok "H1 SMC gate (interp == dbt, N64/N32 x LE/BE)"
+if ./tests/run_p5_busybox.sh >/tmp/parity-p5.log 2>&1; then
+    ok "P5 dynamic + BusyBox gate (interp == dbt == qemu, N64/N32 x LE/BE)"
 else
-    bad "H1 SMC gate failed"
-    tail -5 /tmp/parity-h1.log
+    bad "P5 dynamic + BusyBox gate failed"
+    tail -5 /tmp/parity-p5.log
 fi
 if ./tests/run_h4_cxx17.sh >/tmp/parity-h4.log 2>&1; then
     ok "H4 C++17 gate (interp == dbt, N64/N32 x LE/BE)"

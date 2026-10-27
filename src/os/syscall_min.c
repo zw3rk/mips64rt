@@ -96,6 +96,10 @@ extern void mips_qs_lease_exit(mips64_ctx_t *ctx);
 extern void mips_vm_file_map_hook(mips64_ctx_t *ctx, int fd, uint64_t va,
                                   uint64_t len, uint64_t file_offset,
                                   uint32_t prot, int is_shared);
+extern void mips_vm_file_shared_sync(mips64_ctx_t *ctx, uint64_t va,
+                                     uint64_t len);
+extern void mips_vm_file_reconcile(mips64_ctx_t *ctx);
+extern void mips_guest_range_flush(mips64_ctx_t *ctx);
 /* Phase 4 seams (lanes L4a/L4b/L4c). The (ctx, sp) signal seams read
  * their arguments from the guest registers; sp is reserved. */
 extern int64_t mips_sc_rt_sigaction(mips64_ctx_t *ctx, uint64_t sp);
@@ -396,6 +400,7 @@ static int64_t sc_uname(mips64_ctx_t *ctx, uint64_t va)
     memset(dst + 5U * MIPS_UTS_FIELD, 0, MIPS_UTS_FIELD);
 #endif
     mips_vm_pages_clear(va, MIPS_UTS_SIZE, (unsigned)MIPS_VM_PAGE_COW_CLEAN);
+    mips_vm_file_shared_sync(ctx, va, MIPS_UTS_SIZE);
     return sc_ret(ctx, 0);
 }
 
@@ -616,7 +621,8 @@ static int64_t mips_syscall_inner(mips64_ctx_t *ctx)
         ctx->clear_child_tid = a0;
         /* Single-threaded Phase 1: pid is the tid (real tids in
          * Phase 4). E06: the N64 number is 5212, the N32 number 6213. */
-        return sc_ret(ctx, (int64_t)getpid());
+        return sc_ret(ctx, (int64_t)(ctx->difftest_enabled ? getppid()
+                                                           : getpid()));
     }
     if (nr == (uint64_t)(n32 ? MIPS64_NR32_set_thread_area
                              : MIPS64_NR_set_thread_area)) {
@@ -839,7 +845,9 @@ int64_t mips_syscall(mips64_ctx_t *ctx)
     int64_t rc;
 
     mips_qs_lease_enter(ctx);
+    mips_vm_file_reconcile(ctx);
     rc = mips_syscall_inner(ctx);
+    mips_guest_range_flush(ctx);
     mips_qs_lease_exit(ctx);
     sc_deliver_pending(ctx);
     return rc;
