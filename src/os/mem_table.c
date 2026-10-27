@@ -754,7 +754,7 @@ int guest_mem_init(mips64_ctx_t *ctx)
 
     if (ctx == NULL)
         return MIPS_FAULT;
-    size = mips_task_size(ctx);
+    size = ctx->is_n32 != 0U ? MIPS64_N32_TASK_SIZE : MIPS64_N64_TASK_SIZE;
     mem_lock();
     if (ctx->guest_base != 0U && ctx->task_size != 0U) {
         (void)munmap((void *)(uintptr_t)ctx->guest_base,
@@ -763,6 +763,11 @@ int guest_mem_init(mips64_ctx_t *ctx)
     }
     base = mmap(NULL, (size_t)size, PROT_NONE,
                 MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (base == MAP_FAILED && ctx->is_n32 == 0U) {
+        size = UINT64_C(0x200000000);
+        base = mmap(NULL, (size_t)size, PROT_NONE,
+                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    }
     if (base == MAP_FAILED) {
         ctx->guest_base = 0U;
         ctx->task_size = 0U;

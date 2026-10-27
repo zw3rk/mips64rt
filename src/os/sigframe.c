@@ -188,7 +188,10 @@ static int l4b_pend_consume(mips64_ctx_t *ctx, int signo, int32_t *codep,
 static int l4b_ensure_trampoline(mips64_ctx_t *ctx)
 {
     int n32 = ctx->is_n32 != 0U;
-    uint64_t tramp = mips64_signal_trampoline_addr(n32);
+    uint64_t tramp = (!n32 && ctx->task_size != 0U &&
+                      ctx->task_size < MIPS64_N64_TASK_SIZE)
+        ? (ctx->task_size - UINT64_C(0x20000))
+        : mips64_signal_trampoline_addr(n32);
     uint64_t page = tramp & MIPS64_PAGE_MASK;
     uint64_t nr = (uint64_t)(n32 ? MIPS64_NR32_rt_sigreturn
                                  : MIPS64_NR_rt_sigreturn);
@@ -419,7 +422,10 @@ int mips_raise_guest(mips64_ctx_t *ctx, int signo, uint64_t fault_addr)
     ctx->gpr[MIPS64_REG_A0] = (uint64_t)(uint32_t)signo;
     ctx->gpr[MIPS64_REG_A1] = l4b_va(ctx, frame + 24U);
     ctx->gpr[MIPS64_REG_A2] = l4b_va(ctx, frame + 152U);
-    ctx->gpr[MIPS64_REG_RA] = mips64_signal_trampoline_addr(n32);
+    ctx->gpr[MIPS64_REG_RA] = (!n32 && ctx->task_size != 0U &&
+                               ctx->task_size < MIPS64_N64_TASK_SIZE)
+        ? (ctx->task_size - UINT64_C(0x20000))
+        : mips64_signal_trampoline_addr(n32);
     /* PIC handlers recompute gp from $25 (mips32rt precedent): the
      * kernel enters the handler with $25 = handler address. */
     ctx->gpr[MIPS64_REG_T9] = act.handler;

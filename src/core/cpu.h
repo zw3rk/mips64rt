@@ -323,7 +323,10 @@ static inline int mips_is_n32(const mips64_ctx_t *ctx)
 
 static inline uint64_t mips_task_size(const mips64_ctx_t *ctx)
 {
-    return ctx->is_n32 != 0U ? MIPS64_N32_TASK_SIZE : MIPS64_N64_TASK_SIZE;
+    if (ctx != NULL && ctx->task_size != 0U)
+        return ctx->task_size;
+    return (ctx != NULL && ctx->is_n32 != 0U) ? MIPS64_N32_TASK_SIZE
+                                              : MIPS64_N64_TASK_SIZE;
 }
 
 static inline uint64_t mips64_page_down(uint64_t x)

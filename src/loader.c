@@ -562,7 +562,9 @@ static int build_stack(mips64_ctx_t *ctx, int argc, char **argv, char **envp,
     int w32 = ctx->is_n32 != 0U ? 1 : 0;
     uint64_t ws = w32 ? 4U : 8U;
     uint64_t stack_top = ctx->is_n32 != 0U ? MIPS64_N32_STACK_TOP
-                                           : MIPS64_N64_STACK_TOP;
+        : (ctx->task_size != 0U && ctx->task_size < MIPS64_N64_TASK_SIZE
+            ? (ctx->task_size - UINT64_C(0x10000))
+            : MIPS64_N64_STACK_TOP);
     uint64_t stack_base = stack_top - MIPS_STACK_SIZE;
     uint64_t str_size = 0U;
     uint64_t nenv = 0U;
@@ -778,7 +780,9 @@ int mips_load_elf(mips64_ctx_t *ctx, const char *path, char **argv,
     }
     ctx->task_size = mips_task_size(ctx);
     ctx->mmap_base = ctx->is_n32 != 0U ? MIPS64_N32_MMAP_BASE
-                                       : MIPS64_N64_MMAP_BASE;
+        : (ctx->task_size < MIPS64_N64_TASK_SIZE
+            ? (ctx->task_size / 2U)
+            : MIPS64_N64_MMAP_BASE);
     ctx->mmap_cursor = ctx->mmap_base;
     bias = eh.type == MIPS_ET_DYN ? MIPS_DYN_BIAS : 0U;
     if (map_segments(ctx, fd, &eh, bias, &seg_end, &phdr) != 0) {
@@ -825,7 +829,9 @@ int mips_load_elf(mips64_ctx_t *ctx, const char *path, char **argv,
         }
         ibias = ieh.type == MIPS_ET_DYN ?
             (ctx->is_n32 != 0U ? MIPS_INTERP_BIAS_N32 :
-                                 MIPS_INTERP_BIAS_N64) : 0U;
+                (ctx->task_size < MIPS64_N64_TASK_SIZE
+                    ? ((ctx->task_size * 3U) / 4U)
+                    : MIPS_INTERP_BIAS_N64)) : 0U;
         if (map_segments(ctx, ifd, &ieh, ibias, &iseg_end, &iphdr) != 0) {
             close(ifd);
             close(fd);
