@@ -19,7 +19,7 @@ CROSS_CC ?= aarch64-unknown-linux-musl-gcc
 HOST_CC ?= cc
 # `-pthread` for the Phase 4 thread runtime; glibc >= 2.34 and macOS link
 # without it, older glibc needs it.
-CFLAGS := -std=c11 -Werror=vla -pedantic -Wall -Wextra -Werror -pthread
+CFLAGS := -O2 -std=c11 -Werror=vla -pedantic -Wall -Wextra -Werror -pthread
 INCLUDES := -Isrc
 BUILD := _build
 
