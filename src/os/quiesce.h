@@ -57,10 +57,15 @@
  * table). A peer parked while holding one of those would deadlock
  * the transaction: the mutator blocks on the lock while the holder
  * spins for the commit. Save/restore pairs nest properly. */
+int mips_qs_has_peers(void);
+
 static inline void mips_qs_block_preempt(sigset_t *old)
 {
     sigset_t set;
 
+    if (!mips_qs_has_peers()) {
+        return;
+    }
     (void)sigemptyset(&set);
     (void)sigaddset(&set, QS_PREEMPT_SIG);
     (void)pthread_sigmask(SIG_BLOCK, &set, old);
@@ -68,6 +73,9 @@ static inline void mips_qs_block_preempt(sigset_t *old)
 
 static inline void mips_qs_unblock_preempt(const sigset_t *old)
 {
+    if (!mips_qs_has_peers()) {
+        return;
+    }
     (void)pthread_sigmask(SIG_SETMASK, old, NULL);
 }
 

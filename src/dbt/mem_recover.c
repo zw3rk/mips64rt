@@ -327,8 +327,7 @@ void dbt_u0_prefill(mips64_ctx_t *ctx, uint64_t start, uint64_t end)
             mips_soft_tlb_entry_t *e =
                 &tlb[vpn & MIPS64_SOFT_TLB_INDEX_MASK];
 
-            if ((e->read_tag == UINT64_MAX ||
-                 e->read_tag == (vpn << 12)) &&
+            if (e->read_tag == UINT64_MAX &&
                 mips_mem_ok(ctx, va, 4096U,
                             (uint32_t)MIPS_PROT_READ)) {
                 mips_soft_tlb_fill(ctx, va);

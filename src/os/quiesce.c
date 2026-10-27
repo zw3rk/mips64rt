@@ -59,7 +59,13 @@ static qs_slot_t qs_slots[QS_MAX_SLOTS];
 static pthread_mutex_t qs_mu = PTHREAD_MUTEX_INITIALIZER;
 static _Atomic(int) qs_mutating = 0;
 static _Atomic(int) qs_leases = 0;
+static _Atomic(int) qs_worker_count = 0;
 static pthread_once_t qs_once = PTHREAD_ONCE_INIT;
+
+int mips_qs_has_peers(void)
+{
+    return atomic_load_explicit(&qs_worker_count, memory_order_relaxed) > 1;
+}
 
 static qs_slot_t *qs_slot_for(const mips64_ctx_t *ctx, int create)
 {
@@ -82,6 +88,7 @@ static qs_slot_t *qs_slot_for(const mips64_ctx_t *ctx, int create)
 
         if (atomic_compare_exchange_strong(&qs_slots[i].used, &expect,
                                            1)) {
+            atomic_fetch_add(&qs_worker_count, 1);
             qs_slots[i].key = ctx;
             qs_slots[i].pthread = pthread_self();
             qs_slots[i].depth = 0;

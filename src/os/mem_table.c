@@ -92,6 +92,7 @@ __attribute__((weak)) void dbt_invalidate_range(uint64_t va, uint64_t len) { (vo
 __attribute__((weak)) void mips_qs_begin(mips64_ctx_t *ctx) { (void)ctx; }
 __attribute__((weak)) void mips_qs_commit(mips64_ctx_t *ctx) { (void)ctx; }
 __attribute__((weak)) void mips_qs_abort(mips64_ctx_t *ctx) { (void)ctx; }
+__attribute__((weak)) int mips_qs_has_peers(void) { return 0; }
 __attribute__((weak)) void mips_vm_file_unmap_hook(uint64_t va, uint64_t len) { (void)va; (void)len; }
 __attribute__((weak)) void mips_vm_file_protect_hook(uint64_t va, uint64_t len, uint32_t prot) { (void)va; (void)len; (void)prot; }
 __attribute__((weak)) int mips_vm_file_read_page(mips64_ctx_t *ctx,

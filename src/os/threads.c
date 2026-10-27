@@ -527,7 +527,7 @@ static void l4b_handler(int sig, siginfo_t *si, void *uc)
          * the run side resolves it to the precise guest pc through
          * the retained miss-site tables. */
         l4b_fault_host_pc = l4b_host_pc(uc);
-        longjmp(l4b_jb, 1);
+        _longjmp(l4b_jb, 1);
     }
     l4b_forward(sig, si, uc);
 }
@@ -582,7 +582,7 @@ int mips_hostfault_run(mips64_ctx_t *ctx, void *code, uint32_t *reasonp)
     l4b_fault_addr = 0U;
     l4b_fault_host_pc = 0U;
     l4b_ctx = ctx;
-    if (setjmp(l4b_jb) == 0) {
+    if (_setjmp(l4b_jb) == 0) {
         fn(ctx);
         l4b_armed = 0;
         l4b_ctx = NULL;
