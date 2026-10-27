@@ -38,6 +38,8 @@ int mips_vmfile_map(mips_vm64_t *vm, int fd, uint64_t off, uint64_t va,
 void mips_vm_file_map_hook(mips64_ctx_t *ctx, int fd, uint64_t va,
                            uint64_t len, uint64_t file_offset,
                            uint32_t prot, int is_shared);
+void mips_vm_file_unmap_hook(uint64_t va, uint64_t len);
+void mips_vm_file_shared_sync(mips64_ctx_t *ctx, uint64_t va, uint64_t len);
 
 /* File-mutation hooks (called after a successful host mutation):
  * grow/refresh CLEAN pages, zero discarded tails, drop wholly

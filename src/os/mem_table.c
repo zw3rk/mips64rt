@@ -4,23 +4,9 @@
  * Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0
  *
- * The host mappings inside the reservation are process-global (every
- * MAP_FIXED mmap/munmap/mprotect acts process-wide), so the region
- * table describing them must be process-global too. Per-context
- * copies (memcpy at clone, lane L4b) go stale the moment another
- * thread maps: the stale owner keeps reporting the old cover while
- * the host pages are gone, and a fresh hole search on the stale
- * table may MAP_FIXED over a live mapping owned by a sibling thread
- * (observed: a 128 MiB malloc arena clobbering a live 2 MiB thread
- * stack, then a host SIGSEGV inside guest_ld/st with mips_mem_ok
- * still passing). All table reads and writes below serialize on a
- * single recursive process mutex; guest accessors keep calling the
- * same public mips_mem_* entry points.
- *
- * Locking rules: public entry points lock once (recursive, so
- * mremap may compose map/unmap/protect). Static helpers assume the
- * lock is held. The atfork child handler re-initialises the mutex:
- * only the forking thread survives, so any in-flight holder is gone.
+ * Host mappings inside the reservation are process-global, so the region
+ * table is process-global too, serialized on a recursive mutex with
+ * quiescence preemption blocked across table critical sections.
  */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -144,11 +130,6 @@ __attribute__((weak)) void dbt_invalidate_range(uint64_t va, uint64_t len)
     (void)len;
 }
 
-/* Lane U12 quiescence transaction. Weak defaults for the same
- * reason: small unit links (test_decode, test_mem_sites) mutate the
- * table single-threaded, where the transaction is vacuous; the
- * strong definitions in src/os/quiesce.c override in the real
- * translator and the U0 gates, where every mutation transacts. */
 __attribute__((weak)) void mips_qs_begin(mips64_ctx_t *ctx)
 {
     (void)ctx;
@@ -160,6 +141,11 @@ __attribute__((weak)) void mips_qs_commit(mips64_ctx_t *ctx)
 __attribute__((weak)) void mips_qs_abort(mips64_ctx_t *ctx)
 {
     (void)ctx;
+}
+__attribute__((weak)) void mips_vm_file_unmap_hook(uint64_t va, uint64_t len)
+{
+    (void)va;
+    (void)len;
 }
 
 /* Split the region containing va so a region starts at va. Page
@@ -303,16 +289,8 @@ int mips_mem_ok(const mips64_ctx_t *ctx, uint64_t va, uint64_t len,
     return ok;
 }
 
-/*
- * Map [va, va+len) inside the reservation with the given guest prot.
- * The address must be page aligned; a positive length rounds up to a
- * 4 KiB multiple for the mapped extent (contract section 2.1), so
- * callers may pass byte-exact sizes. The host mapping is MAP_FIXED
- * anonymous with PROT_EXEC stripped (W^X). Returns 0, -EINVAL,
- * -EEXIST, -ENOMEM. Overlap check, host mmap, and record insert are
- * one critical section so concurrent mappers cannot pick the same
- * hole and clobber each other.
- */
+/* Map [va, va+len) inside the reservation with the given guest prot
+ * (PROT_EXEC stripped on host). Returns 0, -EINVAL, -EEXIST, -ENOMEM. */
 int mips_mem_map(mips64_ctx_t *ctx, uint64_t va, uint64_t len, uint32_t prot,
                  const char *tag)
 {
@@ -368,14 +346,12 @@ int mips_mem_map(mips64_ctx_t *ctx, uint64_t va, uint64_t len, uint32_t prot,
     return rc;
 }
 
+size_t mips_mem_snapshot(mips64_region_t *out, size_t cap);
+void mips_mem_restore(const mips64_region_t *regs, size_t count);
+static mips64_region_t g_saved_regions[MIPS64_MAX_REGIONS];
+
 /* Release [va, va+len): drop covered region records and punch a
- * PROT_NONE hole so the reservation stays contiguous. Valid aligned
- * args always succeed (Linux munmap semantics on unmapped pages).
- * Staged commit: the PROT_NONE replacement mapping runs first; only
- * after it lands are the records dropped and the SMC epoch bumped,
- * so a failed host operation leaves the metadata (and the guest
- * view) untouched. The boundary splits are coverage-neutral and may
- * stay in place on the failure path. */
+ * PROT_NONE hole so the reservation stays contiguous. */
 int mips_mem_unmap(mips64_ctx_t *ctx, uint64_t va, uint64_t len)
 {
     uint64_t end;
@@ -383,10 +359,8 @@ int mips_mem_unmap(mips64_ctx_t *ctx, uint64_t va, uint64_t len)
     size_t w;
     void *got;
 
-    if (ctx == NULL || ctx->guest_base == 0U) {
-        return -EINVAL;
-    }
-    if (len == 0U || (va & (MIPS64_PAGE_SIZE - 1U)) != 0U) {
+    if (ctx == NULL || ctx->guest_base == 0U || len == 0U ||
+        (va & (MIPS64_PAGE_SIZE - 1U)) != 0U) {
         return -EINVAL;
     }
     len = page_up(len);
@@ -396,12 +370,8 @@ int mips_mem_unmap(mips64_ctx_t *ctx, uint64_t va, uint64_t len)
     end = va + len;
     mips_qs_begin(ctx);
     mem_lock();
-    if (split_at(ctx->task_size, va) != 0) {
-        mem_unlock();
-        mips_qs_abort(ctx);
-        return -ENOMEM;
-    }
-    if (end < ctx->task_size && split_at(ctx->task_size, end) != 0) {
+    if (split_at(ctx->task_size, va) != 0 ||
+        (end < ctx->task_size && split_at(ctx->task_size, end) != 0)) {
         mem_unlock();
         mips_qs_abort(ctx);
         return -ENOMEM;
@@ -425,11 +395,71 @@ int mips_mem_unmap(mips64_ctx_t *ctx, uint64_t va, uint64_t len)
     }
     g_region_count = w;
     dbt_invalidate_range(va, len);
-    /* Drop the released pages' gate flags (stale rows are safe but
-     * unbounded growth is not). */
     mips_vm_pages_clear(va, len,
                         (unsigned)(MIPS_VM_PAGE_COW_CLEAN |
                                    MIPS_VM_PAGE_HAS_CODE));
+    mips_vm_file_unmap_hook(va, len);
+    mem_unlock();
+    mips_qs_commit(ctx);
+    return 0;
+}
+
+/* Atomically replace [va, va+len) for MAP_FIXED / MREMAP_FIXED. */
+int mips_mem_map_replace(mips64_ctx_t *ctx, uint64_t va, uint64_t len,
+                         uint32_t prot, const char *tag)
+{
+    uint64_t end;
+    size_t saved_count;
+    size_t i;
+    size_t w;
+    void *got;
+
+    if (ctx == NULL || ctx->guest_base == 0U || len == 0U ||
+        (va & (MIPS64_PAGE_SIZE - 1U)) != 0U ||
+        (prot & ~(MIPS_PROT_READ | MIPS_PROT_WRITE | MIPS_PROT_EXEC)) != 0U) {
+        return -EINVAL;
+    }
+    len = page_up(len);
+    if (len < MIPS64_PAGE_SIZE || len > ctx->task_size ||
+        va > ctx->task_size - len) {
+        return -EINVAL;
+    }
+    end = va + len;
+    mips_qs_begin(ctx);
+    mem_lock();
+    saved_count = mips_mem_snapshot(g_saved_regions, MIPS64_MAX_REGIONS);
+    if (split_at(ctx->task_size, va) != 0 ||
+        (end < ctx->task_size && split_at(ctx->task_size, end) != 0)) {
+        mips_mem_restore(g_saved_regions, saved_count);
+        mem_unlock();
+        mips_qs_abort(ctx);
+        return -ENOMEM;
+    }
+    w = 0U;
+    for (i = 0U; i < g_region_count; i++) {
+        if (g_regions[i].start >= va && g_regions[i].end <= end) {
+            continue;
+        }
+        g_regions[w] = g_regions[i];
+        w++;
+    }
+    g_region_count = w;
+    got = g_region_count >= MIPS64_MAX_REGIONS ? MAP_FAILED :
+          mmap((void *)(uintptr_t)(ctx->guest_base + va), (size_t)len,
+               host_prot(prot), MAP_PRIVATE | MAP_FIXED | MAP_ANONYMOUS,
+               -1, 0);
+    if (got == MAP_FAILED) {
+        mips_mem_restore(g_saved_regions, saved_count);
+        mem_unlock();
+        mips_qs_abort(ctx);
+        return -ENOMEM;
+    }
+    insert_region(va, len, prot, tag);
+    dbt_invalidate_range(va, len);
+    mips_vm_pages_clear(va, len,
+                        (unsigned)(MIPS_VM_PAGE_COW_CLEAN |
+                                   MIPS_VM_PAGE_HAS_CODE));
+    mips_vm_file_unmap_hook(va, len);
     mem_unlock();
     mips_qs_commit(ctx);
     return 0;
@@ -541,17 +571,9 @@ static uint32_t remap_prot(uint64_t va)
 }
 
 /*
- * Resize/move a mapping (contract section 2.1): old address alignment
- * and zero sizes are -EINVAL, unknown flags are -EINVAL, FIXED needs
- * MAYMOVE. Lengths round up to 4 KiB; the old range must be fully
- * mapped (-ENOMEM otherwise). Shrink and in-place growth keep the old
- * address; MAYMOVE relocates through a fresh hole (contents copied);
- * FIXED unmaps the destination first and refuses overlap. Returns the
- * new address, or a negative errno.
- *
- * Each step (check/unmap/map) is atomic under the table lock; a hole
- * picked here may lose a concurrent race, surfacing as -ENOMEM from
- * the acting map (the guest retries), never as an overlap.
+ * Resize/move a mapping (contract section 2.1): non-destructive on
+ * error (pre-splits source boundaries and uses mips_mem_map_replace
+ * for FIXED moves).
  */
 int64_t mips_mem_remap(mips64_ctx_t *ctx, uint64_t old_va, uint64_t old_len,
                        uint64_t new_len, uint64_t flags, uint64_t new_va)
@@ -596,8 +618,6 @@ int64_t mips_mem_remap(mips64_ctx_t *ctx, uint64_t old_va, uint64_t old_len,
     prot = remap_prot(old_va);
     if (new_size <= old_size &&
         ((flags & (uint64_t)MIPS_MREMAP_FIXED) == 0U)) {
-        /* Shrink in place; the tail is dropped, contents kept. A
-         * FIXED request always relocates (even when shrinking). */
         if (new_size < old_size) {
             rc = mips_mem_unmap(ctx, old_va + new_size,
                                 old_size - new_size);
@@ -607,66 +627,81 @@ int64_t mips_mem_remap(mips64_ctx_t *ctx, uint64_t old_va, uint64_t old_len,
         }
         return (int64_t)old_va;
     }
-    if ((flags & (uint64_t)MIPS_MREMAP_FIXED) != 0U) {
-        dst = new_va;
-        if (dst > ctx->task_size - new_size) {
-            return -(int64_t)EINVAL;
-        }
-        /* Fixed moves must not overlap the source (the destination
-         * is unmapped first, which would destroy overlapped data). */
-        if (!(dst + new_size <= old_va || old_va + old_size <= dst)) {
-            return -(int64_t)EINVAL;
-        }
-        rc = mips_mem_unmap(ctx, dst, new_size);
-        if (rc != 0) {
-            return (int64_t)rc;
-        }
-    } else if ((flags & (uint64_t)MIPS_MREMAP_MAYMOVE) == 0U) {
+    if ((flags & (uint64_t)MIPS_MREMAP_FIXED) == 0U &&
+        (flags & (uint64_t)MIPS_MREMAP_MAYMOVE) == 0U) {
         uint64_t ext = old_va + old_size;
 
-        /* Grow in place or fail. */
         if (old_va > ctx->task_size - new_size) {
-            return (int64_t)ENOMEM;
+            return -(int64_t)ENOMEM;
         }
         if (mips_mem_ok(ctx, old_va, new_size, 0U)) {
-            return (int64_t)old_va; /* extension already mapped */
+            return (int64_t)old_va;
         }
         if (remap_hole(ctx->task_size, ext, new_size - old_size) != ext) {
             return -(int64_t)ENOMEM;
         }
         rc = mips_mem_map(ctx, ext, new_size - old_size, prot, "remap");
-        if (rc != 0) {
-            return (int64_t)rc;
+        return rc != 0 ? (int64_t)rc : (int64_t)old_va;
+    }
+    if ((flags & (uint64_t)MIPS_MREMAP_FIXED) != 0U) {
+        dst = new_va;
+        if (dst > ctx->task_size - new_size ||
+            !(dst + new_size <= old_va || old_va + old_size <= dst)) {
+            return -(int64_t)EINVAL;
         }
-        return (int64_t)old_va;
     } else {
         uint64_t cand = ctx->mmap_base != 0U ? ctx->mmap_base : old_va;
 
-        /* Relocate through a fresh hole; the old image stays intact
-         * until the copy lands. */
         dst = remap_hole(ctx->task_size, cand, new_size);
         if (dst == 0U) {
             return -(int64_t)ENOMEM;
         }
     }
-    rc = mips_mem_map(ctx, dst, new_size, prot, "remap");
-    if (rc != 0) {
-        return (int64_t)rc;
+    mips_qs_begin(ctx);
+    mem_lock();
+    {
+        static mips64_region_t remap_saved[MIPS64_MAX_REGIONS];
+        size_t remap_saved_count =
+            mips_mem_snapshot(remap_saved, MIPS64_MAX_REGIONS);
+
+        if (split_at(ctx->task_size, old_va) != 0 ||
+            (old_va + old_size < ctx->task_size &&
+             split_at(ctx->task_size, old_va + old_size) != 0)) {
+            mips_mem_restore(remap_saved, remap_saved_count);
+            mem_unlock();
+            mips_qs_abort(ctx);
+            return -(int64_t)ENOMEM;
+        }
+        rc = ((flags & (uint64_t)MIPS_MREMAP_FIXED) != 0U) ?
+             mips_mem_map_replace(ctx, dst, new_size, prot, "remap") :
+             mips_mem_map(ctx, dst, new_size, prot, "remap");
+        if (rc != 0) {
+            mips_mem_restore(remap_saved, remap_saved_count);
+            mem_unlock();
+            mips_qs_abort(ctx);
+            return (int64_t)rc;
+        }
     }
     {
-        /* A FIXED shrink relocates fewer bytes than the source holds. */
         uint64_t kept = old_size < new_size ? old_size : new_size;
         uint8_t *to = (uint8_t *)mips64_guest_ptr(ctx, dst);
-        const uint8_t *from = (uint8_t *)mips64_guest_ptr(ctx,
-                                                                old_va);
+        uint8_t *from = (uint8_t *)mips64_guest_ptr(ctx, old_va);
 
+        if ((prot & MIPS_PROT_READ) == 0U) {
+            (void)mprotect(from, (size_t)kept, PROT_READ);
+        }
+        if ((prot & MIPS_PROT_WRITE) == 0U) {
+            (void)mprotect(to, (size_t)new_size, PROT_READ | PROT_WRITE);
+        }
         memcpy(to, from, (size_t)kept);
+        if ((prot & MIPS_PROT_WRITE) == 0U) {
+            (void)mprotect(to, (size_t)new_size, host_prot(prot));
+        }
     }
     rc = mips_mem_unmap(ctx, old_va, old_size);
-    if (rc != 0) {
-        return (int64_t)rc;
-    }
-    return (int64_t)dst;
+    mem_unlock();
+    mips_qs_commit(ctx);
+    return rc != 0 ? (int64_t)rc : (int64_t)dst;
 }
 
 /*

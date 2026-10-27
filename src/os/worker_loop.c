@@ -273,7 +273,7 @@ static int worker_run_child(mips64_ctx_t *ctx, int engine, int trace_fd,
     }
     ctx->engine = engine;
     ctx->trace_enabled = 1;
-    ctx->difftest_enabled = 0;
+    ctx->difftest_enabled = 1;
     if (engine == MIPS64_ENGINE_DBT) {
         rc = dbt_run(ctx);
     } else {
@@ -290,8 +290,8 @@ static int worker_run_child(mips64_ctx_t *ctx, int engine, int trace_fd,
     _Exit(0); /* unreachable: guest exit() ends the child via _Exit */
 }
 
-/* Compare the I-line streams of two trace files; 0 when identical,
- * printing the first divergence to real stderr. */
+/* Compare the I-line and R-line streams of two trace files; 0 when
+ * identical, printing the first divergence to real stderr. */
 static int worker_cmp_traces(const char *a_path, const char *b_path)
 {
     FILE *fa = fopen(a_path, "r");
@@ -314,13 +314,13 @@ static int worker_cmp_traces(const char *a_path, const char *b_path)
         int hb = 0;
 
         while (fgets(la, sizeof la, fa) != NULL) {
-            if (la[0] == 'I' && la[1] == ' ') {
+            if ((la[0] == 'I' || la[0] == 'R') && la[1] == ' ') {
                 ha = 1;
                 break;
             }
         }
         while (fgets(lb, sizeof lb, fb) != NULL) {
-            if (lb[0] == 'I' && lb[1] == ' ') {
+            if ((lb[0] == 'I' || lb[0] == 'R') && lb[1] == ' ') {
                 hb = 1;
                 break;
             }

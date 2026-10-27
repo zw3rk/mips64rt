@@ -187,16 +187,31 @@ static int dbt_resolve_delay_target(mips64_ctx_t *ctx, uint64_t branch_pc,
         *target = branch_pc + (uint64_t)site->npc_delta;
         return 0;
     case 0x04u: /* BEQ */
+    case 0x14u: /* BEQL */
         taken = ctx->gpr[b.rs] == ctx->gpr[b.rt];
         break;
     case 0x05u: /* BNE */
+    case 0x15u: /* BNEL */
         taken = ctx->gpr[b.rs] != ctx->gpr[b.rt];
         break;
     case 0x06u: /* BLEZ */
+    case 0x16u: /* BLEZL */
         taken = (int64_t)ctx->gpr[b.rs] <= 0;
         break;
     case 0x07u: /* BGTZ */
+    case 0x17u: /* BGTZL */
         taken = (int64_t)ctx->gpr[b.rs] > 0;
+        break;
+    case 0x11u: /* COP1 BC1F/BC1T/BC1FL/BC1TL */
+        if (b.rs == 0x08u) {
+            unsigned cc = ((unsigned)b.rt >> 2u) & 7u;
+            unsigned tf = (unsigned)b.rt & 1u;
+            uint32_t mask = (cc == 0u) ? 0x00800000u : (1u << (24u + cc));
+
+            taken = (((ctx->fcsr & mask) != 0u) == (tf != 0u));
+        } else {
+            taken = 0;
+        }
         break;
     case 0x01u: /* REGIMM */
         rs_v = ctx->gpr[b.rs];
@@ -219,7 +234,7 @@ static int dbt_resolve_delay_target(mips64_ctx_t *ctx, uint64_t branch_pc,
         }
         break;
     default:
-        taken = 1;
+        taken = 0;
         break;
     }
     *target = taken != 0 ? branch_pc + (uint64_t)site->npc_delta :
@@ -539,7 +554,7 @@ static int dbt_pc_visit(const dbt_mem_site_t *sites, size_t count,
             uint64_t cont = (uint64_t)sites[i].cont_insn_offset;
 
             if (lk->want_rewind != 0) {
-                if (rpc >= seq && rpc < insn) {
+                if (rpc >= seq && rpc <= insn) {
                     lk->seq_start = rx_base + seq;
                     lk->found = 1;
                     return 1;

@@ -423,9 +423,6 @@ int interp_exec_mem(mips64_ctx_t *ctx, uint64_t cur_pc, const mips_dec_t *d)
         interp_set_reg(ctx, d->rt, (uint64_t)(int64_t)(int8_t)(v & 0xFFu));
         return 0;
     case 0x21u: /* LH */
-        if ((addr & 1u) != 0u) {
-            return mem_fault_at(ctx, addr);
-        }
         if (guest_ld16(ctx, addr, &v) != 0) {
             return MIPS_FAULT;
         }
@@ -434,9 +431,6 @@ int interp_exec_mem(mips64_ctx_t *ctx, uint64_t cur_pc, const mips_dec_t *d)
     case 0x22u: /* LWL */
         return do_lwl(ctx, addr, d->rt);
     case 0x23u: /* LW */
-        if ((addr & 3u) != 0u) {
-            return mem_fault_at(ctx, addr);
-        }
         if (guest_ld32(ctx, addr, &v) != 0) {
             return MIPS_FAULT;
         }
@@ -449,9 +443,6 @@ int interp_exec_mem(mips64_ctx_t *ctx, uint64_t cur_pc, const mips_dec_t *d)
         interp_set_reg(ctx, d->rt, v & 0xFFu);
         return 0;
     case 0x25u: /* LHU */
-        if ((addr & 1u) != 0u) {
-            return mem_fault_at(ctx, addr);
-        }
         if (guest_ld16(ctx, addr, &v) != 0) {
             return MIPS_FAULT;
         }
@@ -460,9 +451,6 @@ int interp_exec_mem(mips64_ctx_t *ctx, uint64_t cur_pc, const mips_dec_t *d)
     case 0x26u: /* LWR */
         return do_lwr(ctx, addr, d->rt);
     case 0x27u: /* LWU */
-        if ((addr & 3u) != 0u) {
-            return mem_fault_at(ctx, addr);
-        }
         if (guest_ld32(ctx, addr, &v) != 0) {
             return MIPS_FAULT;
         }
@@ -474,9 +462,6 @@ int interp_exec_mem(mips64_ctx_t *ctx, uint64_t cur_pc, const mips_dec_t *d)
         }
         return 0;
     case 0x29u: /* SH */
-        if ((addr & 1u) != 0u) {
-            return mem_fault_at(ctx, addr);
-        }
         if (guest_st16(ctx, addr, ctx->gpr[d->rt] & 0xFFFFu) != 0) {
             return MIPS_FAULT;
         }
@@ -484,9 +469,6 @@ int interp_exec_mem(mips64_ctx_t *ctx, uint64_t cur_pc, const mips_dec_t *d)
     case 0x2Au: /* SWL */
         return do_swl(ctx, addr, ctx->gpr[d->rt]);
     case 0x2Bu: /* SW */
-        if ((addr & 3u) != 0u) {
-            return mem_fault_at(ctx, addr);
-        }
         if (guest_st32(ctx, addr, ctx->gpr[d->rt] & 0xFFFFFFFFu) != 0) {
             return MIPS_FAULT;
         }
@@ -502,9 +484,6 @@ int interp_exec_mem(mips64_ctx_t *ctx, uint64_t cur_pc, const mips_dec_t *d)
     case 0x34u: /* LLD */
         return do_lld(ctx, addr, d->rt);
     case 0x37u: /* LD */
-        if ((addr & 7u) != 0u) {
-            return mem_fault_at(ctx, addr);
-        }
         if (guest_ld64(ctx, addr, &v) != 0) {
             return MIPS_FAULT;
         }
@@ -515,9 +494,6 @@ int interp_exec_mem(mips64_ctx_t *ctx, uint64_t cur_pc, const mips_dec_t *d)
     case 0x3Cu: /* SCD */
         return do_scd(ctx, addr, d->rt);
     case 0x3Fu: /* SD */
-        if ((addr & 7u) != 0u) {
-            return mem_fault_at(ctx, addr);
-        }
         if (guest_st64(ctx, addr, ctx->gpr[d->rt]) != 0) {
             return MIPS_FAULT;
         }

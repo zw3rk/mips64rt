@@ -216,6 +216,53 @@ int main(void)
                   v == 0u);
         }
     }
+    /* Wholly removed page past eof_page revokes access (SIGBUS/MIPS_FAULT)
+     * and restores access on file growth; non-native MAP_SHARED writes
+     * through to the underlying file; read-only MREMAP_FIXED copies
+     * without faulting. */
+    {
+        extern int64_t mips_mem_remap(mips64_ctx_t *c, uint64_t old_va,
+                                      uint64_t old_len, uint64_t new_len,
+                                      uint64_t flags, uint64_t new_va);
+        uint64_t fpage = UINT64_C(0x20000);
+        uint64_t spage = UINT64_C(0x2C000);
+        uint64_t rpage = UINT64_C(0x24000);
+        uint64_t dpage = UINT64_C(0x28000);
+        uint8_t rbuf[4];
+
+        CHECK(mips_mem_map(&ctx, fpage, UINT64_C(0x1000),
+                           (uint32_t)(1u | 2u), "fpage") == 0);
+        mips_vm_file_map_hook(&ctx, fd, fpage, UINT64_C(0x1000), 0u,
+                              (uint32_t)(1u | 2u), 0);
+        CHECK(ftruncate(fd, 0) == 0);
+        mips_vm_file_post_truncate_fd(&ctx, fd, 0u);
+        CHECK(guest_ld8(&ctx, fpage, &v) == MIPS_FAULT);
+        CHECK(lseek(fd, 0, SEEK_SET) == 0);
+        CHECK(write(fd, probe, sizeof probe) == (ssize_t)sizeof probe);
+        mips_vm_file_post_write(&ctx, fd, 0u, sizeof probe);
+        CHECK(guest_ld8(&ctx, fpage, &v) == 0 && v == 0xABu);
+
+        CHECK(ftruncate(fd, 8192) == 0);
+        CHECK(mips_mem_map(&ctx, spage, UINT64_C(0x1000),
+                           (uint32_t)(1u | 2u), "spage") == 0);
+        mips_vm_file_map_hook(&ctx, fd, spage, UINT64_C(0x1000),
+                              UINT64_C(0x1000), (uint32_t)(1u | 2u), 1);
+        CHECK(guest_st32(&ctx, spage, UINT64_C(0x11223344)) == 0);
+        CHECK(pread(fd, rbuf, 4u, (off_t)0x1000) == 4 &&
+              rbuf[0] == 0x44u && rbuf[1] == 0x33u &&
+              rbuf[2] == 0x22u && rbuf[3] == 0x11u);
+
+        CHECK(mips_mem_map(&ctx, rpage, UINT64_C(0x1000),
+                           (uint32_t)(1u | 2u), "rpage") == 0);
+        CHECK(guest_st32(&ctx, rpage, UINT64_C(0xCAFEBABE)) == 0);
+        CHECK(mips_mem_protect(&ctx, rpage, UINT64_C(0x1000), 1u) == 0);
+        CHECK(mips_mem_remap(&ctx, rpage, UINT64_C(0x1000),
+                             UINT64_C(0x1000), 3u, dpage) ==
+              (int64_t)dpage);
+        CHECK(guest_ld32(&ctx, dpage, &v) == 0 &&
+              v == UINT64_C(0xCAFEBABE));
+        CHECK(guest_st32(&ctx, dpage, 0u) == MIPS_FAULT);
+    }
     (void)close(fd);
     (void)unlink(tmpl);
 

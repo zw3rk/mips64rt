@@ -253,8 +253,24 @@ static size_t ei_probe_open(a64_emit_t *e, uint64_t pc, const mips_dec_t *d,
     return miss;
 }
 
+/* Update the open site's host_insn_offset to the exact word of the
+ * first host memory instruction (past register-only setup such as
+ * ei_gld/ei_rev) so signal preemption rewinds the entire prefix. */
+static void ei_probe_mark_insn(a64_emit_t *e)
+{
+    if (e == NULL || !ei_active) {
+        return;
+    }
+    if (ei_open == (size_t)-1 || ei_open >= ei_sites.count ||
+        e->len * 4u > 0xFFFFu) {
+        e->err = 1;
+        return;
+    }
+    ei_sites.sites[ei_open].host_insn_offset = (uint16_t)(e->len * 4u);
+}
+
 /* Close the open site: cont is the first word past the memory
- * word(s), so the signal rewind can bracket [seq_start, host_insn)
+ * word(s), so the signal rewind can bracket [seq_start, host_insn]
  * (side-effect-free) against [host_insn, cont) (precise fault). */
 static void ei_probe_close(a64_emit_t *e)
 {
@@ -400,9 +416,6 @@ int ei_mem_aligned(a64_emit_t *e, const mips_dec_t *d, uint64_t pc,
     }
     ei_gld(e, EI_C, d->rt);
     if (be != 0 && kind != (unsigned)EI_RX_U8) {
-        /* EI_B is dead past the masked compare; rev the value there
-         * so x0/EI_C survive (the spec preserves x0 on BE stores).
-         * Single bytes need no rev. */
         if (kind == (unsigned)EI_RX_U16) {
             ei_rev(e, 0x5AC00400u, EI_B, EI_C);
         } else if (kind == (unsigned)EI_RX_U32) {
@@ -410,8 +423,10 @@ int ei_mem_aligned(a64_emit_t *e, const mips_dec_t *d, uint64_t pc,
         } else {
             ei_rev(e, 0xDAC00C00u, EI_B, EI_C);
         }
+        ei_probe_mark_insn(e);
         ei_mem_rx(e, kind, 0, EI_B, EI_A, EI_H);
     } else {
+        ei_probe_mark_insn(e);
         ei_mem_rx(e, kind, 0, EI_C, EI_A, EI_H);
     }
     /* E05: any ordinary store clears the reservation. */
@@ -421,8 +436,7 @@ int ei_mem_aligned(a64_emit_t *e, const mips_dec_t *d, uint64_t pc,
 }
 
 /* Variable guest-field shift: B holds the exact shift amount (sk for
- * modes 0-1, C - sk for modes 2-3, pre-adjusted by the caller). C is 24
- * for 32-bit, 56 for 64-bit (unused here). */
+ * modes 0-1, C - sk for modes 2-3, pre-adjusted by the caller). */
 static void ei_vshift(a64_emit_t *e, unsigned dst, unsigned src, int is_w,
                       int mode, unsigned cval)
 {
@@ -434,8 +448,7 @@ static void ei_vshift(a64_emit_t *e, unsigned dst, unsigned src, int is_w,
     }
 }
 
-/* Load merge: A = R (memory word), C = old rt, B = shift amount.
- * Produces the merged value in C. */
+/* Load merge: A = R (memory word), C = old rt, B = shift amount. */
 static void ei_merge_load(a64_emit_t *e, int is_w, int mode, unsigned cval)
 {
     ei_vshift(e, EI_T, EI_A, is_w, mode, cval);
@@ -450,8 +463,7 @@ static void ei_merge_load(a64_emit_t *e, int is_w, int mode, unsigned cval)
     ei_eor(e, 0, EI_C, EI_C, EI_T);
 }
 
-/* Store merge: A = R (memory word), C = rt. Produces the word in A.
- * The mask lives in C so R survives for the final XOR. */
+/* Store merge: A = R (memory word), C = rt. Produces the word in A. */
 static void ei_merge_store(a64_emit_t *e, int is_w, int mode, unsigned cval)
 {
     ei_vshift(e, EI_T, EI_C, is_w, mode, cval);
@@ -466,16 +478,7 @@ static void ei_merge_store(a64_emit_t *e, int is_w, int mode, unsigned cval)
     ei_eor(e, 0, EI_A, EI_A, EI_T);
 }
 
-/* Unaligned word/doubleword access with RC1 span semantics.
- * is_load selects the merge direction, is_d the width, mode the shift
- * shape (0 = <<sk/>>sk per dir, 2 = >>(C-sk), 3 = <<(C-sk)), cval the
- * 24/56 constant, dir the mode-0 direction (0 left, 1 right). */
-/* Unaligned word/doubleword access with RC1 span semantics.
- * is_load selects the merge direction, is_d the width, mode the shift
- * shape (0 = <<sk/>>sk per dir, 2 = >>(C-sk), 3 = <<(C-sk)), cval the
- * 24/56 constant, dir the mode-0 direction (0 left, 1 right). The
- * span check runs against task_size; the soft-TLB probe resolves the
- * aligned host page into x4 (EI_H). */
+/* Unaligned word/doubleword access with RC1 span semantics. */
 int ei_unaligned(a64_emit_t *e, const mips_dec_t *d, uint64_t pc,
                  int is_load, int is_d, int be, int mode, int swap, unsigned cval,
                  int slot)
@@ -510,13 +513,10 @@ int ei_unaligned(a64_emit_t *e, const mips_dec_t *d, uint64_t pc,
     if (miss == (size_t)-1) {
         return e == NULL ? 1 : 0;
     }
-    /* Hit: materialize the host address (the scalar fast path keeps
-     * [EI_A, EI_H] addressing, but the merge sequence below needs the
-     * plain host base in EI_H). The shift was parked in the scratch
-     * slot across the probe (which consumes EI_T): restore it now. */
     ei_add(e, 0, EI_H, EI_A, EI_H);
     ei_ldr(e, 0, EI_T, EI_CTX, EI_OFF_SCRATCH);
     ei_gld(e, EI_C, d->rt);
+    ei_probe_mark_insn(e);
     if (is_d != 0) {
         ei_ldr(e, 0, EI_A, EI_H, 0u);
     } else {
@@ -526,13 +526,9 @@ int ei_unaligned(a64_emit_t *e, const mips_dec_t *d, uint64_t pc,
         ei_rev(e, is_d != 0 ? 0xDAC00C00u : 0x5AC00800u, EI_A, EI_A);
     }
     if (is_load == 0) {
-        /* Spill the host address: EI_B becomes the shift amount below
-         * and EI_H is reloaded for the final store. The spill lifetime
-         * holds no exits, so the padding slot is invisible elsewhere. */
         ei_str(e, 0, EI_H, EI_CTX, EI_OFF_SCRATCH);
     }
     if (m == 2 || m == 3) {
-        /* EI_B = C - sk so a plain register shift does the job. */
         ei_sub_imm(e, EI_B, EI_T, cval);
         ei_sub(e, 0, EI_B, EI_XZR, EI_B);
         m = (m == 2) ? 1 : 0;
@@ -556,13 +552,9 @@ int ei_unaligned(a64_emit_t *e, const mips_dec_t *d, uint64_t pc,
         } else {
             ei_str(e, 1, EI_A, EI_H, 0u);
         }
-        /* E05: any ordinary store clears the reservation. */
         ei_strb(e, EI_XZR, EI_CTX, MIPS64_CTX_LLBIT_OFFSET);
     }
     ei_probe_close(e);
-    /* The span check faults through the per-word miss path like the
-     * probe: record its slot next to the probe miss slot so block end
-     * patches both to this word's stub. */
     if (e == NULL || ei_sites.count == 0U ||
         ei_sites.count > DBT_MEM_SITES_MAX) {
         if (e != NULL) {
@@ -576,10 +568,6 @@ int ei_unaligned(a64_emit_t *e, const mips_dec_t *d, uint64_t pc,
 }
 
 /* LL/SC/LLD/SCD via LDXR/STXR with llbit semantics. */
-/* LL/SC/LLD/SCD via LDXR/STXR with llbit semantics. The address
- * resolves through the Rev4 probe into EI_H (addend); exclusives
- * have no register-offset form, so one add materializes the host
- * address. EI_A stays live across the probe for the LLADDR store. */
 int ei_atomic(a64_emit_t *e, const mips_dec_t *d, uint64_t pc, int be,
               int slot)
 {
@@ -604,11 +592,9 @@ int ei_atomic(a64_emit_t *e, const mips_dec_t *d, uint64_t pc, int be,
     if (miss == (size_t)-1) {
         return e == NULL ? 1 : 0;
     }
-    /* EI_T is dead past the probe (tag scratch), and EI_A must
-     * survive for LLADDR. */
     ei_add(e, 0, EI_H, EI_A, EI_H);
     if (d->op == 0x30u || d->op == 0x34u) { /* LL / LLD */
-        /* Width flag is "is word": LL needs the W form, LLD the X. */
+        ei_probe_mark_insn(e);
         ei_ldxr(e, is_d == 0, EI_C, EI_H);
         ei_mov32(e, EI_T, 1u);
         ei_strb(e, EI_T, EI_CTX, MIPS64_CTX_LLBIT_OFFSET);
@@ -626,9 +612,6 @@ int ei_atomic(a64_emit_t *e, const mips_dec_t *d, uint64_t pc, int be,
         ei_probe_close(e);
         return 0;
     }
-    /* SC / SCD: the host address is needed on the dead path too, and
-     * EI_H survives the reservation checks below (nothing in between
-     * writes it), so the fail-path load reuses it directly. */
     ei_gld(e, EI_B, d->rt);
     ei_ldrb(e, EI_C, EI_CTX, MIPS64_CTX_LLBIT_OFFSET);
     dead = ei_cbz(e, 0, 0, EI_C);
@@ -638,13 +621,7 @@ int ei_atomic(a64_emit_t *e, const mips_dec_t *d, uint64_t pc, int be,
     if (be != 0) {
         ei_rev(e, is_d != 0 ? 0xDAC00C00u : 0x5AC00800u, EI_B, EI_B);
     }
-    /* The LL block exited to the dispatcher, which need not preserve
-     * the host exclusive monitor, so a bare STXR here can never
-     * succeed. Re-arm with LDXR in this block. RC4: commit only when
-     * the lane still holds the LL-observed value. EI_A is dead past
-     * the lladdr check, so it carries llval (raw host order on both
-     * sides, like the LL store). Width flag is "is word", matching
-     * the fail-path load below. */
+    ei_probe_mark_insn(e);
     top = e == NULL ? 0u : e->len;
     ei_ldxr(e, is_d == 0, EI_C, EI_H);
     ei_ldr(e, 0, EI_A, EI_CTX, MIPS64_CTX_LLVAL_OFFSET);

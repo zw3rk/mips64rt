@@ -17,6 +17,7 @@
 #include "core/cpu.h"
 
 #include "os/syscall_nr.h"
+#include "vm/vm_pages.h"
 
 #include <errno.h>
 #include <limits.h>
@@ -301,6 +302,10 @@ int64_t mips_sc_read(mips64_ctx_t *ctx, uint64_t fd, uint64_t buf,
     n = read((int)fd, host_buf, (size_t)count);
     if (n < 0) {
         return l2a_ret(ctx, -(int64_t)errno);
+    }
+    if (n > 0) {
+        mips_vm_pages_clear(buf, (uint64_t)n,
+                            (unsigned)MIPS_VM_PAGE_COW_CLEAN);
     }
     return l2a_ret(ctx, (int64_t)n);
 }

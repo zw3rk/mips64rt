@@ -158,7 +158,8 @@ static void qs_preempt_handler(int sig, siginfo_t *si, void *uc)
             uint64_t hpc;
             uint64_t seq = 0u;
 
-            if (atomic_load(&qs_mutating) == 0) {
+            if (atomic_load(&qs_mutating) == 0 ||
+                atomic_load(&qs_slots[i].leases) > 0) {
                 return;
             }
             atomic_store(&qs_slots[i].state, MIPS_QS_PARKED);
@@ -208,14 +209,29 @@ void mips_qs_lease_enter(mips64_ctx_t *ctx)
         return;
     }
     qs_touch(s);
-    /* A lease entered during a mutation parks until the commit:
-     * no new memory access starts mid-transaction. */
-    while (atomic_load(&qs_mutating) != 0) {
-        sched_yield();
+    if (s->depth != 0 || atomic_load(&s->leases) > 0) {
+        atomic_fetch_add(&s->leases, 1);
+        atomic_fetch_add(&qs_leases, 1);
+        return;
     }
-    atomic_store(&s->state, MIPS_QS_LEASE);
-    atomic_fetch_add(&s->leases, 1);
-    atomic_fetch_add(&qs_leases, 1);
+    /* Dekker lease acquisition: publish LEASE + lease count first, then
+     * check qs_mutating; if a mutation is active, back out to PARKED
+     * and wait so no leased helper ever runs or parks mid-mutation. */
+    for (;;) {
+        while (atomic_load(&qs_mutating) != 0) {
+            atomic_store(&s->state, MIPS_QS_PARKED);
+            sched_yield();
+        }
+        atomic_fetch_add(&s->leases, 1);
+        atomic_fetch_add(&qs_leases, 1);
+        atomic_store(&s->state, MIPS_QS_LEASE);
+        if (atomic_load(&qs_mutating) == 0) {
+            break;
+        }
+        atomic_fetch_sub(&s->leases, 1);
+        atomic_fetch_sub(&qs_leases, 1);
+        atomic_store(&s->state, MIPS_QS_PARKED);
+    }
 }
 
 void mips_qs_lease_exit(mips64_ctx_t *ctx)
@@ -230,11 +246,18 @@ void mips_qs_lease_exit(mips64_ctx_t *ctx)
         return;
     }
     if (atomic_load(&s->leases) > 0) {
-        atomic_fetch_sub(&s->leases, 1);
+        int rem = atomic_fetch_sub(&s->leases, 1) - 1;
+
         atomic_fetch_sub(&qs_leases, 1);
-    }
-    if (atomic_load(&s->state) == MIPS_QS_LEASE) {
-        atomic_store(&s->state, MIPS_QS_RUNNING);
+        if (rem <= 0 && s->depth == 0) {
+            if (atomic_load(&qs_mutating) != 0) {
+                atomic_store(&s->state, MIPS_QS_PARKED);
+                while (atomic_load(&qs_mutating) != 0) {
+                    sched_yield();
+                }
+            }
+            atomic_store(&s->state, MIPS_QS_RUNNING);
+        }
     }
 }
 
@@ -260,16 +283,9 @@ void mips_qs_begin(mips64_ctx_t *ctx)
     s->depth = 1;
     atomic_store(&s->state, MIPS_QS_MUTATING);
     atomic_store(&qs_mutating, 1);
-    /* Drive every peer to PARKED, re-signalling inside the loop: a
-     * peer that was in LEASE state during the last sweep (or that
-     * just entered RUNNING) has no signal in flight yet. Slots
-     * bound to this thread are never peers: the same thread cannot
-     * run two workers at once, so a same-thread slot is either this
-     * one or stale. Signalling one would preempt this very thread
-     * mid-transaction and deadlock the drain. A parked peer is out
-     * regardless of any lease it still reports: it is spun in the
-     * handler touching no memory, and its lease accounting resumes
-     * intact (the drain counts only unparked holders). */
+    /* Drive every peer to PARKED with zero active leases: leased
+     * helpers run to mips_qs_lease_exit without signal preemption
+     * and park on exit when qs_mutating is set. */
     for (;;) {
         int quiet = 1;
         int held = 0;
@@ -284,12 +300,10 @@ void mips_qs_begin(mips64_ctx_t *ctx)
                 continue;
             }
             st = atomic_load(&qs_slots[i].state);
-            if (st == MIPS_QS_RUNNING || st == MIPS_QS_LEASE) {
+            if (st != MIPS_QS_PARKED) {
                 quiet = 0;
             }
-            if (st != MIPS_QS_PARKED) {
-                held += atomic_load(&qs_slots[i].leases);
-            }
+            held += atomic_load(&qs_slots[i].leases);
         }
         if (quiet && held <= 0) {
             break;
@@ -298,7 +312,8 @@ void mips_qs_begin(mips64_ctx_t *ctx)
             if (atomic_load(&qs_slots[i].used) != 0 &&
                 &qs_slots[i] != s &&
                 !pthread_equal(qs_slots[i].pthread, self) &&
-                atomic_load(&qs_slots[i].state) != MIPS_QS_PARKED) {
+                atomic_load(&qs_slots[i].state) != MIPS_QS_PARKED &&
+                atomic_load(&qs_slots[i].leases) == 0) {
                 qs_preempt_peer(&qs_slots[i]);
             }
         }

@@ -30,11 +30,27 @@
 
 #include "core/cpu.h"
 #include "os/backend.h"
+#include "vm/vm_pages.h"
 
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+
+__attribute__((weak)) void mips_vm_file_shared_sync(mips64_ctx_t *ctx,
+                                                    uint64_t va,
+                                                    uint64_t len)
+{
+    (void)ctx;
+    (void)va;
+    (void)len;
+}
+
+static void mem_note_guest_write(mips64_ctx_t *ctx, uint64_t va, uint64_t len)
+{
+    mips_vm_pages_clear(va, len, (unsigned)MIPS_VM_PAGE_COW_CLEAN);
+    mips_vm_file_shared_sync(ctx, va, len);
+}
 
 /* Synchronous fault: records EXIT_FAULT, after an RC4 signal-delivery
  * attempt. Every execution fault traps SIGSEGV (11, identical on MIPS
@@ -173,6 +189,7 @@ int guest_st8(mips64_ctx_t *ctx, uint64_t va, uint64_t val)
     }
     b = (uint8_t)(val & 0xFFU);
     memcpy(mips64_guest_ptr(ctx, va), &b, 1U);
+    mem_note_guest_write(ctx, va, 1U);
     ctx->llbit = 0U; /* E05: any ordinary store clears the reservation */
     return 0;
 }
@@ -222,6 +239,7 @@ int guest_st16(mips64_ctx_t *ctx, uint64_t va, uint64_t val)
         b[1] = (uint8_t)((val >> 8) & 0xFFU);
     }
     memcpy(mips64_guest_ptr(ctx, va), b, 2U);
+    mem_note_guest_write(ctx, va, 2U);
     ctx->llbit = 0U; /* E05: any ordinary store clears the reservation */
     return 0;
 }
@@ -277,6 +295,7 @@ int guest_st32(mips64_ctx_t *ctx, uint64_t va, uint64_t val)
         b[3] = (uint8_t)((val >> 24) & 0xFFU);
     }
     memcpy(mips64_guest_ptr(ctx, va), b, 4U);
+    mem_note_guest_write(ctx, va, 4U);
     ctx->llbit = 0U; /* E05: any ordinary store clears the reservation */
     return 0;
 }
@@ -344,6 +363,32 @@ int guest_st64(mips64_ctx_t *ctx, uint64_t va, uint64_t val)
         b[7] = (uint8_t)((val >> 56) & 0xFFU);
     }
     memcpy(mips64_guest_ptr(ctx, va), b, 8U);
+    mem_note_guest_write(ctx, va, 8U);
     ctx->llbit = 0U; /* E05: any ordinary store clears the reservation */
     return 0;
+}
+
+void mips64_difftest_checkpoint(const mips64_ctx_t *ctx)
+{
+    uint64_t h = UINT64_C(0xcbf29ce484222325);
+    unsigned i;
+
+    if (ctx == NULL || !ctx->difftest_enabled) {
+        return;
+    }
+    for (i = 1u; i < 32u; i++) {
+        h ^= ctx->gpr[i];
+        h *= UINT64_C(0x100000001b3);
+    }
+    h ^= ctx->hi;
+    h *= UINT64_C(0x100000001b3);
+    h ^= ctx->lo;
+    h *= UINT64_C(0x100000001b3);
+    h ^= (uint64_t)ctx->fcsr;
+    h *= UINT64_C(0x100000001b3);
+    h ^= ctx->ulr;
+    h *= UINT64_C(0x100000001b3);
+    (void)fprintf(stderr, "R %llx %016llx\n",
+                  (unsigned long long)ctx->pc,
+                  (unsigned long long)h);
 }

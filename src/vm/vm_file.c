@@ -274,9 +274,12 @@ int mips_vmfile_map(mips_vm64_t *vm, int fd, uint64_t off, uint64_t va,
 #define VM_INODE_MAPS 8u
 
 typedef struct {
+    pid_t pid;
+    int fd_dup;
     uint64_t va;
     uint64_t len;
     uint64_t file_offset;
+    uint32_t prot;
     int shared;
     int native;
 } vm_inode_map_t;
@@ -294,6 +297,7 @@ typedef struct {
 
 static vm_inode_t *vm_inode_table_ptr;
 static int vm_inode_table_tried;
+static int vm_has_shared_fallback;
 static pthread_mutex_t vm_inode_mu = PTHREAD_MUTEX_INITIALIZER;
 
 /* MAP_SHARED backing: fork children inherit the table and observe
@@ -457,9 +461,10 @@ void mips_vm_file_map_hook(mips64_ctx_t *ctx, int fd, uint64_t va,
     struct stat st;
     vm_inode_t *in;
     long hps;
+    uint64_t hmask;
     int native = 0;
+    int fd_dup = -1;
 
-    (void)prot;
     if (ctx == NULL || fd < 0 || len == 0u) {
         return;
     }
@@ -477,14 +482,14 @@ void mips_vm_file_map_hook(mips64_ctx_t *ctx, int fd, uint64_t va,
         in->size = (uint64_t)st.st_size;
         in->resize_seq++;
     }
-    /* MAP_SHARED goes native (writes through) when the host page
-     * size divides everything: the fixed mapping preserves the
-     * uniform arena addend and the kernel owns coherence. */
-    hps = sysconf(_SC_PAGESIZE);
-    if (is_shared != 0 && hps == 4096L && (va & 4095u) == 0u &&
-        (len & 4095u) == 0u && (file_offset & 4095u) == 0u) {
+    /* MAP_SHARED goes native (writes through) whenever the host page
+     * size divides the host address, length, and file offset. */
+    hps = u0f_page_size();
+    hmask = (uint64_t)hps - 1u;
+    if (is_shared != 0 && ((ctx->guest_base + va) & hmask) == 0u &&
+        (len & hmask) == 0u && (file_offset & hmask) == 0u) {
         void *at = mmap((void *)(uintptr_t)(ctx->guest_base + va),
-                        (size_t)len, PROT_READ | PROT_WRITE,
+                        (size_t)len, u0f_host_prot(prot),
                         MAP_SHARED | MAP_FIXED, fd,
                         (off_t)file_offset);
 
@@ -492,30 +497,143 @@ void mips_vm_file_map_hook(mips64_ctx_t *ctx, int fd, uint64_t va,
             native = 1;
         }
     }
+    if (is_shared != 0 && native == 0) {
+        fd_dup = fcntl(fd, F_DUPFD_CLOEXEC, 0);
+        if (fd_dup >= 0) {
+            vm_has_shared_fallback = 1;
+        }
+    }
     if ((unsigned)in->nmaps < VM_INODE_MAPS) {
         vm_inode_map_t *m = &in->maps[in->nmaps];
 
+        m->pid = getpid();
+        m->fd_dup = fd_dup;
         m->va = va;
         m->len = len;
         m->file_offset = file_offset;
+        m->prot = prot;
         m->shared = is_shared;
         m->native = native;
         in->nmaps++;
     } else {
+        if (fd_dup >= 0) {
+            (void)close(fd_dup);
+        }
         in->wide = 1;
     }
     (void)pthread_mutex_unlock(&vm_inode_mu);
-    /* Private maps start COW_CLEAN (never guest-written): the first
-     * store promotes through the miss path. Shared-anon fallbacks
-     * stay unmarked (direct-mapped, like any anonymous page). */
-    if (native == 0 && is_shared == 0) {
+    /* Private maps and non-native shared maps start COW_CLEAN so the
+     * soft-TLB write gate traps stores into dbt_mem_recover. */
+    if (native == 0) {
         mips_vm_pages_mark(va, len, (unsigned)MIPS_VM_PAGE_COW_CLEAN);
     }
+}
+
+void mips_vm_file_unmap_hook(uint64_t va, uint64_t len)
+{
+    vm_inode_t *tab;
+    pid_t self;
+    uint64_t end;
+    size_t k;
+
+    if (len == 0u || !vm_inode_table_tried || vm_inode_table_ptr == NULL) {
+        return;
+    }
+    end = va + len;
+    self = getpid();
+    (void)pthread_mutex_lock(&vm_inode_mu);
+    tab = vm_inode_table_ptr;
+    for (k = 0u; k < VM_INODE_MAX; k++) {
+        vm_inode_t *in = &tab[k];
+        int i = 0;
+
+        if (in->used == 0) {
+            continue;
+        }
+        while (i < in->nmaps) {
+            vm_inode_map_t *m = &in->maps[i];
+            uint64_t mlo = m->va;
+            uint64_t mhi = m->va + m->len;
+
+            if (m->pid != self || mhi <= va || mlo >= end) {
+                i++;
+                continue;
+            }
+            if (va <= mlo && end >= mhi) {
+                int j;
+
+                if (m->fd_dup >= 0) {
+                    (void)close(m->fd_dup);
+                }
+                for (j = i; j + 1 < in->nmaps; j++) {
+                    in->maps[j] = in->maps[j + 1];
+                }
+                in->nmaps--;
+                continue;
+            }
+            if (va <= mlo && end < mhi) {
+                m->file_offset += (end - mlo);
+                m->len = mhi - end;
+                m->va = end;
+            } else if (va > mlo && end >= mhi) {
+                m->len = va - mlo;
+            }
+            i++;
+        }
+    }
+    (void)pthread_mutex_unlock(&vm_inode_mu);
+}
+
+void mips_vm_file_shared_sync(mips64_ctx_t *ctx, uint64_t va, uint64_t len)
+{
+    vm_inode_t *tab;
+    pid_t self;
+    size_t k;
+
+    if (ctx == NULL || len == 0u || !vm_has_shared_fallback) {
+        return;
+    }
+    self = getpid();
+    (void)pthread_mutex_lock(&vm_inode_mu);
+    tab = vm_inode_table();
+    if (tab != NULL) {
+        for (k = 0u; k < VM_INODE_MAX; k++) {
+            vm_inode_t *in = &tab[k];
+            int i;
+
+            if (in->used == 0) {
+                continue;
+            }
+            for (i = 0; i < in->nmaps; i++) {
+                vm_inode_map_t *m = &in->maps[i];
+                uint64_t lo;
+                uint64_t hi;
+
+                if (m->pid != self || m->shared == 0 || m->native != 0 ||
+                    m->fd_dup < 0) {
+                    continue;
+                }
+                lo = va > m->va ? va : m->va;
+                hi = (va + len) < (m->va + m->len) ? (va + len) :
+                                                     (m->va + m->len);
+                if (lo >= hi) {
+                    continue;
+                }
+                (void)pwrite(m->fd_dup, mips64_guest_ptr(ctx, lo),
+                             (size_t)(hi - lo),
+                             (off_t)(m->file_offset + (lo - m->va)));
+                mips_vm_pages_mark(lo, hi - lo,
+                                   (unsigned)MIPS_VM_PAGE_COW_CLEAN);
+            }
+        }
+    }
+    (void)pthread_mutex_unlock(&vm_inode_mu);
 }
 
 static void vm_inode_invalidate_maps(vm_inode_t *in, uint64_t lo,
                                        uint64_t hi)
 {
+    pid_t self = getpid();
     int i;
 
     if (in->wide != 0) {
@@ -526,7 +644,7 @@ static void vm_inode_invalidate_maps(vm_inode_t *in, uint64_t lo,
         uint64_t s = in->maps[i].va;
         uint64_t e = s + in->maps[i].len;
 
-        if (e <= lo || s >= hi) {
+        if (in->maps[i].pid != self || e <= lo || s >= hi) {
             continue;
         }
         dbt_invalidate_range(s, e - s);
@@ -538,6 +656,7 @@ void mips_vm_file_post_write(mips64_ctx_t *ctx, int fd, uint64_t off,
 {
     struct stat st;
     vm_inode_t *in;
+    pid_t self;
     int i;
 
     if (ctx == NULL || fd < 0 || n == 0u) {
@@ -546,6 +665,7 @@ void mips_vm_file_post_write(mips64_ctx_t *ctx, int fd, uint64_t off,
     if (fstat(fd, &st) != 0) {
         return;
     }
+    self = getpid();
     (void)pthread_mutex_lock(&vm_inode_mu);
     in = vm_inode_lookup((uint64_t)st.st_dev, (uint64_t)st.st_ino, 0, 0u);
     if (in == NULL) {
@@ -557,6 +677,7 @@ void mips_vm_file_post_write(mips64_ctx_t *ctx, int fd, uint64_t off,
         in->resize_seq++;
     }
     uint64_t wend = (off + n < off) ? ~(uint64_t)0u : off + n;
+    uint64_t eof_page = (in->size + 4095u) & ~(uint64_t)4095u;
 
     for (i = 0; i < in->nmaps; i++) {
         vm_inode_map_t *m = &in->maps[i];
@@ -564,13 +685,11 @@ void mips_vm_file_post_write(mips64_ctx_t *ctx, int fd, uint64_t off,
         uint64_t mhi = m->va + m->len;
         uint64_t page;
 
-        if (m->native != 0) {
+        if (m->pid != self || m->native != 0) {
             continue;
         }
         for (page = mlo & ~(uint64_t)4095U; page < mhi;
              page += 4096u) {
-            /* Mapped span of this host page (sub-page edges when
-             * the record itself is unaligned). */
             uint64_t ps = page < mlo ? mlo : page;
             uint64_t pe = page + 4096u > mhi ? mhi : page + 4096u;
             uint64_t fbase;
@@ -585,15 +704,18 @@ void mips_vm_file_post_write(mips64_ctx_t *ctx, int fd, uint64_t off,
                 continue;
             }
             fbase = m->file_offset + (ps - mlo);
+            if (fbase < eof_page && ps == page && pe == page + 4096u &&
+                vm_inode_page_host_prot(page) == 0) {
+                (void)mips_mem_protect(ctx, page, 4096u, m->prot);
+            }
             flo = fbase > off ? fbase : off;
             fhi = fbase + (pe - ps) < wend ? fbase + (pe - ps) : wend;
             if (flo >= fhi) {
                 continue;
             }
-            /* CLEAN pages show the file: refresh the overlapped
-             * span (zeros past EOF). DIRTY pages stay. */
             fl = mips_vm_page_flags(page >> 12);
-            if ((fl & (unsigned)MIPS_VM_PAGE_COW_CLEAN) != 0u) {
+            if (m->shared != 0 ||
+                (fl & (unsigned)MIPS_VM_PAGE_COW_CLEAN) != 0u) {
                 vm_inode_refresh_span(ctx, fd, page, ps + (flo - fbase),
                                       ps + (fhi - fbase), flo);
             }
@@ -606,6 +728,8 @@ void mips_vm_file_post_write(mips64_ctx_t *ctx, int fd, uint64_t off,
 static void vm_inode_post_truncate_locked(mips64_ctx_t *ctx, vm_inode_t *in,
                                           uint64_t newsize)
 {
+    uint64_t eof_page = (newsize + 4095u) & ~(uint64_t)4095u;
+    pid_t self = getpid();
     int i;
 
     in->size = newsize;
@@ -616,13 +740,11 @@ static void vm_inode_post_truncate_locked(mips64_ctx_t *ctx, vm_inode_t *in,
         uint64_t mhi = m->va + m->len;
         uint64_t page;
 
-        if (m->native != 0) {
+        if (m->pid != self || m->native != 0) {
             continue;
         }
         for (page = mlo & ~(uint64_t)4095U; page < mhi;
              page += 4096u) {
-            /* Mapped span of this host page (sub-page edges when
-             * the record itself is unaligned). */
             uint64_t ps = page < mlo ? mlo : page;
             uint64_t pe = page + 4096u > mhi ? mhi : page + 4096u;
             uint64_t fbase;
@@ -637,19 +759,26 @@ static void vm_inode_post_truncate_locked(mips64_ctx_t *ctx, vm_inode_t *in,
             fbase = m->file_offset + (ps - mlo);
             fl = mips_vm_page_flags(page >> 12);
             if (fbase >= newsize) {
-                /* Wholly removed: CLEAN pages observe clean bytes
-                 * (zero); DIRTY private pages are the guest's. */
-                if ((fl & (unsigned)MIPS_VM_PAGE_COW_CLEAN) != 0u) {
-                    vm_inode_zero_span(ctx, page, ps - page, pe - page);
-                }
-            } else if (fbase + (pe - ps) > newsize) {
-                /* Partial tail: zero MAP_SHARED and CLEAN pages,
-                 * leave DIRTY private pages intact. */
                 if (m->shared != 0 ||
                     (fl & (unsigned)MIPS_VM_PAGE_COW_CLEAN) != 0u) {
-                    vm_inode_zero_span(ctx, page,
-                                       ps - page + (newsize - fbase),
-                                       pe - page);
+                    vm_inode_zero_span(ctx, page, ps - page, pe - page);
+                    if (fbase >= eof_page && ps == page &&
+                        pe == page + 4096u) {
+                        (void)mips_mem_protect(ctx, page, 4096u, 0u);
+                    }
+                }
+            } else {
+                if (ps == page && pe == page + 4096u &&
+                    vm_inode_page_host_prot(page) == 0) {
+                    (void)mips_mem_protect(ctx, page, 4096u, m->prot);
+                }
+                if (fbase + (pe - ps) > newsize) {
+                    if (m->shared != 0 ||
+                        (fl & (unsigned)MIPS_VM_PAGE_COW_CLEAN) != 0u) {
+                        vm_inode_zero_span(ctx, page,
+                                           ps - page + (newsize - fbase),
+                                           pe - page);
+                    }
                 }
             }
         }

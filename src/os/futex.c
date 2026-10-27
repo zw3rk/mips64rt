@@ -96,31 +96,37 @@ typedef struct {
 } l4f_dslot_t;
 
 static l4f_dslot_t l4f_dslots[L4F_DARWIN_SLOTS];
+static pthread_mutex_t l4f_dslots_mu = PTHREAD_MUTEX_INITIALIZER;
 
 static l4f_dslot_t *l4f_dslot_for(uint64_t va, int create)
 {
     size_t i;
     size_t at = (size_t)((va >> 2u) & (uint64_t)(L4F_DARWIN_SLOTS - 1u));
+    l4f_dslot_t *res = NULL;
 
+    (void)pthread_mutex_lock(&l4f_dslots_mu);
     for (i = 0u; i < L4F_DARWIN_SLOTS; i++) {
         l4f_dslot_t *s = &l4f_dslots[(at + i) & (L4F_DARWIN_SLOTS - 1u)];
 
         if (s->used != 0 && s->va == va) {
-            return s;
+            res = s;
+            break;
         }
         if (s->used == 0) {
             if (!create) {
-                return NULL;
+                break;
             }
-            s->used = 1;
-            s->va = va;
-            s->waiters = 0;
             (void)pthread_mutex_init(&s->mu, NULL);
             (void)pthread_cond_init(&s->cv, NULL);
-            return s;
+            s->va = va;
+            s->waiters = 0;
+            s->used = 1;
+            res = s;
+            break;
         }
     }
-    return NULL;
+    (void)pthread_mutex_unlock(&l4f_dslots_mu);
+    return res;
 }
 
 /* Absolute REALTIME deadline for cond_timedwait from a relative

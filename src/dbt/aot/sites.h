@@ -10,9 +10,8 @@
  * without re-emission. The writer appends one record per block
  * (best-effort: failures are silent, the run never depends on the
  * cache); the loader validates magic + `MIPS64_AOT_EMITTER_VERSION`
- * and replays rows through a visitor. Until the code cache lands,
- * only the writer is wired into the dispatcher; the loader is
- * exercised by the host unit test.
+ * and replays rows through a visitor. Both the writer and the loader
+ * are wired into the DBT compile/cache path (`src/dbt/dbt.c`).
  */
 
 #ifndef MIPS64RT_DBT_AOT_SITES_H

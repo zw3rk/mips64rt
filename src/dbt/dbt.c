@@ -182,6 +182,69 @@ static _Thread_local dbt_entry_t block_cache[MIPS64_DBT_CACHE_ENTRIES];
 static _Thread_local uint64_t ras[MIPS64_DBT_RAS_ENTRIES];
 static _Thread_local unsigned ras_top;
 
+/* Preloaded AOT site cache from `--cache-dir` (`mips_aot_sites_load`):
+ * avoids duplicate `.aot` leaf appends across runs and reuses validated
+ * persisted site rows on block compile. */
+#define DBT_AOT_PRELOAD_MAX 256u
+typedef struct {
+    int used;
+    uint64_t pc;
+    dbt_mem_site_t *sites;
+    size_t count;
+} dbt_aot_preload_t;
+
+static _Thread_local dbt_aot_preload_t aot_preload[DBT_AOT_PRELOAD_MAX];
+static _Thread_local int aot_preload_done;
+
+static int dbt_aot_visit(uint64_t guest_pc, const struct dbt_mem_site *sites,
+                         size_t count, void *arg)
+{
+    unsigned idx = (unsigned)((guest_pc >> 2) ^ (guest_pc >> 12)) &
+                   (DBT_AOT_PRELOAD_MAX - 1u);
+    dbt_aot_preload_t *p = &aot_preload[idx];
+    dbt_mem_site_t *copy;
+
+    (void)arg;
+    if (sites == NULL || count == 0u || count > DBT_MEM_SITES_MAX)
+        return 0;
+    copy = (dbt_mem_site_t *)malloc(count * sizeof(dbt_mem_site_t));
+    if (copy == NULL)
+        return 0;
+    memcpy(copy, sites, count * sizeof(dbt_mem_site_t));
+    if (p->sites != NULL)
+        free(p->sites);
+    p->used = 1;
+    p->pc = guest_pc;
+    p->sites = copy;
+    p->count = count;
+    return 0;
+}
+
+static void dbt_aot_ensure_loaded(void)
+{
+    const char *leaf;
+
+    if (aot_preload_done != 0)
+        return;
+    leaf = mips_aot_leaf_path();
+    if (leaf == NULL)
+        return;
+    aot_preload_done = 1;
+    (void)mips_aot_sites_load(leaf, dbt_aot_visit, NULL);
+}
+
+static int dbt_aot_has_match(uint64_t pc, const dbt_mem_site_t *rows,
+                             size_t nrows)
+{
+    unsigned idx = (unsigned)((pc >> 2) ^ (pc >> 12)) &
+                   (DBT_AOT_PRELOAD_MAX - 1u);
+    const dbt_aot_preload_t *p = &aot_preload[idx];
+
+    if (!p->used || p->pc != pc || p->sites == NULL || p->count != nrows)
+        return 0;
+    return memcmp(p->sites, rows, nrows * sizeof(dbt_mem_site_t)) == 0;
+}
+
 static unsigned cache_index(uint64_t pc)
 {
     return (unsigned)((pc >> 2) ^ (pc >> 12)) & (MIPS64_DBT_CACHE_ENTRIES - 1u);
@@ -352,10 +415,9 @@ int dbt_compile(mips64_ctx_t *ctx, uint64_t pc)
         return 1;
     if (ensure_ibtc(ctx) != 0)
         return 1;
+    dbt_aot_ensure_loaded();
     slot = &block_cache[cache_index(pc)];
     if (slot->used && slot->pc == pc && slot->epoch == dbt_smc_epoch) {
-        /* A valid entry means a retry with no guest change: native
-         * entries re-enter, negative entries stay in `interp`. */
         if (slot->fallback || slot->blk.code == NULL)
             return 1;
         if (lookup_entry(ctx, pc) != NULL)
@@ -363,15 +425,14 @@ int dbt_compile(mips64_ctx_t *ctx, uint64_t pc)
     }
     start_page = pc & MIPS64_PAGE_MASK;
     cur = pc;
-    while (n < MIPS64_DBT_MAX_INSNS) {
+    while (n < (ctx->difftest_enabled ? 1u : MIPS64_DBT_MAX_INSNS)) {
         uint32_t word = 0u;
         mips_dec_t *d;
 
         if (n > 0u && (cur & MIPS64_PAGE_MASK) != start_page)
             break; /* SPEC 2.2: blocks end at page boundaries. */
         if (mips_fetch(ctx, cur, &word) != 0)
-            break; /* Unreadable tail: the block falls through to pc
-                    * `cur`, where `interp` raises the guest fault. */
+            break;
         d = &insns[n];
         mips_decode(word, d);
         if (is_fp_coproc(d))
@@ -384,9 +445,6 @@ int dbt_compile(mips64_ctx_t *ctx, uint64_t pc)
             mips_dec_t *s;
 
             if (mips_fetch(ctx, cur, &word) != 0) {
-                /* Delay slot unreadable (the RC1 `page_end - 4`
-                 * probe): drop the branch and let `interp` run the
-                 * pair across the page edge. */
                 n--;
                 cur -= 4u;
                 break;
@@ -413,12 +471,12 @@ int dbt_compile(mips64_ctx_t *ctx, uint64_t pc)
         uint8_t *snap = NULL;
 
         if (host == NULL)
-            return 1; /* Resource exhaustion: retry later, cache nothing. */
+            return 1;
         if (len == 0u || len > (size_t)MIPS64_DBT_MAX_INSNS * 4u)
             return compile_decline(ctx, pc);
         snap = (uint8_t *)malloc(len);
         if (snap == NULL)
-            return 1; /* Retry later, cache nothing. */
+            return 1;
         memcpy(snap, mips64_guest_ptr(ctx, pc), len);
         dbt_snap_drop(slot);
         slot->used = 1;
@@ -433,9 +491,6 @@ int dbt_compile(mips64_ctx_t *ctx, uint64_t pc)
         slot->fallback = 0;
         slot->sites = NULL;
         slot->site_count = 0u;
-        /* Retain the emission's relative site rows with the block
-         * (miss path, signal rewind, AOT): drained from the staging
-         * table, so the next compile starts clean. */
         {
             const dbt_mem_site_t *rows = NULL;
             size_t nrows = 0u;
@@ -452,13 +507,10 @@ int dbt_compile(mips64_ctx_t *ctx, uint64_t pc)
                            nrows * sizeof(dbt_mem_site_t));
                     slot->sites = copy;
                     slot->site_count = nrows;
-                    /* Best-effort AOT persistence (no-op without a
-                     * worker leaf). The loader side lands with the
-                     * code cache. */
-                    mips_aot_note_block(pc, copy, nrows);
-                    /* The block's pages now carry translated code:
-                     * the write gate closes for them until an
-                     * invalidation retires the translation. */
+                    if (!dbt_aot_has_match(pc, copy, nrows)) {
+                        mips_aot_note_block(pc, copy, nrows);
+                        (void)dbt_aot_visit(pc, copy, nrows, NULL);
+                    }
                     if (out_end > pc) {
                         mips_vm_pages_mark(pc, out_end - pc,
                                            (unsigned)MIPS_VM_PAGE_HAS_CODE);
@@ -478,6 +530,16 @@ int dbt_compile(mips64_ctx_t *ctx, uint64_t pc)
 /* Trace + run loop.                                                  */
 /* ------------------------------------------------------------------ */
 
+extern void mips64_difftest_checkpoint(const mips64_ctx_t *ctx);
+
+static void dbt_difftest_step(mips64_ctx_t *ctx)
+{
+    if (ctx != NULL && ctx->difftest_enabled) {
+        dbt_npc_resume(ctx);
+        mips64_difftest_checkpoint(ctx);
+    }
+}
+
 void mips64_dbt_trace(mips64_ctx_t *ctx, uint64_t pc, uint32_t word)
 {
     if (ctx == NULL || !ctx->trace_enabled)
@@ -485,13 +547,6 @@ void mips64_dbt_trace(mips64_ctx_t *ctx, uint64_t pc, uint32_t word)
     (void)fprintf(stderr, "I %llx %x\n", (unsigned long long)pc, word);
 }
 
-/* RC4: run one compiled block under the L4b host-fault guard, so a
- * compiled load/store to a PROT_NONE (or unmapped) guest page becomes
- * a guest SIGSEGV — deliverable via the EXIT_FAULT case — instead of
- * killing the translator with a host fault. mips_hostfault_run takes
- * a void (*)(ctx); the trampoline below carries the (base, code) pair
- * in a thread-local slot. The guard is installed once per dbt_run
- * over the whole guest reservation (idempotent). */
 struct dbt_guarded_enter {
     uint64_t base;
     void *code;
@@ -513,10 +568,6 @@ static void *dbt_tramp_ptr(void (*fn)(mips64_ctx_t *))
     return p;
 }
 
-/* A not-taken MIPS branch-likely annuls its delay slot: the word
- * at `end - 4` never executes, so the trace must skip it. Mirrors
- * the `likely` set in `ei_branch` (emit_int.c); COP1-likely declines
- * to interp and never reaches a compiled block. */
 static int block_branch_likely(mips64_ctx_t *ctx, uint64_t end)
 {
     uint32_t w = 0u;
@@ -533,13 +584,6 @@ static int block_branch_likely(mips64_ctx_t *ctx, uint64_t end)
     return 0;
 }
 
-/* Print the natively executed prefix of a block exit: full blocks
- * print `[start, end)`; fallback exits print `[start, ctx->pc)` (the
- * dispatcher completes the insn at `ctx->pc` via `interp_step`,
- * which prints its own line). A not-taken likely exit lands exactly
- * on `end` with its delay slot annulled, so it prints `[start,
- * end - 4)`. Same `I <pc> <word>` shape as `interp`'s fetch trace,
- * so the L2d difftest compares equal. */
 static void trace_block_exit(mips64_ctx_t *ctx, uint64_t start, uint64_t end,
                              int full)
 {
@@ -575,10 +619,6 @@ static void ras_update(mips64_ctx_t *ctx, unsigned info)
     }
 }
 
-/* Print the natively executed prefix [start, fault) when a memory
- * word misses: the recovery runs the word itself (which prints its
- * own line), so the I-stream matches the interpreter exactly.
- * Leaves ctx->pc at fault for the caller's word print. */
 void dbt_trace_fault_prefix(mips64_ctx_t *ctx, uint64_t start,
                             uint64_t fault)
 {
@@ -589,8 +629,6 @@ void dbt_trace_fault_prefix(mips64_ctx_t *ctx, uint64_t start,
     trace_block_exit(ctx, start, fault, 0);
 }
 
-/* Walk every live block for host-pc resolution (signal rewind,
- * host-guard fault reporting). The visitor returns nonzero to stop. */
 void dbt_visit_blocks(dbt_block_visit_t visit, void *arg)
 {
     size_t i;
@@ -613,8 +651,6 @@ void dbt_visit_blocks(dbt_block_visit_t visit, void *arg)
     }
 }
 
-/* Find the retained site for a guest-pc delta inside a block (NULL
- * when the block has no rows or the delta matches none). */
 static const dbt_mem_site_t *dbt_find_site(const dbt_entry_t *e,
                                            uint64_t delta)
 {
@@ -631,10 +667,6 @@ static const dbt_mem_site_t *dbt_find_site(const dbt_entry_t *e,
     return NULL;
 }
 
-/* NOTE: dbt_fault_ea and dbt_u0_fill_retry live in
- * src/dbt/mem_recover.c (lane U12); see the note above
- * dbt_npc_resume. */
-
 int dbt_run(mips64_ctx_t *ctx)
 {
     if (ctx == NULL)
@@ -645,11 +677,9 @@ int dbt_run(mips64_ctx_t *ctx)
 
             if (rc != 0)
                 return rc;
+            dbt_difftest_step(ctx);
         }
     }
-    /* Guard installed once per run (idempotent): the reservation base
-     * is fixed for the run, so per-block install only paid a mutex
-     * round-trip per translated block (lane H3). */
     mips_hostfault_install((const void *)(uintptr_t)ctx->guest_base,
                            ctx->task_size);
     for (;;) {
@@ -663,8 +693,6 @@ int dbt_run(mips64_ctx_t *ctx)
 
         if (ctx->exit_reason != MIPS64_EXIT_NONE)
             return 1;
-        /* U0 dynamic NPC: a pending delay target (x25 in emitted
-         * code) selects the resume pc before the cache probe. */
         dbt_npc_resume(ctx);
         pc = ctx->pc;
         code = dbt_lookup(ctx, pc);
@@ -673,6 +701,7 @@ int dbt_run(mips64_ctx_t *ctx)
                 rc = interp_step(ctx);
                 if (rc != 0)
                     return rc;
+                dbt_difftest_step(ctx);
                 continue;
             }
             code = dbt_lookup(ctx, pc);
@@ -680,6 +709,7 @@ int dbt_run(mips64_ctx_t *ctx)
                 rc = interp_step(ctx);
                 if (rc != 0)
                     return rc;
+                dbt_difftest_step(ctx);
                 continue;
             }
         }
@@ -694,10 +724,9 @@ int dbt_run(mips64_ctx_t *ctx)
             rc = interp_step(ctx);
             if (rc != 0)
                 return rc;
+            dbt_difftest_step(ctx);
             continue;
         }
-        /* U0: x20 binds the soft-TLB base; prefill the block span
-         * so the inlined probe hits. */
         dbt_u0_prefill(ctx, start, end);
         dbt_ge.base = (uint64_t)(uintptr_t)mips_soft_tlb_base(ctx);
         dbt_ge.code = code;
@@ -715,16 +744,12 @@ int dbt_run(mips64_ctx_t *ctx)
             }
         }
         switch (ex) {
-        /* All chaining flavors share the cpu.h BRANCH code (dbt.h):
-         * one label covers FALLTHROUGH, DIRECT and INDIRECT. */
         case MIPS64_DBT_EXIT_DIRECT:
             trace_block_exit(ctx, start, end, 1);
             ras_update(ctx, ctx->exit_info);
-            /* Consumed: a stale BRANCH reason must not abort the next
-             * iteration at the loop-top check (RC2: every taken branch
-             * ended the run with (exit 1)). */
             ctx->exit_reason = MIPS64_EXIT_NONE;
             ctx->exit_info = 0u;
+            dbt_difftest_step(ctx);
             continue;
         case MIPS64_DBT_EXIT_UNDEF:
         case MIPS64_DBT_EXIT_SINGLE_STEP:
@@ -735,26 +760,14 @@ int dbt_run(mips64_ctx_t *ctx)
             rc = interp_step(ctx);
             if (rc != 0)
                 return rc;
+            dbt_difftest_step(ctx);
             continue;
         case MIPS64_DBT_EXIT_FAULT: {
-            /* Host-guard capture on a stale entry: the precise pc
-             * comes from the retained site when the fault lands
-             * inside [seq_start, cont), else the word decodes at the
-             * captured pc (legacy path, no delay recovery). Only the
-             * faulting access runs again — earlier words already
-             * committed, and re-executing them would replay register
-             * clobbers with clobbered inputs. */
             dbt_entry_t *te = e;
             const dbt_mem_site_t *site = NULL;
-            uint64_t fpc;
+            uint64_t fpc = ctx->pc;
             int mrc;
 
-            /* ctx->pc is already precise (epilogues materialize it;
-             * the host guard resolves it before returning). The
-             * scratch slot is never consulted: it doubles as the
-             * unaligned shift park, and a stale shift would
-             * masquerade as a fault pc. */
-            fpc = ctx->pc;
             ctx->exit_reason = MIPS64_EXIT_NONE;
             ctx->exit_info = 0u;
             ctx->pad150 = 0u;
@@ -765,6 +778,7 @@ int dbt_run(mips64_ctx_t *ctx)
             if (mrc == 0) {
                 ctx->exit_reason = MIPS64_EXIT_NONE;
                 ctx->exit_info = 0u;
+                dbt_difftest_step(ctx);
                 continue;
             }
             if (mrc == 2 && ctx->trace_enabled) {
@@ -774,22 +788,14 @@ int dbt_run(mips64_ctx_t *ctx)
                     mips64_dbt_trace(ctx, ctx->pc, word);
                 }
             }
-            /* A handled fault clears the exit (pc already redirected
-             * into the handler): resume instead of exiting, exactly
-             * like the legacy fill-and-retry path. */
             if (ctx->exit_reason == MIPS64_EXIT_NONE) {
                 ctx->exit_info = 0u;
+                dbt_difftest_step(ctx);
                 continue;
             }
-            /* RC4: exactly one mips_fault trap per fault, so a
-             * handled SIGSEGV delivers exactly like interp (frame +
-             * handler pc) with no stale duplicate queued. */
             return (int)MIPS_FAULT;
         }
         case MIPS64_DBT_EXIT_TRAP: {
-            /* Rev4 miss path: the per-site stub recorded the site
-             * index in exit_info. Derive the fault pc from the
-             * retained row and run the shared recovery. */
             uint32_t idx = ctx->exit_info;
             dbt_entry_t *te = e;
             const dbt_mem_site_t *site = NULL;
@@ -807,6 +813,7 @@ int dbt_run(mips64_ctx_t *ctx)
             if (mrc == 0) {
                 ctx->exit_reason = MIPS64_EXIT_NONE;
                 ctx->exit_info = 0u;
+                dbt_difftest_step(ctx);
                 continue;
             }
             if (mrc == 2 && ctx->trace_enabled) {
@@ -816,10 +823,9 @@ int dbt_run(mips64_ctx_t *ctx)
                     mips64_dbt_trace(ctx, ctx->pc, word);
                 }
             }
-            /* A handled fault clears the exit (pc already redirected
-             * into the handler): resume instead of exiting. */
             if (ctx->exit_reason == MIPS64_EXIT_NONE) {
                 ctx->exit_info = 0u;
+                dbt_difftest_step(ctx);
                 continue;
             }
             return (int)MIPS_FAULT;
@@ -831,6 +837,7 @@ int dbt_run(mips64_ctx_t *ctx)
             rc = interp_step(ctx);
             if (rc != 0)
                 return rc;
+            dbt_difftest_step(ctx);
             continue;
         }
     }

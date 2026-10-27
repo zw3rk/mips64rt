@@ -223,5 +223,5 @@ if docker ps --format "{{.Names}}" 2>/dev/null | grep -q "^${NAME}$"; then
 fi
 
 echo "P-RESULT: pass=$pass fail=$fail skip=$skip gap=$gapn"
-# Zero-GAP gate: any parity gap fails the suite, not just hard FAILs.
-[ "$fail" -eq 0 ] && [ "$gapn" -eq 0 ]
+# Zero-GAP, zero-SKIP gate: any fail, skip, or parity gap fails the suite.
+[ "$fail" -eq 0 ] && [ "$skip" -eq 0 ] && [ "$gapn" -eq 0 ]

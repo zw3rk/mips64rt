@@ -4,38 +4,13 @@
  * Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0
  *
- * Implements the Phase 1 subset per SPEC 2.2 and the phase-1 lane card:
- * exit, exit_group, read, write, brk, mmap, munmap, mprotect, uname,
- * set_tid_address, plus the RC1 test-harness minimum: fork, the
- * fork-equivalent clone subset musl's fork() uses, and wait4 with NULL
- * rusage (full clone/threads/signals stay Phase 4, lane L4b). Dual
- * numbers from src/os/syscall_nr.h (N64 base 5000, N32 base 6000)
- * selected by ctx->is_n32. Unknown syscalls report -ENOSYS with $a3=1.
- *
- * N64/N32 convention (E01 FINDINGS): the number arrives in $v0, args
- * 1..6 in $a0..$a5 (full 64-bit registers, no O32 stack slots, no
- * even-pair rule); success is $a3=0 with $v0=ret, error is $a3=1 with
- * $v0=positive MIPS errno. The return value of mips_syscall is the raw
- * host-style result (negative errno on error) for the engine; the guest
- * registers always follow the $a3 convention above.
- *
- * errno mapping: MIPS shares asm-generic errno values for every error
- * produced here except ENOSYS (MIPS asm/errno.h: ENOSYS 89 vs host 38);
- * mips_errno_from_host maps 38->89 and passes the rest through.
- *
- * Guest mapping flags are MIPS N64/N32 values (arch/mips UAPI
- * asm/mman.h): MAP_SHARED 0x01, MAP_PRIVATE 0x02, MAP_FIXED 0x10,
- * MAP_ANONYMOUS 0x20. The O32-compat MAP_ANONYMOUS alias 0x800 is also
- * accepted as anonymous. Mappings live in the Phase 1 reservation via
- * the mips_mem_* helpers (src/os/mem.c); MAP_FIXED_NOREPLACE is
- * honoured, file-backed pages are filled from the fd (Linux semantics:
- * file content with zeros past EOF), and the host side never gains
- * PROT_EXEC (W^X).
+ * N64/N32 syscall dispatcher ($v0 number, $a0..$a5 args, $a3=0/1 error
+ * flag, ENOSYS 38->89). Runs under a quiescence memory lease.
  */
 
 #include "core/cpu.h"
-
 #include "os/syscall_nr.h"
+#include "vm/vm_pages.h"
 
 #include <errno.h>
 #include <stdint.h>
@@ -147,6 +122,8 @@ extern int64_t mips_sc_waitid(mips64_ctx_t *ctx, uint64_t which, uint64_t pid,
                               uint64_t rusage_va);
 extern int mips_mem_map(mips64_ctx_t *ctx, uint64_t va, uint64_t len,
                         uint32_t prot, const char *tag);
+extern int mips_mem_map_replace(mips64_ctx_t *ctx, uint64_t va, uint64_t len,
+                                uint32_t prot, const char *tag);
 extern int mips_mem_unmap(mips64_ctx_t *ctx, uint64_t va, uint64_t len);
 extern int mips_mem_protect(mips64_ctx_t *ctx, uint64_t va, uint64_t len,
                             uint32_t prot);
@@ -304,6 +281,7 @@ static int64_t sc_mmap(mips64_ctx_t *ctx, uint64_t addr, uint64_t len,
 {
     uint64_t size;
     uint64_t va;
+    uint8_t *fbuf = NULL;
     int rc;
     int anon;
 
@@ -318,81 +296,36 @@ static int64_t sc_mmap(mips64_ctx_t *ctx, uint64_t addr, uint64_t len,
     if (!anon && (offset & (MIPS64_PAGE_SIZE - 1U)) != 0U) {
         return sc_ret(ctx, -(int64_t)EINVAL);
     }
-    if ((flags & MIPS_MAP_FIXED) != 0U) {
-        if ((addr & (MIPS64_PAGE_SIZE - 1U)) != 0U) {
+    if ((flags & MIPS_MAP_FIXED) != 0U ||
+        ((flags & MIPS_MAP_FIXED_NOREPLACE) != 0U && addr != 0U)) {
+        if ((addr & (MIPS64_PAGE_SIZE - 1U)) != 0U ||
+            addr + size < addr || addr + size > ctx->task_size) {
             return sc_ret(ctx, -(int64_t)EINVAL);
         }
-        va = addr;
-        if (va + size < va || va + size > ctx->task_size) {
-            return sc_ret(ctx, -(int64_t)EINVAL);
-        }
-        rc = mips_mem_unmap(ctx, va, size);
-        if (rc != 0) {
-            return sc_ret(ctx, (int64_t)rc);
-        }
-        rc = mips_mem_map(ctx, va, size, (uint32_t)(prot & 7U), "map");
-        if (rc != 0) {
-            return sc_ret(ctx, (int64_t)rc);
-        }
-    } else if ((flags & MIPS_MAP_FIXED_NOREPLACE) != 0U && addr != 0U) {
-        if ((addr & (MIPS64_PAGE_SIZE - 1U)) != 0U) {
-            return sc_ret(ctx, -(int64_t)EINVAL);
-        }
-        va = addr;
-        if (va + size < va || va + size > ctx->task_size) {
-            return sc_ret(ctx, -(int64_t)EINVAL);
-        }
-        if (mips_mem_ok(ctx, va, 1U, 0U) ||
-            hole_from(ctx, va, size) != va) {
+        if ((flags & MIPS_MAP_FIXED) == 0U &&
+            (mips_mem_ok(ctx, addr, 1U, 0U) ||
+             hole_from(ctx, addr, size) != addr)) {
             return sc_ret(ctx, -(int64_t)EEXIST);
         }
-        rc = mips_mem_map(ctx, va, size, (uint32_t)(prot & 7U), "map");
-        if (rc != 0) {
-            return sc_ret(ctx, (int64_t)rc);
-        }
-    } else {
-        va = pick_hole(ctx, addr, size);
-        if (va == 0U) {
-            return sc_ret(ctx, -(int64_t)ENOMEM);
-        }
-        rc = mips_mem_map(ctx, va, size, (uint32_t)(prot & 7U), "map");
-        if (rc != 0) {
-            return sc_ret(ctx, (int64_t)rc);
-        }
     }
+    /* Pre-stage file bytes before touching any mapping so a bad fd or
+     * unreadable file leaves a MAP_FIXED destination untouched. */
     if (!anon) {
-        /* File-backed maps always show file content (Linux semantics:
-         * pages are filled from the file with zeros past EOF). The
-         * region is writable exactly when the guest asked for it; a
-         * read-only file fill goes through a temporary host-side
-         * writable window so the fill itself never faults. */
-        uint8_t *dst = (uint8_t *)mips64_guest_ptr(ctx, va);
         uint64_t left = size;
         uint64_t off = 0U;
-        int made_writable = 0;
 
-        if (((uint32_t)prot & MIPS_PROT_WRITE) == 0U) {
-            if (mprotect(dst, (size_t)size, PROT_READ | PROT_WRITE) != 0) {
-                (void)mips_mem_unmap(ctx, va, size);
-                return sc_ret(ctx, -(int64_t)EFAULT);
-            }
-            made_writable = 1;
+        fbuf = (uint8_t *)calloc(1U, (size_t)size);
+        if (fbuf == NULL) {
+            return sc_ret(ctx, -(int64_t)ENOMEM);
         }
-        while (left > 0U) {
-            ssize_t got;
+        while (left > 0U && offset + off >= off) {
+            ssize_t got = pread((int)fd, fbuf + off, (size_t)left,
+                                (off_t)(offset + off));
 
-            if (offset + off < off) {
-                break;
-            }
-            got = pread((int)fd, dst + off, (size_t)left,
-                        (off_t)(offset + off));
             if (got < 0) {
                 int e = errno;
 
-                if (made_writable) {
-                    (void)mprotect(dst, (size_t)size, PROT_READ);
-                }
-                (void)mips_mem_unmap(ctx, va, size);
+                free(fbuf);
                 return sc_ret(ctx, -(int64_t)e);
             }
             if (got == 0) {
@@ -401,14 +334,35 @@ static int64_t sc_mmap(mips64_ctx_t *ctx, uint64_t addr, uint64_t len,
             off += (uint64_t)got;
             left -= (uint64_t)got;
         }
-        if (made_writable &&
-            mprotect(dst, (size_t)size, PROT_READ) != 0) {
-            (void)mips_mem_unmap(ctx, va, size);
-            return sc_ret(ctx, -(int64_t)ENOMEM);
+    }
+    if ((flags & MIPS_MAP_FIXED) != 0U) {
+        va = addr;
+        rc = mips_mem_map_replace(ctx, va, size, (uint32_t)(prot & 7U), "map");
+    } else if ((flags & MIPS_MAP_FIXED_NOREPLACE) != 0U && addr != 0U) {
+        va = addr;
+        rc = mips_mem_map(ctx, va, size, (uint32_t)(prot & 7U), "map");
+    } else {
+        va = pick_hole(ctx, addr, size);
+        rc = va == 0U ? -ENOMEM :
+             mips_mem_map(ctx, va, size, (uint32_t)(prot & 7U), "map");
+    }
+    if (rc != 0) {
+        free(fbuf);
+        return sc_ret(ctx, (int64_t)rc);
+    }
+    if (!anon) {
+        uint8_t *dst = (uint8_t *)mips64_guest_ptr(ctx, va);
+        int hp = (((uint32_t)prot & MIPS_PROT_READ) != 0U ? PROT_READ : 0) |
+                 (((uint32_t)prot & MIPS_PROT_WRITE) != 0U ? PROT_WRITE : 0);
+
+        if ((hp & PROT_WRITE) == 0) {
+            (void)mprotect(dst, (size_t)size, PROT_READ | PROT_WRITE);
         }
-        /* Lane U12 Provider A hook: inode/EOF tracking, COW_CLEAN
-         * marking for private maps, native shared remap when
-         * H-aligned. Best-effort; never fails the mapping. */
+        memcpy(dst, fbuf, (size_t)size);
+        if ((hp & PROT_WRITE) == 0) {
+            (void)mprotect(dst, (size_t)size, hp);
+        }
+        free(fbuf);
         mips_vm_file_map_hook(ctx, (int)fd, va, size, offset,
                               (uint32_t)(prot & 7U),
                               (flags & MIPS_MAP_SHARED) != 0U ? 1 : 0);
@@ -441,6 +395,7 @@ static int64_t sc_uname(mips64_ctx_t *ctx, uint64_t va)
 #else
     memset(dst + 5U * MIPS_UTS_FIELD, 0, MIPS_UTS_FIELD);
 #endif
+    mips_vm_pages_clear(va, MIPS_UTS_SIZE, (unsigned)MIPS_VM_PAGE_COW_CLEAN);
     return sc_ret(ctx, 0);
 }
 

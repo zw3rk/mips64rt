@@ -821,14 +821,11 @@ static int exec_branch(mips64_ctx_t *ctx, uint64_t pc, const mips_dec_t *d)
         interp_set_reg(ctx, link_rd, pc + 8u);
     }
     if (likely && !taken) {
-        /* The annulled slot is never fetched: no fault can arise from
-         * pc+4 (RC1 gate steps likely-annul across PROT_NONE). */
         ctx->in_delay_slot = 0;
         ctx->pc = pc + 8u;
         ctx->next_pc = pc + 12u;
         return 0;
     }
-    /* SPEC 2.2: the slot runs with ctx->pc at the slot (branch_pc). */
     ctx->in_delay_slot = 1;
     ctx->pc = pc + 4u;
     {
@@ -849,6 +846,8 @@ static int exec_branch(mips64_ctx_t *ctx, uint64_t pc, const mips_dec_t *d)
         } else if (rc == 2) {
             ctx->in_delay_slot = 0;
             rc = 0;
+        } else if (rc == MIPS_FAULT && ctx->exit_reason == MIPS64_EXIT_NONE) {
+            ctx->in_delay_slot = 0;
         }
         return rc;
     }
@@ -860,8 +859,6 @@ int interp_step(mips64_ctx_t *ctx)
     mips_dec_t d;
     int rc = fetch_decode(ctx, pc, &d);
 
-    /* A fetch fault that delivered a signal (moved pc, exit NONE)
-     * resumes at the handler via the RC4 check below. */
     if (rc == 0 && interp_is_control(&d)) {
         rc = exec_branch(ctx, pc, &d);
     } else if (rc == 0) {
@@ -874,8 +871,6 @@ int interp_step(mips64_ctx_t *ctx)
             rc = 0;
         }
     }
-    /* RC4: direct MIPS_FAULT after a delivered signal (moved pc, exit
-     * NONE) resumes at the handler; fault_at already maps its own. */
     if (rc == MIPS_FAULT && ctx->exit_reason == MIPS64_EXIT_NONE &&
         ctx->pc != pc) {
         ctx->next_pc = ctx->pc + 4u;
@@ -887,6 +882,8 @@ int interp_step(mips64_ctx_t *ctx)
     return rc;
 }
 
+extern void mips64_difftest_checkpoint(const mips64_ctx_t *ctx);
+
 int interp_run(mips64_ctx_t *ctx)
 {
     for (;;) {
@@ -895,5 +892,6 @@ int interp_run(mips64_ctx_t *ctx)
         if (rc != 0) {
             return rc;
         }
+        mips64_difftest_checkpoint(ctx);
     }
 }

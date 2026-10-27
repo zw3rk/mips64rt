@@ -732,6 +732,7 @@ static void unaligned_body(void)
 	sa.sa_handler = fault_139;
 	(void)sigaction(SIGSEGV, &sa, NULL);
 	(void)sigaction(SIGBUS, &sa, NULL);
+	(void)syscall(SYS_sysmips, 7L, 0L, 0L, 0L);
 	__asm__ volatile("lw %0, 1(%1)" : "=r"(v) : "r"(&buf[0]));
 	_exit((int)(v & 0xFFu) + 100); /* only if the engine fixed it up */
 }

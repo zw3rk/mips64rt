@@ -343,14 +343,16 @@ static int jit_probe_map_jit(void)
     if (p == MAP_FAILED) {
         return 0;
     }
-    (void)pthread_jit_write_protect_np(1);
+    /* pthread_jit_write_protect_np(0) disables write protection (makes
+     * MAP_JIT pages writable); (1) enables write protection (seals RX). */
+    (void)pthread_jit_write_protect_np(0);
     jit_probe_armed = 1;
     if (sigsetjmp(jit_probe_jb, 1) == 0) {
         *(volatile uint32_t *)p = 0xD2800540u;
         ok = 1;
     }
     jit_probe_armed = 0;
-    (void)pthread_jit_write_protect_np(0);
+    (void)pthread_jit_write_protect_np(1);
     (void)munmap(p, 16384);
     return ok;
 }
@@ -404,8 +406,8 @@ void mips_jit_begin_write(void *p, size_t size)
         return;
     }
     if (jit_use_map_jit()) {
-        /* Open the JIT write window (no mprotect: toggle only). */
-        (void)pthread_jit_write_protect_np(1);
+        /* Open the JIT write window (0 = writable, no mprotect). */
+        (void)pthread_jit_write_protect_np(0);
         return;
     }
     lo = (uintptr_t)p & ~(uintptr_t)(ps - 1u);
@@ -429,9 +431,8 @@ int mips_jit_seal_rx(void *p, size_t size)
             return MIPS_FAULT;
         }
     } else {
-        /* Close the JIT write window. No mprotect anywhere near a
-         * MAP_JIT page. */
-        (void)pthread_jit_write_protect_np(0);
+        /* Close the JIT write window (1 = write-protected/RX). */
+        (void)pthread_jit_write_protect_np(1);
     }
 #if defined(__aarch64__) || defined(__arm64__)
     __builtin___clear_cache((char *)p, (char *)p + size);

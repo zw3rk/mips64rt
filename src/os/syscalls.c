@@ -4,24 +4,8 @@
  * Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0
  *
- * Shared helpers (guest $a3 convention, endian-aware field access,
- * validated guest windows, MIPS open-flag translation) plus the
- * descriptor/path/identity handlers: openat, fcntl, ioctl (verbatim
- * passthrough), lseek, dup/dup2/dup3, pipe2, access/faccessat,
- * readlinkat, unlinkat, close_range, the getpid/getppid/getuid/getgid
- * identity family, getrandom, and getdents64. Sibling files hold the
- * stat family (syscalls_stat.c), the clock family (syscalls_time.c),
- * and futex/signal-mask/robust/vectored-I/O (syscalls_sync.c); all are
- * wired through the mips_syscall dispatch in src/os/syscall_min.c.
- *
- * Verified in a debian:stable-slim container against
- * arch/mips/include/uapi/asm/unistd_n64.h / unistd_n32.h with live
- * fills under qemu-mips64el / qemu-mipsn32el 10.0.13. MIPS O_ and F_
- * flag values and the 1/2/3 SIG how values come from arch/mips UAPI
- * asm/fcntl.h and asm/signal.h. Guest byte order goes through
- * putn/getn keyed on ctx->is_be (the host is little-endian). Every
- * range is validated with mips_mem_ok; bad addresses return -EFAULT
- * with $a3=1 (never mips_fault: a bad syscall address is recoverable).
+ * Shared guest accessors, open-flag translation, and core descriptor,
+ * path, and identity syscalls.
  */
 #define _GNU_SOURCE
 
@@ -29,6 +13,7 @@
 
 #include "os/host_args.h"
 #include "os/syscall_nr.h"
+#include "vm/vm_pages.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -171,6 +156,9 @@ uint8_t *guest_range(mips64_ctx_t *ctx, uint64_t va, uint64_t len,
     }
     if (!mips_mem_ok(ctx, va, len, need)) {
         return NULL;
+    }
+    if (write != 0) {
+        mips_vm_pages_clear(va, len, (unsigned)MIPS_VM_PAGE_COW_CLEAN);
     }
     return (uint8_t *)mips64_guest_ptr(ctx, va);
 }
