@@ -457,7 +457,8 @@ int dbt_compile(mips64_ctx_t *ctx, uint64_t pc)
         if (mips_has_delay_slot(d)) {
             mips_dec_t *s;
 
-            if (mips_fetch(ctx, cur, &word) != 0) {
+            if (n >= MIPS64_DBT_MAX_INSNS ||
+                mips_fetch(ctx, cur, &word) != 0) {
                 n--;
                 cur -= 4u;
                 break;

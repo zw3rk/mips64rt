@@ -213,7 +213,7 @@ static int ei_branch(a64_emit_t *e, const mips_dec_t *d, const mips_dec_t *s,
     case 0x02u: /* J */
     case 0x03u: /* JAL */
         link = (d->op == 0x03u) ? 1 : 0;
-        tgt = ((pc + 4u) & ~UINT64_C(0xFFFFFF)) | ((uint64_t)d->target << 2);
+        tgt = ((pc + 4u) & ~UINT64_C(0xFFFFFFF)) | ((uint64_t)d->target << 2);
         has_cond = 0;
         break;
     case 0x04u: /* BEQ */

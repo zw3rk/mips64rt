@@ -555,7 +555,7 @@ static int ef_cmp(a64_emit_t *e, const mips_dec_t *d, uint64_t pc, int slot,
     /* Any unordered (NaN) instance exits: signaling compares and SNaN
      * Invalid flags stay exactly L3a's. Ordered FCC is pure hardware. */
     ei_cset(e, EI_C, EI_VS);
-    slow = ei_cbz(e, 1, 1, EI_C);
+    slow = ei_cbz(e, 1, 0, EI_C);
     ei_exit_undef(e, pc);
     ei_patch(e, slow, 0);
     /* Ordered predicate into EI_B (signaling pairs share the FCC of
