@@ -31,12 +31,15 @@
 #endif
 
 #ifndef MIPS64RT_HAVE_A64_EMIT_H
-/* Frozen cross-lane shape (must match src/dbt/a64_emit.h). Owned by L2b. */
+/* Frozen cross-lane shape (must match src/dbt/a64_emit.h). Owned by L2b.
+ * The trailing GPR cache pins guest `r` in host `x(9 + (r & 7))`. */
 typedef struct {
     uint32_t *buf;
     size_t cap;
     size_t len;
     int err;
+    uint8_t gpr_cache_valid;
+    uint8_t gpr_cache_reg[8];
 } a64_emit_t;
 
 /* Bounds-checked append; sets e->err on overflow. Owned by L2b. */

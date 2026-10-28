@@ -24,6 +24,23 @@ void a64e_u32(a64_emit_t *e, uint32_t w)
     e->buf[e->len++] = w;
 }
 
+void a64e_init(a64_emit_t *e, uint32_t *buf, size_t cap)
+{
+    size_t i;
+
+    if (e == NULL) {
+        return;
+    }
+    e->buf = buf;
+    e->cap = cap;
+    e->len = 0u;
+    e->err = 0;
+    e->gpr_cache_valid = 0u;
+    for (i = 0u; i < 8u; i++) {
+        e->gpr_cache_reg[i] = 0u;
+    }
+}
+
 /* Register gate: `x18`, `x29`, `x30` are never scratch-encodable.
  * `xzr` (31) is fine (dropped writes, comparisons). */
 static int reg_ok(a64_emit_t *e, unsigned r)

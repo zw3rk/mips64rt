@@ -20,6 +20,11 @@ static void ei_skip_st(a64_emit_t *e, unsigned test, int is_w, int is_nz,
 
     ei_gst(e, src, rd);
     ei_patch_at(e, s, e == NULL ? 0u : e->len, 0);
+    /* MOVZ/MOVN conditional skip: the store may not have executed,
+     * so the slot's fill must not survive the merge. */
+    if (e != NULL) {
+        e->gpr_cache_valid = 0;
+    }
 }
 
 int ei_special(a64_emit_t *e, const mips_dec_t *d, uint64_t pc,
@@ -184,6 +189,10 @@ int ei_special(a64_emit_t *e, const mips_dec_t *d, uint64_t pc,
         ei_sxt(e, 31u, EI_T, EI_T);
         ei_str(e, 0, EI_T, EI_CTX, MIPS64_CTX_HI_OFFSET);
         ei_patch_at(e, s, e == NULL ? 0u : e->len, 0);
+        /* Zero-divisor skip merges here: drop cached fills. */
+        if (e != NULL) {
+            e->gpr_cache_valid = 0;
+        }
         return 0;
     }
     case 0x1Cu: /* DMULT: signed 128-bit product */
@@ -218,11 +227,17 @@ int ei_special(a64_emit_t *e, const mips_dec_t *d, uint64_t pc,
             ei_cmp(e, 0, EI_B, EI_T);
             yes = ei_bcc(e, EI_EQ);
             ei_patch_at(e, no, e == NULL ? 0u : e->len, 0);
+            if (e != NULL) {
+                e->gpr_cache_valid = 0;
+            }
             ei_div(e, 0x9AC00C00u, 0, EI_C, EI_A, EI_B);
             ei_msub(e, 0, EI_T, EI_C, EI_B, EI_A);
             ei_str(e, 0, EI_C, EI_CTX, MIPS64_CTX_LO_OFFSET);
             ei_str(e, 0, EI_T, EI_CTX, MIPS64_CTX_HI_OFFSET);
             ei_patch_at(e, yes, e == NULL ? 0u : e->len, 0);
+            if (e != NULL) {
+                e->gpr_cache_valid = 0;
+            }
         } else {
             ei_div(e, 0x9AC00800u, 0, EI_C, EI_A, EI_B);
             ei_msub(e, 0, EI_T, EI_C, EI_B, EI_A);
@@ -230,6 +245,10 @@ int ei_special(a64_emit_t *e, const mips_dec_t *d, uint64_t pc,
             ei_str(e, 0, EI_T, EI_CTX, MIPS64_CTX_HI_OFFSET);
         }
         ei_patch_at(e, s, e == NULL ? 0u : e->len, 0);
+        /* DDIV zero/overflow skips merge here: drop cached fills. */
+        if (e != NULL) {
+            e->gpr_cache_valid = 0;
+        }
         return 0;
     }
     case 0x20u: /* ADD (trapping) */
@@ -260,6 +279,10 @@ int ei_special(a64_emit_t *e, const mips_dec_t *d, uint64_t pc,
         }
         if (trapping != 0) {
             ei_bfault(e, pc, ei_bcc(e, EI_VS));
+            /* Overflow trap exits; the fallthrough drops fills. */
+            if (e != NULL) {
+                e->gpr_cache_valid = 0;
+            }
         }
         if (is_d == 0) {
             ei_sxt(e, 31u, EI_C, EI_C);
@@ -316,6 +339,9 @@ int ei_special(a64_emit_t *e, const mips_dec_t *d, uint64_t pc,
             cc = EI_NE;
         }
         ei_bfault(e, pc, ei_bcc(e, cc));
+        if (e != NULL) {
+            e->gpr_cache_valid = 0;
+        }
         return 0;
     }
     case 0x38u: /* DSLL */
@@ -572,6 +598,9 @@ int ei_imm(a64_emit_t *e, const mips_dec_t *d, uint64_t pc, int slot)
         ei_mov32(e, EI_B, (uint32_t)d->simm);
         ei_adds(e, 1, EI_C, EI_A, EI_B);
         ei_bfault(e, pc, ei_bcc(e, EI_VS));
+        if (e != NULL) {
+            e->gpr_cache_valid = 0;
+        }
         ei_sxt(e, 31u, EI_C, EI_C);
         ei_gst(e, EI_C, d->rt);
         return 0;
@@ -618,6 +647,9 @@ int ei_imm(a64_emit_t *e, const mips_dec_t *d, uint64_t pc, int slot)
         ei_mov64(e, EI_B, (uint64_t)(int64_t)d->simm);
         ei_adds(e, 0, EI_C, EI_A, EI_B);
         ei_bfault(e, pc, ei_bcc(e, EI_VS));
+        if (e != NULL) {
+            e->gpr_cache_valid = 0;
+        }
         ei_gst(e, EI_C, d->rt);
         return 0;
     case 0x19u: /* DADDIU */
@@ -666,6 +698,9 @@ int ei_regimm_trap(a64_emit_t *e, const mips_dec_t *d, uint64_t pc,
     ei_mov64(e, EI_B, (uint64_t)(int64_t)d->simm);
     ei_cmp(e, 0, EI_A, EI_B);
     ei_bfault(e, pc, ei_bcc(e, cc));
+    if (e != NULL) {
+        e->gpr_cache_valid = 0;
+    }
     return 0;
 }
 int ei_cop(a64_emit_t *e, const mips_dec_t *d, uint64_t pc, int slot)

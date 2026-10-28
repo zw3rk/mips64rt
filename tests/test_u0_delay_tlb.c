@@ -343,6 +343,7 @@ static void u0_begin(void)
     u0e.cap = 512u;
     u0e.len = 0u;
     u0e.err = 0;
+    u0e.gpr_cache_valid = 0;
 }
 
 static int u0_has_masked(uint32_t mask, uint32_t want)

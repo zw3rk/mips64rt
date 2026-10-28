@@ -41,19 +41,64 @@ int ef_emit_cop1x(a64_emit_t *e, const mips_dec_t *d, uint64_t pc, int slot);
 
 /* ---- Guest state access ($0 reads as XZR, writes are dropped) ---- */
 
+/* Wave P12 direct GPR cache: guest `r != 0` pins in host
+ * `x(9 + (r & 7))` (x9..x16, never used as scratch elsewhere, never
+ * x18). Write-through, so `ctx->r[]` stays exact for faults, traps,
+ * and block exits. The caller invalidates (`gpr_cache_valid = 0`)
+ * wherever emitted control flow diverges and merges. */
 void ei_gld(a64_emit_t *e, unsigned tmp, unsigned r)
 {
+    unsigned slot;
+    unsigned creg;
+
     if (r == MIPS64_REG_ZERO) {
         ei_mov(e, tmp, EI_XZR);
-    } else {
-        ei_ldr(e, 0, tmp, EI_CTX, EI_OFF_GPR(r));
+        return;
+    }
+    slot = r & 7u;
+    creg = 9u + slot;
+    if (e != NULL && ((e->gpr_cache_valid >> slot) & 1u) != 0u &&
+        e->gpr_cache_reg[slot] == (uint8_t)r) {
+        if (tmp != creg) {
+            ei_mov(e, tmp, creg);
+            if (tmp >= 9u && tmp <= 16u) {
+                e->gpr_cache_valid &= (uint8_t)(~(1u << (tmp - 9u)));
+            }
+        }
+        return;
+    }
+    ei_ldr(e, 0, creg, EI_CTX, EI_OFF_GPR(r));
+    if (e != NULL) {
+        /* A scratch `tmp` inside x9..x16 (never the EI_A..EI_T path,
+         * which uses x21..x24) would clobber that slot: drop it. */
+        if (tmp >= 9u && tmp <= 16u && tmp != creg) {
+            e->gpr_cache_valid &= (uint8_t)(~(1u << (tmp - 9u)));
+        }
+        e->gpr_cache_valid |= (uint8_t)(1u << slot);
+        e->gpr_cache_reg[slot] = (uint8_t)r;
+    }
+    if (tmp != creg) {
+        ei_mov(e, tmp, creg);
     }
 }
 
 void ei_gst(a64_emit_t *e, unsigned tmp, unsigned r)
 {
-    if (r != MIPS64_REG_ZERO) {
-        ei_str(e, 0, tmp, EI_CTX, EI_OFF_GPR(r));
+    unsigned slot;
+    unsigned creg;
+
+    if (r == MIPS64_REG_ZERO) {
+        return;
+    }
+    slot = r & 7u;
+    creg = 9u + slot;
+    ei_str(e, 0, tmp, EI_CTX, EI_OFF_GPR(r));
+    if (tmp != creg) {
+        ei_mov(e, creg, tmp);
+    }
+    if (e != NULL) {
+        e->gpr_cache_valid |= (uint8_t)(1u << slot);
+        e->gpr_cache_reg[slot] = (uint8_t)r;
     }
 }
 
@@ -394,6 +439,11 @@ static int ei_branch(a64_emit_t *e, const mips_dec_t *d, const mips_dec_t *s,
         }
         ei_exit_at(e, pc + 8u, MIPS64_EXIT_BRANCH);
         ei_patch_at(e, t, e == NULL ? 0u : e->len, 0);
+        /* Taken-likely path: the not-taken skip may have bypassed
+         * cached fills, so the slot starts with a cold GPR cache. */
+        if (e != NULL) {
+            e->gpr_cache_valid = 0;
+        }
         ei_mem_branch_note(pc, (unsigned)RT_NPC_STATIC_TARGET,
                            (int32_t)(tgt - pc));
         if (ei_one(e, s, pc + 4u, be, 1) != 0) {
@@ -433,6 +483,11 @@ static int ei_branch(a64_emit_t *e, const mips_dec_t *d, const mips_dec_t *s,
         }
         ei_exit_at(e, pc + 8u, MIPS64_EXIT_BRANCH);
         ei_patch_at(e, t, e == NULL ? 0u : e->len, 0);
+        /* Second slot copy: the fallthrough copy above may have
+         * cached fills that never execute on the taken path. */
+        if (e != NULL) {
+            e->gpr_cache_valid = 0;
+        }
         ei_mem_branch_note(pc, (unsigned)RT_NPC_STATIC_TARGET,
                            (int32_t)(tgt - pc));
         if (ei_one(e, s, pc + 4u, be, 1) != 0) {
@@ -607,10 +662,9 @@ int dbt_emit_int(mips64_ctx_t *ctx, uint64_t pc, const mips_dec_t *insns,
     if (cap < 4u || ((uintptr_t)out & 3u) != 0u) {
         return 1;
     }
-    e.buf = (uint32_t *)(void *)out;
-    e.cap = cap / 4u;
-    e.len = 0u;
-    e.err = 0;
+    /* Fresh block: the GPR cache starts empty (a64e_init zeroes
+     * gpr_cache_valid); each ei_branch slot copy re-invalidates. */
+    a64e_init(&e, (uint32_t *)(void *)out, cap / 4u);
     be = ctx->is_be != 0u ? 1 : 0;
     /* Every memory word records one relative site between begin and
      * end (the dispatcher retains the table with the block). */

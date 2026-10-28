@@ -646,6 +646,11 @@ int ei_atomic(a64_emit_t *e, const mips_dec_t *d, uint64_t pc, int be,
     ei_gst(e, EI_B, d->rt);
     ei_strb(e, EI_XZR, EI_CTX, MIPS64_CTX_LLBIT_OFFSET);
     ei_patch26(e, done, e == NULL ? 0u : e->len);
+    /* SC/SCD success/failure paths merge here: the loser path's
+     * fills must not survive, so the GPR cache restarts cold. */
+    if (e != NULL) {
+        e->gpr_cache_valid = 0;
+    }
     ei_probe_close(e);
     if (ei_sites.count > 0u && ei_sites.count <= DBT_MEM_SITES_MAX) {
         ei_sites.sites[ei_sites.count - 1u].seq_start_offset =

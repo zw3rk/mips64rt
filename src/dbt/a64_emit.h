@@ -22,16 +22,24 @@
 #include <stdint.h>
 
 /* Emit buffer: a bounds-checked append of one raw A64 instruction
- * word; overflow sets `err` and drops the word. */
+ * word; overflow sets `err` and drops the word. The trailing GPR
+ * cache (Wave P12) tracks which guest register each host register
+ * `x9..x16` holds: slot `r & 7` pins guest `r` in `x(9 + slot)` while
+ * the slot bit in `gpr_cache_valid` is set (write-through, so
+ * `ctx->r[]` stays exact for faults and exits). */
 typedef struct {
     uint32_t *buf;
     size_t cap;
     size_t len;
     int err;
+    uint8_t gpr_cache_valid;
+    uint8_t gpr_cache_reg[8];
 } a64_emit_t;
 
 /* Bounds-checked append of one raw A64 word. */
 void a64e_u32(a64_emit_t *e, uint32_t w);
+/* Initialize an emit buffer (zeroes the GPR cache). */
+void a64e_init(a64_emit_t *e, uint32_t *buf, size_t cap);
 
 /* Raw AArch64 register ids. `A64_X18` is listed only so emitters can
  * name the forbidden platform register; no helper ever encodes it,

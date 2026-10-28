@@ -27,6 +27,7 @@ static void begin(void)
     e.cap = 64;
     e.len = 0;
     e.err = 0;
+    e.gpr_cache_valid = 0;
 }
 
 static void expect(unsigned slot, uint32_t want, unsigned line)
