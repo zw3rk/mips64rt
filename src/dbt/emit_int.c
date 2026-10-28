@@ -57,6 +57,15 @@ void ei_gst(a64_emit_t *e, unsigned tmp, unsigned r)
     }
 }
 
+/* Link write (RA = pc + 8 for direct links, rd for JALR). Deferred
+ * past a guarded COP1/COP1X delay slot so a guard exit reaches the
+ * dispatcher with the link (and any JALR rd==rs input) untouched. */
+static void ei_link(a64_emit_t *e, unsigned rd, uint64_t pc)
+{
+    ei_mov64(e, EI_T, pc + 8u);
+    ei_gst(e, EI_T, rd);
+}
+
 /* ---- Block terminators ---- */
 
 /* Store an immediate guest pc to ctx->pc. */
@@ -208,6 +217,7 @@ static int ei_branch(a64_emit_t *e, const mips_dec_t *d, const mips_dec_t *s,
     unsigned fccbit = 23u;
     unsigned tf = 0u;
     size_t t;
+    int fpslot = 0;
 
     switch (d->op) {
     case 0x02u: /* J */
@@ -306,6 +316,11 @@ static int ei_branch(a64_emit_t *e, const mips_dec_t *d, const mips_dec_t *s,
     default:
         return 1;
     }
+    /* A guarded COP1/COP1X word in the slot of a linking branch runs
+     * before the link write: its guards exit at the branch pc, so RA
+     * (and any JALR rd==rs input) must still be untouched for the
+     * interpreter replay. Pure bit-op/GPR slots keep the old order. */
+    fpslot = (link != 0 && (s->op == 0x11u || s->op == 0x13u)) ? 1 : 0;
     if (indirect != 0) {
         size_t s1;
         size_t s2;
@@ -314,9 +329,8 @@ static int ei_branch(a64_emit_t *e, const mips_dec_t *d, const mips_dec_t *s,
         ei_gld(e, EI_A, d->rs);
         s1 = ei_tbz(e, 1, EI_A, 0u);
         s2 = ei_tbz(e, 1, EI_A, 1u);
-        if (link != 0) {
-            ei_mov64(e, EI_T, pc + 8u);
-            ei_gst(e, EI_T, d->rd);
+        if (link != 0 && fpslot == 0) {
+            ei_link(e, d->rd, pc);
         }
         /* The delay slot owns x21..x24, so park the target in x25
          * (trampoline-preserved, emitter-unused) across it. The slot
@@ -328,6 +342,9 @@ static int ei_branch(a64_emit_t *e, const mips_dec_t *d, const mips_dec_t *s,
             return 1;
         }
         ei_mem_branch_clear();
+        if (fpslot != 0) {
+            ei_link(e, d->rd, pc);
+        }
         ei_mov(e, EI_A, EI_S);
         ei_str(e, 0, EI_A, EI_CTX, MIPS64_CTX_PC_OFFSET);
         ei_mov32(e, EI_T, 4u);
@@ -357,9 +374,8 @@ static int ei_branch(a64_emit_t *e, const mips_dec_t *d, const mips_dec_t *s,
             }
         }
     }
-    if (link != 0) {
-        ei_mov64(e, EI_T, pc + 8u);
-        ei_gst(e, EI_T, MIPS64_REG_RA);
+    if (link != 0 && fpslot == 0) {
+        ei_link(e, MIPS64_REG_RA, pc);
     }
     if (has_cond != 0 && fpcond != 0) {
         /* BC1T: taken when the FCC bit is set (tbnz); BC1F: taken
@@ -371,7 +387,11 @@ static int ei_branch(a64_emit_t *e, const mips_dec_t *d, const mips_dec_t *s,
     /* The slot site inherits the static taken-target delta: fault
      * recovery applies it without replaying the branch. */
     if (likely != 0) {
-        /* Not-taken likely: skip the slot with no fetch. */
+        /* Not-taken likely: skip the slot with no fetch (the link
+         * still fires: the interpreter writes RA before the annul). */
+        if (fpslot != 0) {
+            ei_link(e, MIPS64_REG_RA, pc);
+        }
         ei_exit_at(e, pc + 8u, MIPS64_EXIT_BRANCH);
         ei_patch_at(e, t, e == NULL ? 0u : e->len, 0);
         ei_mem_branch_note(pc, (unsigned)RT_NPC_STATIC_TARGET,
@@ -381,6 +401,9 @@ static int ei_branch(a64_emit_t *e, const mips_dec_t *d, const mips_dec_t *s,
             return 1;
         }
         ei_mem_branch_clear();
+        if (fpslot != 0) {
+            ei_link(e, MIPS64_REG_RA, pc);
+        }
         ei_exit_at(e, tgt, MIPS64_EXIT_BRANCH);
         return 0;
     }
@@ -394,6 +417,9 @@ static int ei_branch(a64_emit_t *e, const mips_dec_t *d, const mips_dec_t *s,
             return 1;
         }
         ei_mem_branch_clear();
+        if (fpslot != 0) {
+            ei_link(e, MIPS64_REG_RA, pc);
+        }
     } else {
         ei_mem_branch_note(pc, (unsigned)RT_NPC_STATIC_TARGET,
                            (int32_t)(tgt - pc));
@@ -402,6 +428,9 @@ static int ei_branch(a64_emit_t *e, const mips_dec_t *d, const mips_dec_t *s,
             return 1;
         }
         ei_mem_branch_clear();
+        if (fpslot != 0) {
+            ei_link(e, MIPS64_REG_RA, pc);
+        }
         ei_exit_at(e, pc + 8u, MIPS64_EXIT_BRANCH);
         ei_patch_at(e, t, e == NULL ? 0u : e->len, 0);
         ei_mem_branch_note(pc, (unsigned)RT_NPC_STATIC_TARGET,
@@ -411,6 +440,9 @@ static int ei_branch(a64_emit_t *e, const mips_dec_t *d, const mips_dec_t *s,
             return 1;
         }
         ei_mem_branch_clear();
+        if (fpslot != 0) {
+            ei_link(e, MIPS64_REG_RA, pc);
+        }
     }
     ei_exit_at(e, tgt, MIPS64_EXIT_BRANCH);
     return 0;

@@ -33,8 +33,11 @@
  * - Unknown fmt/funct words (moves, COP1X, DMFC1/DMTC1, MFC1/MTC1,
  *   CFC1/CTC1, LWC1/SWC1/LDC1/SDC1 stay with fpmove.c/interp) return
  *   nonzero so the dispatcher falls back.
- * - Words that need a runtime guard never emit inside a delay slot
- *   (slot != 0 returns nonzero); pure bit-ops (MOV/ABS/NEG) may.
+ * - Words that need a runtime guard may emit inside a delay slot:
+ *   every guard exits at the branch (slot pc - 4u) with zero
+ *   architectural state modified, so the dispatcher replays the
+ *   branch plus its slot via interp_step; pure bit-ops (MOV/ABS/NEG)
+ *   never guard and always emit.
  *
  * Known RC3 adjudication items (value-exact, flags deferred): MIPS
  * Inexact/Overflow/Underflow/DivisionByZero sticky flags are not
@@ -319,10 +322,11 @@ static int ef_arith(a64_emit_t *e, const mips_dec_t *d, uint64_t pc, int slot,
     unsigned s0 = is_d != 0 ? EF_D0 : EF_S0;
     unsigned s1 = is_d != 0 ? EF_D1 : EF_S1;
     unsigned s2 = is_d != 0 ? EF_D2 : EF_S2;
+    /* Guarded words may emit in a delay slot: every runtime guard
+     * below exits at the branch (pc - 4u) with zero architectural
+     * state modified, so the dispatcher replays branch + slot. */
+    uint64_t gpc = slot != 0 ? (pc - 4u) : pc;
 
-    if (slot != 0) {
-        return 1;
-    }
     switch (d->funct) {
     case 0x00u: /* ADD */
         base = is_d != 0 ? EF_FADD_D : EF_FADD_S;
@@ -338,9 +342,9 @@ static int ef_arith(a64_emit_t *e, const mips_dec_t *d, uint64_t pc, int slot,
         break;
     case 0x04u: /* SQRT (fs -> fd, ft ignored) */
         ef_fill(e, is_d, s0, fs);
-        ef_mode_guard(e, pc);
+        ef_mode_guard(e, gpc);
         ef_f1(e, is_d != 0 ? EF_FSQRT_D : EF_FSQRT_S, s2, s0);
-        ef_nan_guard(e, s2, is_d, pc);
+        ef_nan_guard(e, s2, is_d, gpc);
         ef_spill(e, is_d, s2, fd);
         return 0;
     default:
@@ -348,7 +352,7 @@ static int ef_arith(a64_emit_t *e, const mips_dec_t *d, uint64_t pc, int slot,
     }
     ef_fill(e, is_d, s0, fs);
     ef_fill(e, is_d, s1, ft);
-    ef_mode_guard(e, pc);
+    ef_mode_guard(e, gpc);
     if (d->funct == 0x03u) {
         size_t nz;
 
@@ -356,11 +360,11 @@ static int ef_arith(a64_emit_t *e, const mips_dec_t *d, uint64_t pc, int slot,
         ef_fcmp(e, is_d, s1, is_d != 0 ? EF_D3 : EF_S3);
         ei_cset(e, EI_B, EI_EQ);
         nz = ei_cbz(e, 1, 0, EI_B);
-        ei_exit_undef(e, pc);
+        ei_exit_undef(e, gpc);
         ei_patch(e, nz, 0);
     }
     ef_f2(e, base, s2, s0, s1);
-    ef_nan_guard(e, s2, is_d, pc);
+    ef_nan_guard(e, s2, is_d, gpc);
     ef_spill(e, is_d, s2, fd);
     return 0;
 }
@@ -375,21 +379,19 @@ static int ef_cvt_ff(a64_emit_t *e, const mips_dec_t *d, uint64_t pc, int slot,
 {
     unsigned fs = d->rd & 31u;
     unsigned fd = d->sa & 31u;
+    uint64_t gpc = slot != 0 ? (pc - 4u) : pc;
 
-    if (slot != 0) {
-        return 1;
-    }
     if (to_d != 0) {
         ef_fill(e, 0, EF_S0, fs);
-        ef_mode_guard(e, pc);
+        ef_mode_guard(e, gpc);
         ef_f1(e, EF_FCVT_DS, EF_D2, EF_S0);
-        ef_nan_guard(e, EF_D2, 1, pc);
+        ef_nan_guard(e, EF_D2, 1, gpc);
         ef_spill(e, 1, EF_D2, fd);
     } else {
         ef_fill(e, 1, EF_D0, fs);
-        ef_mode_guard(e, pc);
+        ef_mode_guard(e, gpc);
         ef_f1(e, EF_FCVT_SD, EF_S2, EF_D0);
-        ef_nan_guard(e, EF_S2, 0, pc);
+        ef_nan_guard(e, EF_S2, 0, gpc);
         ef_spill(e, 0, EF_S2, fd);
     }
     return 0;
@@ -446,19 +448,17 @@ static int ef_cvt_to_int(a64_emit_t *e, const mips_dec_t *d, uint64_t pc,
     unsigned fd = d->sa & 31u;
     unsigned s0 = is_d != 0 ? EF_D0 : EF_S0;
     unsigned s2 = is_d != 0 ? EF_D2 : EF_S2;
+    uint64_t gpc = slot != 0 ? (pc - 4u) : pc;
 
-    if (slot != 0) {
-        return 1;
-    }
     ef_fill(e, is_d, s0, fs);
     if (mode == 0u) {
-        ef_mode_guard(e, pc);
+        ef_mode_guard(e, gpc);
     } else {
-        ef_fs_guard(e, pc);
+        ef_fs_guard(e, gpc);
     }
     ef_round_op(e, is_d, (int)mode, pc);
     ef_fcvtsz(e, is_l, is_d, EI_B, s2);
-    ef_roundtrip_guard(e, is_d, is_l, mode == 0u ? s0 : s2, pc);
+    ef_roundtrip_guard(e, is_d, is_l, mode == 0u ? s0 : s2, gpc);
     if (is_l != 0) {
         ei_str(e, 0, EI_B, EI_CTX, EF_OFF_FPR(fd));
     } else {
@@ -475,16 +475,14 @@ static int ef_cvt_from_int(a64_emit_t *e, const mips_dec_t *d, uint64_t pc,
 {
     unsigned fs = d->rd & 31u;
     unsigned fd = d->sa & 31u;
+    uint64_t gpc = slot != 0 ? (pc - 4u) : pc;
 
-    if (slot != 0) {
-        return 1;
-    }
     if (is_l != 0) {
         ei_ldr(e, 0, EI_B, EI_CTX, EF_OFF_FPR(fs));
     } else {
         ei_ldr(e, 1, EI_B, EI_CTX, EF_OFF_FPR(fs));
     }
-    ef_mode_guard(e, pc);
+    ef_mode_guard(e, gpc);
     if (to_d != 0) {
         ef_scvtf(e, is_l, 1, EF_D2, EI_B);
         ef_spill(e, 1, EF_D2, fd);
@@ -545,10 +543,8 @@ static int ef_cmp(a64_emit_t *e, const mips_dec_t *d, uint64_t pc, int slot,
     unsigned s0 = is_d != 0 ? EF_D0 : EF_S0;
     unsigned s1 = is_d != 0 ? EF_D1 : EF_S1;
     size_t slow;
+    uint64_t gpc = slot != 0 ? (pc - 4u) : pc;
 
-    if (slot != 0) {
-        return 1;
-    }
     ef_fill(e, is_d, s0, fs);
     ef_fill(e, is_d, s1, ft);
     ef_fcmp(e, is_d, s0, s1);
@@ -556,7 +552,7 @@ static int ef_cmp(a64_emit_t *e, const mips_dec_t *d, uint64_t pc, int slot,
      * Invalid flags stay exactly L3a's. Ordered FCC is pure hardware. */
     ei_cset(e, EI_C, EI_VS);
     slow = ei_cbz(e, 1, 0, EI_C);
-    ei_exit_undef(e, pc);
+    ei_exit_undef(e, gpc);
     ei_patch(e, slow, 0);
     /* Ordered predicate into EI_B (signaling pairs share the FCC of
      * their non-signaling counterpart). */
@@ -747,7 +743,8 @@ int ef_emit_fp(a64_emit_t *e, const mips_dec_t *d, uint64_t pc, int slot)
  * are deferred per the RC3 adjudication, exactly like S/D arithmetic.
  * Indexed COP1X memory words (LWXC1/LDXC1/SWXC1/SDXC1/PREFX) fault in
  * the interp oracle, so they return 1 here and the dispatcher replays
- * them (fault-identical). Guarded words never emit in delay slots. */
+ * them (fault-identical). Guarded FMA words may emit in delay slots:
+ * their guards exit at the branch (slot pc - 4u). */
 
 /* Assembler-verified FMA bases (Rd=0,Rn=0,Rm=0,Ra=0 probed with
  * aarch64 clang; o1 = bit 21, o0 = bit 15, type = bit 22):
@@ -778,7 +775,8 @@ static void ef_fma(a64_emit_t *e, uint32_t base, unsigned rd, unsigned rn,
 
 /* Entry point for op 0x13 (called from the COP1X case in
  * src/dbt/emit_int.c): 0 emitted, nonzero for the dispatcher to fall
- * back (indexed words, unknown functs, guarded words in slots). */
+ * back (indexed words, unknown functs). Guarded FMA words emit in
+ * slots with branch-pc guard exits (see above). */
 int ef_emit_cop1x(a64_emit_t *e, const mips_dec_t *d, uint64_t pc, int slot)
 {
     unsigned fr = d->rs & 31u;
@@ -794,9 +792,11 @@ int ef_emit_cop1x(a64_emit_t *e, const mips_dec_t *d, uint64_t pc, int slot)
     if (d->op != 0x13u) {
         return 1;
     }
-    if (slot != 0) {
-        return 1;
-    }
+    /* Guarded COP1X words may emit in a delay slot: the mode and NaN
+     * guards below exit at the branch (pc - 4u) with zero
+     * architectural state modified. */
+    uint64_t gpc = slot != 0 ? (pc - 4u) : pc;
+
     switch (d->funct) {
     case 0x20u: /* MADD.S */
         base = EF_FMADD_S;
@@ -832,15 +832,15 @@ int ef_emit_cop1x(a64_emit_t *e, const mips_dec_t *d, uint64_t pc, int slot)
     ef_fill(e, is_d, is_d != 0 ? EF_D0 : EF_S0, fr);
     ef_fill(e, is_d, is_d != 0 ? EF_D1 : EF_S1, fs);
     ef_fill(e, is_d, is_d != 0 ? EF_D2 : EF_S2, ft);
-    ef_mode_guard(e, pc);
+    ef_mode_guard(e, gpc);
     /* rd = fd, rn = fs, rm = ft, ra = fr. */
     if (is_d != 0) {
         ef_fma(e, base, EF_D3, EF_D1, EF_D2, EF_D0);
-        ef_nan_guard(e, EF_D3, 1, pc);
+        ef_nan_guard(e, EF_D3, 1, gpc);
         ef_spill(e, 1, EF_D3, fd);
     } else {
         ef_fma(e, base, EF_S3, EF_S1, EF_S2, EF_S0);
-        ef_nan_guard(e, EF_S3, 0, pc);
+        ef_nan_guard(e, EF_S3, 0, gpc);
         ef_spill(e, 0, EF_S3, fd);
     }
     return 0;
