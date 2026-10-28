@@ -10,8 +10,9 @@
  * `src/core/cpu.h`). Words the emitter declines end the block with a
  * fallback exit: the dispatcher single-steps the declining word in
  * `interp_step` and resumes, bit-identical to `interp` by
- * construction. FP/COP1 blocks never reach the emitter: the compile
- * scan hands them to `interp_step` until Phase 3.
+ * construction. Wave P compiles the L3b FP subset too (COP1
+ * arithmetic/CVT/compare, COP1X FMA, LWC1/SWC1/LDC1/SDC1); indexed
+ * COP1X words and COP2 still decline to `interp_step`.
  *
  * Host register discipline (see `src/dbt/dbt.h`; U0 lane rebinds
  * `x20`): `x19` pins the `mips64_ctx_t *`, `x20` pins the U0
@@ -58,11 +59,14 @@ int mips64_dbt_available(void)
 /* C fallback for non-AArch64 hosts so unit builds link; the real
  * dispatcher only enters code when `mips64_dbt_available()` is true. */
 #if !defined(__aarch64__) && !defined(__arm64__)
-long mips64_dbt_enter(mips64_ctx_t *ctx, uint64_t base, void *code)
+long mips64_dbt_enter(mips64_ctx_t *ctx, uint64_t base, void *code,
+                      uint64_t budget, const _Atomic uint64_t *epoch)
 {
     (void)ctx;
     (void)base;
     (void)code;
+    (void)budget;
+    (void)epoch;
     return (long)MIPS64_DBT_EXIT_UNDEF;
 }
 #endif
@@ -124,30 +128,10 @@ int dbt_npc_resume(mips64_ctx_t *ctx)
 /* W^X code pages.                                                    */
 /* ------------------------------------------------------------------ */
 
-/* Publish one block through the backend JIT hooks (W^X done right
- * per host: Linux flips RW->RX, Darwin toggles MAP_JIT writability
- * and never mprotects). Guest data pages are never `PROT_EXEC` on
- * the host. Evicted cache entries keep their RX mapping until
- * process end (RC2 bound: the cache holds 1024 entries), so no live
- * IBTC slot can ever dangle. */
-static void *dbt_code_publish(const uint8_t *buf, size_t len)
-{
-    void *p;
-
-    if (buf == NULL || len == 0)
-        return NULL;
-    p = mips_jit_alloc(len);
-    if (p == NULL)
-        return NULL;
-    mips_jit_begin_write(p, len);
-    memcpy(p, buf, len);
-    if (mips_jit_seal_rx(p, len) != 0) {
-        mips_jit_free(p, len);
-        return NULL;
-    }
-    return p;
-}
-
+/* Block publication lives in src/dbt/arena.c (Wave P bump-allocated
+ * W^X arena). Guest data pages are never `PROT_EXEC` on the host.
+ * Published mappings are retained until process end (RC2 bound: the
+ * cache holds 1024 entries), so no live IBTC slot can dangle. */
 /* ------------------------------------------------------------------ */
 /* Block cache + IBTC + RAS.                                          */
 /* ------------------------------------------------------------------ */
@@ -181,6 +165,7 @@ static void dbt_snap_drop(dbt_entry_t *e)
 static _Thread_local dbt_entry_t block_cache[MIPS64_DBT_CACHE_ENTRIES];
 static _Thread_local uint64_t ras[MIPS64_DBT_RAS_ENTRIES];
 static _Thread_local unsigned ras_top;
+static _Thread_local uint64_t ibtc_epoch;
 
 /* Preloaded AOT site cache from `--cache-dir` (`mips_aot_sites_load`):
  * avoids duplicate `.aot` leaf appends across runs and reuses validated
@@ -299,18 +284,21 @@ static void ibtc_insert(mips64_ctx_t *ctx, uint64_t guest, void *host)
     slots[ibtc_index(guest)].host = host;
 }
 
-/* Snapshot match for one cache entry: a single cover check plus a
- * host-side memcmp of the covered guest bytes. Same detection power
- * as the old per-word fetch+hash (any clobbering plain store
- * retires the translation), at one lock acquisition and no fetch
- * calls: the per-entry O(block) scan with per-word overhead is what
- * kept `dbt` below `interp` on branch-heavy code (lane H3). The
- * snapshot holds raw host bytes (not decoded words), so the compare
- * is endianness-neutral: a word compare would pass on LE and fail on
- * BE forever, recompiling every block until the RX mappings exhaust
- * the container (lane H4 n32be-dbt SIGKILL). Returns 0 when the
- * range is not fully readable (lookup miss: the dispatcher
- * retranslates, and `interp` raises the guest fault). */
+static void ibtc_evict(mips64_ctx_t *ctx, uint64_t guest)
+{
+    mips64_ibtc_slot_t *slots;
+
+    if (ctx == NULL || ctx->ibtc_ptr == 0u)
+        return;
+    slots = (void *)(uintptr_t)ctx->ibtc_ptr;
+    if (slots[ibtc_index(guest)].guest == guest) {
+        slots[ibtc_index(guest)].guest = 0u;
+        slots[ibtc_index(guest)].host = NULL;
+    }
+}
+
+/* Snapshot match for one cache entry: cover check (READ + EXEC) plus a
+ * host-side memcmp of the covered guest bytes on SMC epoch advances. */
 static int dbt_snap_match(mips64_ctx_t *ctx, const dbt_entry_t *e)
 {
     uint64_t len;
@@ -319,26 +307,58 @@ static int dbt_snap_match(mips64_ctx_t *ctx, const dbt_entry_t *e)
     if (e->snap == NULL || e->blk.guest_end <= e->blk.guest_pc)
         return 0;
     len = e->blk.guest_end - e->blk.guest_pc;
-    if (!mips_mem_ok(ctx, e->blk.guest_pc, len, MIPS_PROT_READ))
+    if (!mips_mem_ok(ctx, e->blk.guest_pc, len,
+                     MIPS_PROT_READ | MIPS_PROT_EXEC))
         return 0;
     cur = mips64_guest_ptr(ctx, e->blk.guest_pc);
     return memcmp(cur, e->snap, (size_t)len) == 0;
 }
 
-/* Validate one cache entry: epoch match plus, for native entries, a
- * guest-word snapshot match (retires translations clobbered by plain
- * stores with no remap epoch bump). Negative entries need no check:
- * the `interp_step` fallback always reads current bytes. */
+/* Arm every page a translated block spans as code-bearing BEFORE
+ * publishing, and revoke writable Soft-TLB tags for those pages. */
+static void dbt_arm_code_pages(mips64_ctx_t *ctx, uint64_t start,
+                               uint64_t end)
+{
+    uint64_t len;
+
+    if (ctx == NULL || end <= start) {
+        return;
+    }
+    len = end - start;
+    mips_vm_pages_mark(start, len, (unsigned)MIPS_VM_PAGE_HAS_CODE);
+    mips_soft_tlb_evict_write(ctx, start, len);
+}
+
+/* Validate one cache entry (Wave P epoch-gated): matching SMC epoch hits
+ * with no snapshot scan; epoch advances flush the IBTC and revalidate. */
 static dbt_entry_t *lookup_entry(mips64_ctx_t *ctx, uint64_t pc)
 {
     dbt_entry_t *e = &block_cache[cache_index(pc)];
+    uint64_t epoch = atomic_load_explicit(&dbt_smc_epoch, memory_order_acquire);
 
-    if (!e->used || e->pc != pc || e->epoch != dbt_smc_epoch)
+    if (ibtc_epoch != epoch) {
+        if (ctx != NULL && ctx->ibtc_ptr != 0u)
+            memset((void *)(uintptr_t)ctx->ibtc_ptr, 0,
+                   MIPS64_IBTC_SIZE * sizeof(mips64_ibtc_slot_t));
+        ibtc_epoch = epoch;
+    }
+    if (!e->used || e->pc != pc)
         return NULL;
-    if (e->fallback || e->blk.code == NULL)
+    if (e->epoch == epoch)
         return e;
+    if (e->fallback || e->blk.code == NULL) {
+        e->epoch = epoch;
+        return e;
+    }
     if (!dbt_snap_match(ctx, e))
         return NULL;
+    dbt_arm_code_pages(ctx, e->blk.guest_pc, e->blk.guest_end);
+    if (atomic_load_explicit(&dbt_smc_epoch, memory_order_acquire) !=
+        epoch)
+        return NULL;
+    e->epoch = epoch;
+    if (ctx != NULL && ctx->ibtc_ptr != 0u)
+        ibtc_insert(ctx, pc, e->blk.code);
     return e;
 }
 
@@ -346,54 +366,27 @@ void *dbt_lookup(mips64_ctx_t *ctx, uint64_t pc)
 {
     dbt_entry_t *e;
     mips64_ibtc_slot_t *slots;
-    mips64_ibtc_slot_t *s;
 
     if (ctx == NULL)
         return NULL;
     if (ensure_ibtc(ctx) != 0)
         return NULL;
-    /* IBTC fast path, revalidated like the cache probe (an evicted
-     * entry never matches: its code pointer is gone from the cache). */
-    slots = (void *)(uintptr_t)ctx->ibtc_ptr;
-    s = &slots[ibtc_index(pc)];
-    if (s->host != NULL && s->guest == pc) {
-        e = lookup_entry(ctx, pc);
-        if (e != NULL && !e->fallback && e->blk.code == s->host)
-            return s->host;
-    }
+    /* Single probe: the epoch gate above makes the snapshot scan free
+     * on the hot path, so one lookup serves the IBTC refresh too. */
     e = lookup_entry(ctx, pc);
     if (e == NULL || e->fallback || e->blk.code == NULL)
         return NULL;
-    ibtc_insert(ctx, pc, e->blk.code);
+    slots = (void *)(uintptr_t)ctx->ibtc_ptr;
+    slots[ibtc_index(pc)].guest = pc;
+    slots[ibtc_index(pc)].host = e->blk.code;
     return e->blk.code;
-}
-
-/* True for instructions lowered by Phase 3: any COP1/COP1X/COP2 word
- * or FPR load/store. Such words abort the whole block compile; the
- * dispatcher runs them in `interp_step` instead. */
-static int is_fp_coproc(const mips_dec_t *d)
-{
-    switch (d->op) {
-    case MIPS64_OP_COP1:
-    case MIPS64_OP_COP1X:
-    case MIPS64_OP_COP2:
-    case MIPS64_OP_LWC1:
-    case MIPS64_OP_LDC1:
-    case MIPS64_OP_SWC1:
-    case MIPS64_OP_SDC1:
-    case MIPS64_OP_LWC2:
-    case MIPS64_OP_LDC2:
-    case MIPS64_OP_SWC2:
-    case MIPS64_OP_SDC2:
-        return 1;
-    default:
-        return 0;
-    }
 }
 
 /* Privileged words end the block without a delay slot (the emitter
  * exits to the dispatcher and `interp` evaluates them). MIPS16
- * entry (`JALX`) likewise: `interp` faults, never jumps. */
+ * entry (`JALX`) likewise: `interp` faults, never jumps. FP words
+ * flow into the L2c/L3b emitters (Wave P); only COP2/FP moves the
+ * emitters decline abort the block via the emitter itself. */
 static int is_bare_ender(const mips_dec_t *d)
 {
     return d->op == MIPS64_OP_COP0 || d->op == MIPS64_OP_JALX;
@@ -406,8 +399,8 @@ static int compile_decline(mips64_ctx_t *ctx, uint64_t pc)
 {
     dbt_entry_t *e = &block_cache[cache_index(pc)];
 
-    (void)ctx;
-
+    if (e->used)
+        ibtc_evict(ctx, e->pc);
     e->used = 1;
     e->pc = pc;
     e->blk.guest_pc = pc;
@@ -457,8 +450,6 @@ int dbt_compile(mips64_ctx_t *ctx, uint64_t pc)
             break;
         d = &insns[n];
         mips_decode(word, d);
-        if (is_fp_coproc(d))
-            return compile_decline(ctx, pc);
         n++;
         cur += 4u;
         if (is_bare_ender(d) || mips_is_trap(d))
@@ -473,8 +464,6 @@ int dbt_compile(mips64_ctx_t *ctx, uint64_t pc)
             }
             s = &insns[n];
             mips_decode(word, s);
-            if (is_fp_coproc(s))
-                return compile_decline(ctx, pc);
             n++;
             cur += 4u;
             break;
@@ -500,6 +489,8 @@ int dbt_compile(mips64_ctx_t *ctx, uint64_t pc)
         if (snap == NULL)
             return 1;
         memcpy(snap, mips64_guest_ptr(ctx, pc), len);
+        if (slot->used)
+            ibtc_evict(ctx, slot->pc);
         dbt_snap_drop(slot);
         slot->used = 1;
         slot->pc = pc;
@@ -535,13 +526,14 @@ int dbt_compile(mips64_ctx_t *ctx, uint64_t pc)
                         mips_aot_note_block(pc, copy, nrows);
                         (void)dbt_aot_visit(pc, copy, nrows, NULL);
                     }
-                    if (out_end > pc) {
-                        mips_vm_pages_mark(pc, out_end - pc,
-                                           (unsigned)MIPS_VM_PAGE_HAS_CODE);
-                    }
                 }
             }
         }
+        /* Wave P: arm the write gate for every published block (not
+         * just memory-bearing ones), BEFORE the entry becomes
+         * visible, and prefill once here instead of per execution. */
+        dbt_arm_code_pages(ctx, pc, out_end);
+        dbt_u0_prefill(ctx, pc, out_end);
         ibtc_insert(ctx, pc, host);
         ctx->blocks_compiled++;
         ctx->wx_transitions++;
@@ -574,6 +566,8 @@ void mips64_dbt_trace(mips64_ctx_t *ctx, uint64_t pc, uint32_t word)
 struct dbt_guarded_enter {
     uint64_t base;
     void *code;
+    uint64_t budget;
+    const _Atomic uint64_t *epoch;
     long ex;
 };
 
@@ -581,7 +575,9 @@ static _Thread_local struct dbt_guarded_enter dbt_ge;
 
 static void dbt_guarded_tramp(mips64_ctx_t *ctx)
 {
-    dbt_ge.ex = mips64_dbt_enter(ctx, dbt_ge.base, dbt_ge.code);
+    dbt_ge.ex =
+        mips64_dbt_enter(ctx, dbt_ge.base, dbt_ge.code, dbt_ge.budget,
+                         dbt_ge.epoch);
 }
 
 static void *dbt_tramp_ptr(void (*fn)(mips64_ctx_t *))
@@ -719,8 +715,10 @@ int dbt_run(mips64_ctx_t *ctx)
             return 1;
         dbt_npc_resume(ctx);
         pc = ctx->pc;
-        code = dbt_lookup(ctx, pc);
-        if (code == NULL) {
+        /* Single probe: the epoch gate retires stale entries without
+         * a snapshot scan, so no second lookup is needed. */
+        e = lookup_entry(ctx, pc);
+        if (e == NULL) {
             if (dbt_compile(ctx, pc) != 0) {
                 rc = interp_step(ctx);
                 if (rc != 0)
@@ -728,8 +726,8 @@ int dbt_run(mips64_ctx_t *ctx)
                 dbt_difftest_step(ctx);
                 continue;
             }
-            code = dbt_lookup(ctx, pc);
-            if (code == NULL) {
+            e = lookup_entry(ctx, pc);
+            if (e == NULL) {
                 rc = interp_step(ctx);
                 if (rc != 0)
                     return rc;
@@ -737,12 +735,16 @@ int dbt_run(mips64_ctx_t *ctx)
                 continue;
             }
         }
-        e = lookup_entry(ctx, pc);
-        if (e == NULL || e->fallback || e->blk.code != code) {
+        if (e->fallback || e->blk.code == NULL) {
+            rc = interp_step(ctx);
+            if (rc != 0)
+                return rc;
+            dbt_difftest_step(ctx);
             continue;
         }
         start = e->blk.guest_pc;
         end = e->blk.guest_end;
+        code = e->blk.code;
         ctx->blocks_executed++;
         if (!mips64_dbt_available()) {
             rc = interp_step(ctx);
@@ -751,9 +753,16 @@ int dbt_run(mips64_ctx_t *ctx)
             dbt_difftest_step(ctx);
             continue;
         }
-        dbt_u0_prefill(ctx, start, end);
         dbt_ge.base = (uint64_t)(uintptr_t)mips_soft_tlb_base(ctx);
         dbt_ge.code = code;
+        /* In-trampoline chaining is exact-lockstep-hostile: one block
+         * per enter under --difftest, single-step, or tracing. The
+         * budget also bounds signal/quiescence latency (preempt
+         * signals are never blocked inside JIT code, so they still
+         * preempt a chaining loop). */
+        dbt_ge.budget = (ctx->difftest_enabled || ctx->trace_enabled) !=
+                0 ? 1u : 4096u;
+        dbt_ge.epoch = &dbt_smc_epoch;
         dbt_ge.ex = MIPS64_DBT_EXIT_FAULT;
         {
             uint32_t reason = (uint32_t)MIPS64_EXIT_NONE;
@@ -787,18 +796,20 @@ int dbt_run(mips64_ctx_t *ctx)
             dbt_difftest_step(ctx);
             continue;
         case MIPS64_DBT_EXIT_FAULT: {
-            dbt_entry_t *te = e;
-            const dbt_mem_site_t *site = NULL;
             uint64_t fpc = ctx->pc;
+            dbt_entry_t *te = (fpc >= start && fpc < end) ? e :
+                              lookup_entry(ctx, fpc);
+            uint64_t bstart = te != NULL ? te->blk.guest_pc : fpc;
+            const dbt_mem_site_t *site = NULL;
             int mrc;
 
             ctx->exit_reason = MIPS64_EXIT_NONE;
             ctx->exit_info = 0u;
             ctx->pad150 = 0u;
-            if (te != NULL && te->sites != NULL && fpc >= start) {
-                site = dbt_find_site(te, fpc - start);
+            if (te != NULL && te->sites != NULL && fpc >= bstart) {
+                site = dbt_find_site(te, fpc - bstart);
             }
-            mrc = dbt_mem_recover(ctx, site, start, fpc);
+            mrc = dbt_mem_recover(ctx, site, bstart, fpc);
             if (mrc == 0) {
                 ctx->exit_reason = MIPS64_EXIT_NONE;
                 ctx->exit_info = 0u;
@@ -821,9 +832,10 @@ int dbt_run(mips64_ctx_t *ctx)
         }
         case MIPS64_DBT_EXIT_TRAP: {
             uint32_t idx = ctx->exit_info;
-            dbt_entry_t *te = e;
-            const dbt_mem_site_t *site = NULL;
             uint64_t fpc = ctx->pc;
+            dbt_entry_t *te = (fpc == start) ? e : lookup_entry(ctx, fpc);
+            uint64_t bstart = te != NULL ? te->blk.guest_pc : fpc;
+            const dbt_mem_site_t *site = NULL;
             int mrc;
 
             ctx->exit_reason = MIPS64_EXIT_NONE;
@@ -831,9 +843,9 @@ int dbt_run(mips64_ctx_t *ctx)
             ctx->pad150 = 0u;
             if (te != NULL && te->sites != NULL && idx < te->site_count) {
                 site = &te->sites[idx];
-                fpc = start + (uint64_t)site->guest_pc_delta;
+                fpc = bstart + (uint64_t)site->guest_pc_delta;
             }
-            mrc = dbt_mem_recover(ctx, site, start, fpc);
+            mrc = dbt_mem_recover(ctx, site, bstart, fpc);
             if (mrc == 0) {
                 ctx->exit_reason = MIPS64_EXIT_NONE;
                 ctx->exit_info = 0u;

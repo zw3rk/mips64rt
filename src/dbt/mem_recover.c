@@ -95,6 +95,29 @@ static int dbt_mem_span(mips64_ctx_t *ctx, const mips_dec_t *d,
     case 0x3Cu: /* SCD */
         size = 8u;
         break;
+    case 0x31u: /* LWC1 (Wave P: lowered in emit_fpmem.c) */
+    case 0x39u: /* SWC1 */
+        size = 4u;
+        break;
+    case 0x35u: /* LDC1 */
+    case 0x3Du: /* SDC1 */
+        size = 8u;
+        break;
+    case 0x13u: /* COP1X indexed FP loads/stores */
+        if (d->funct == 0x00u || d->funct == 0x08u) {
+            size = 4u;
+        } else if (d->funct == 0x01u || d->funct == 0x09u) {
+            size = 8u;
+        } else {
+            return MIPS_FAULT;
+        }
+        is_load = (d->funct == 0x00u || d->funct == 0x01u) ? 1 : 0;
+        *ea = ctx->gpr[d->rs] + ctx->gpr[d->rt];
+        *base = *ea;
+        *len = size;
+        *need = is_load != 0 ? (uint32_t)MIPS_PROT_READ :
+                               (uint32_t)MIPS_PROT_WRITE;
+        return 0;
     default:
         return MIPS_FAULT;
     }
@@ -102,7 +125,7 @@ static int dbt_mem_span(mips64_ctx_t *ctx, const mips_dec_t *d,
         (d->op == 0x28u || d->op == 0x29u || d->op == 0x2Bu ||
          d->op == 0x2Au || d->op == 0x2Eu || d->op == 0x2Cu ||
          d->op == 0x2Du || d->op == 0x38u || d->op == 0x3Cu ||
-         d->op == 0x3Fu) ? 0 : 1;
+         d->op == 0x39u || d->op == 0x3Du || d->op == 0x3Fu) ? 0 : 1;
     *ea = ctx->gpr[d->rs] + (uint64_t)(int64_t)d->simm;
     if (d->op == 0x22u || d->op == 0x26u || d->op == 0x2Au ||
         d->op == 0x2Eu || d->op == 0x1Au || d->op == 0x1Bu ||

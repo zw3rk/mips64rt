@@ -17,6 +17,84 @@
 
 #include "core/cpu.h"
 #include "interp/fp.h"
+#include "interp/interp.h"
+
+static int fp_cop1x_mem(mips64_ctx_t *ctx, const mips_dec_t *d)
+{
+    uint64_t addr = ctx->gpr[d->rs] + ctx->gpr[d->rt];
+    unsigned fd = d->sa & 31u;
+    unsigned fs = d->rd & 31u;
+    int be = mips_is_be(ctx);
+    unsigned i;
+
+    if (d->funct == 0x0Fu) { /* PREFX */
+        return 0;
+    }
+    if (d->funct == 0x05u || d->funct == 0x0Du) { /* LUXC1 / SUXC1 */
+        addr &= ~UINT64_C(7);
+    } else if (d->funct == 0x00u || d->funct == 0x08u) { /* LWXC1 / SWXC1 */
+        if ((addr & 3u) != 0u) {
+            mips_fault(ctx, addr);
+            return MIPS_FAULT;
+        }
+    } else if (d->funct == 0x01u || d->funct == 0x09u) { /* LDXC1 / SDXC1 */
+        if ((addr & 7u) != 0u) {
+            mips_fault(ctx, addr);
+            return MIPS_FAULT;
+        }
+    } else {
+        return MIPS_FAULT;
+    }
+    if (d->funct == 0x00u) { /* LWXC1 */
+        uint32_t w = 0u;
+
+        for (i = 0u; i < 4u; i++) {
+            uint64_t b = 0u;
+
+            if (guest_ld8(ctx, addr + i, &b) != 0)
+                return MIPS_FAULT;
+            w |= (uint32_t)(b & 0xFFu) << (8u * (be ? (3u - i) : i));
+        }
+        ctx->fpr[fd] = (ctx->fpr[fd] & UINT64_C(0xFFFFFFFF00000000)) | w;
+        return 0;
+    }
+    if (d->funct == 0x08u) { /* SWXC1 */
+        uint32_t w = (uint32_t)ctx->fpr[fs];
+
+        for (i = 0u; i < 4u; i++) {
+            unsigned p = be ? (3u - i) : i;
+
+            if (guest_st8(ctx, addr + i, (w >> (8u * p)) & 0xFFu) != 0)
+                return MIPS_FAULT;
+        }
+        return 0;
+    }
+    if (d->funct == 0x01u || d->funct == 0x05u) { /* LDXC1 / LUXC1 */
+        uint64_t v = 0u;
+
+        for (i = 0u; i < 8u; i++) {
+            uint64_t b = 0u;
+
+            if (guest_ld8(ctx, addr + i, &b) != 0)
+                return MIPS_FAULT;
+            v |= (b & 0xFFu) << (8u * (be ? (7u - i) : i));
+        }
+        ctx->fpr[fd] = v;
+        return 0;
+    }
+    { /* SDXC1 / SUXC1 */
+        uint64_t v = ctx->fpr[fs];
+
+        for (i = 0u; i < 8u; i++) {
+            unsigned p = be ? (7u - i) : i;
+
+            if (guest_st8(ctx, addr + i,
+                          (uint32_t)((v >> (8u * p)) & 0xFFu)) != 0)
+                return MIPS_FAULT;
+        }
+        return 0;
+    }
+}
 
 /* One PS lane: op selects ADD/SUB/MUL on raw 32-bit lanes au/bu.
  * Returns the result lane; *exc accumulates FP_EXC_* bits (bit e set
@@ -134,6 +212,14 @@ int fp_cop1x(mips64_ctx_t *ctx, uint64_t cur_pc, const mips_dec_t *d)
         return MIPS_FAULT;
     }
     switch (d->funct) {
+    case 0x00u: /* LWXC1 */
+    case 0x01u: /* LDXC1 */
+    case 0x05u: /* LUXC1 */
+    case 0x08u: /* SWXC1 */
+    case 0x09u: /* SDXC1 */
+    case 0x0Du: /* SUXC1 */
+    case 0x0Fu: /* PREFX */
+        return fp_cop1x_mem(ctx, d);
     case 0x20u: /* MADD.S */
     case 0x28u: /* MSUB.S */
     case 0x30u: /* NMADD.S */

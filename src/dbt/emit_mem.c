@@ -19,11 +19,9 @@
 #include "dbt/emit_int.h"
 #include "dbt/emit_mem.h"
 
-/* Rev4 probe scratch: x4 carries the addend out of the ldp and is
- * dead after the masked compare (entry reuse); x0 is never encoded
- * anywhere in this file (the probe and hit path only name
+/* Probe scratch EI_H (see emit_int.h); x0 is never encoded anywhere
+ * in this file (the probe and hit path only name
  * x4/x20/x21/x22/x24/x25); x18 is rejected by the encoders. */
-#define EI_H 4u
 
 /* ---- Lane U12 live block-site table (thread-local emission) ---- */
 
@@ -118,7 +116,7 @@ void ei_patch26(a64_emit_t *e, size_t slot, size_t tgt)
 /* ---- Memory: aligned fast path, unaligned RMW, LL/SC ---- */
 
 /* A = rs + sign-extended imm. */
-static void ei_mem_addr(a64_emit_t *e, const mips_dec_t *d)
+void ei_mem_addr(a64_emit_t *e, const mips_dec_t *d)
 {
     ei_gld(e, EI_A, d->rs);
     ei_mov64(e, EI_T, (uint64_t)(int64_t)d->simm);
@@ -169,7 +167,7 @@ static uint32_t ei_probe_mask(unsigned width)
  *
  * The caller emits the memory word(s) next, then closes the site
  * (cont offset). Returns the miss slot, or (size_t)-1 on error. */
-static size_t ei_probe_open(a64_emit_t *e, uint64_t pc, const mips_dec_t *d,
+size_t ei_probe_open(a64_emit_t *e, uint64_t pc, const mips_dec_t *d,
                             unsigned width, unsigned flags, unsigned val_reg,
                             int is_store, int slot)
 {
@@ -256,7 +254,7 @@ static size_t ei_probe_open(a64_emit_t *e, uint64_t pc, const mips_dec_t *d,
 /* Update the open site's host_insn_offset to the exact word of the
  * first host memory instruction (past register-only setup such as
  * ei_gld/ei_rev) so signal preemption rewinds the entire prefix. */
-static void ei_probe_mark_insn(a64_emit_t *e)
+void ei_probe_mark_insn(a64_emit_t *e)
 {
     if (e == NULL || !ei_active) {
         return;
@@ -272,7 +270,7 @@ static void ei_probe_mark_insn(a64_emit_t *e)
 /* Close the open site: cont is the first word past the memory
  * word(s), so the signal rewind can bracket [seq_start, host_insn]
  * (side-effect-free) against [host_insn, cont) (precise fault). */
-static void ei_probe_close(a64_emit_t *e)
+void ei_probe_close(a64_emit_t *e)
 {
     if (e == NULL) {
         return;

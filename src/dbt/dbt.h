@@ -38,7 +38,7 @@
 _Static_assert(MIPS64_IBTC_SIZE == 4096U, "IBTC must have 4096 entries");
 
 /* Direct-mapped block-cache entries (lane-internal sizing). */
-#define MIPS64_DBT_CACHE_ENTRIES 1024u
+#define MIPS64_DBT_CACHE_ENTRIES 4096u
 /* Return address stack depth (call/return pairing is advisory: it
  * only skips a cache probe, never changes the resume PC). */
 #define MIPS64_DBT_RAS_ENTRIES 16u
@@ -163,8 +163,24 @@ int dbt_rewind_pc(uint64_t host_pc, uint64_t *seq_out);
  * `x19 = ctx` and `x20 = base`, calls `code`, restores, and returns
  * the `w0` exit code. Implemented in `trampoline_a64.S` on AArch64;
  * a C fallback in `dbt.c` reports `MIPS64_DBT_EXIT_UNDEF` elsewhere
- * so unit builds still link. */
-long mips64_dbt_enter(mips64_ctx_t *ctx, uint64_t base, void *code);
+ * so unit builds still link.
+ *
+ * Wave P in-trampoline chaining: after a DIRECT exit the trampoline
+ * consults the IBTC for `ctx->pc` and enters the next block without
+ * returning to C, up to `budget` chained blocks (1 disables chaining
+ * for --difftest/single-step/tracing). Each chained step re-reads
+ * `*epoch` (the live SMC epoch) and bails to C on a mismatch, so
+ * cross-thread SMC never runs stale code. The epoch arrives by
+ * pointer so the pure-GAS trampoline needs no platform symbol
+ * spelling. */
+long mips64_dbt_enter(mips64_ctx_t *ctx, uint64_t base, void *code,
+                      uint64_t budget, const _Atomic uint64_t *epoch);
+
+/* Bump-allocated W^X code arena (src/dbt/arena.c): carve `len`
+ * 16-byte-aligned bytes out of the thread-local chunk (NULL on
+ * exhaustion); publish one block through the backend JIT hooks. */
+void *dbt_arena_alloc(size_t len);
+void *dbt_code_publish(const uint8_t *buf, size_t len);
 
 /* Run guest code until a syscall `exit`/`exit_group` ends the
  * process (via `_Exit` inside the syscall layer) or a fault stops

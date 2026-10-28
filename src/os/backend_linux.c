@@ -277,6 +277,43 @@ void mips_soft_tlb_invalidate(mips64_ctx_t *ctx)
     }
 }
 
+void mips_soft_tlb_evict_write(mips64_ctx_t *ctx, uint64_t va, uint64_t len)
+{
+    u0_slot_t *s;
+    uint64_t start;
+    uint64_t end;
+    uint64_t vpn;
+
+    if (ctx == NULL || len == 0u) {
+        return;
+    }
+    s = u0_slot_for(ctx, 0);
+    if (s == NULL) {
+        return;
+    }
+    start = va & ~(uint64_t)4095U;
+    end = (va + len + 4095U) & ~(uint64_t)4095U;
+    if (end < start) {
+        return;
+    }
+    /* Only revoke slots that actually map the page: distinct vpns
+     * alias the same direct-mapped slot, so an unconditional clear
+     * would drop a live tag for an unrelated page. */
+    (void)u0_lock();
+    for (vpn = start >> 12; vpn < (end >> 12); vpn++) {
+        mips_soft_tlb_entry_t *e =
+            &s->tlb[vpn & MIPS64_SOFT_TLB_INDEX_MASK];
+
+        if (e->write_tag == (vpn << 12)) {
+            e->write_tag = UINT64_MAX;
+        }
+        if (vpn + 1u < vpn) {
+            break;
+        }
+    }
+    (void)u0_unlock();
+}
+
 void mips_soft_tlb_invalidate_all(void)
 {
     size_t i;

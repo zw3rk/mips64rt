@@ -55,6 +55,10 @@ void a64e_u32(a64_emit_t *e, uint32_t w);
  * here while the delay slot runs (delay emission owns x21..x24). */
 #define EI_S 25u
 #define EI_XZR 31u
+/* Rev4 probe scratch: x4 carries the addend out of the ldp and is
+ * dead after the masked compare (entry reuse); x0 is never encoded
+ * anywhere in the memory emitters; x18 is rejected by the encoders. */
+#define EI_H 4u
 
 /* AArch64 condition codes. */
 #define EI_EQ 0u
@@ -198,6 +202,21 @@ int ei_unaligned(a64_emit_t *e, const mips_dec_t *d, uint64_t pc, int is_load,
                  int slot);
 int ei_atomic(a64_emit_t *e, const mips_dec_t *d, uint64_t pc, int be,
               int slot);
+/* Wave P probe sharing with src/dbt/emit_fpmem.c: address materialize
+ * (A = rs + simm), site open/close around one memory word, and the
+ * mark that rewinds signal preemption past register-only setup. */
+void ei_mem_addr(a64_emit_t *e, const mips_dec_t *d);
+size_t ei_probe_open(a64_emit_t *e, uint64_t pc, const mips_dec_t *d,
+                     unsigned width, unsigned flags, unsigned val_reg,
+                     int is_store, int slot);
+void ei_probe_mark_insn(a64_emit_t *e);
+void ei_probe_close(a64_emit_t *e);
+/* Wave P FPR loads/stores (src/dbt/emit_fpmem.c): LWC1/SWC1/LDC1/SDC1
+ * through the same probe + miss-site path as integer memory. */
+int ei_fp_mem(a64_emit_t *e, const mips_dec_t *d, uint64_t pc, int be,
+              int slot);
+int ei_fp_mem_idx(a64_emit_t *e, const mips_dec_t *d, uint64_t pc, int be,
+                  int slot);
 /* Lane U12 block-site framing: every memory word records one relative
  * site (see dbt/emit_mem.h) between begin and end; end emits the
  * per-site 2-insn stubs plus the single shared miss epilogue (which

@@ -158,6 +158,10 @@ uint8_t *guest_range(mips64_ctx_t *ctx, uint64_t va, uint64_t len, int write)
         return NULL;
     if (write != 0) {
         mips_vm_pages_clear(va, len, (unsigned)MIPS_VM_PAGE_COW_CLEAN);
+        /* Wave P SMC write gate: syscall copyouts retire translated
+         * code they overlap (read/readv/pread/getdents/getrandom and
+         * the signal-frame build all funnel through here). */
+        mips_vm_pages_retire_code(va, len);
         if (g_sync_cnt >= G_SYNC_MAX)
             mips_guest_range_flush(ctx);
         g_sync_va[g_sync_cnt] = va;

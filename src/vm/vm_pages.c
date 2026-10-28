@@ -212,6 +212,61 @@ int mips_vm_page_writable(uint64_t vpn)
     return mips_vm_page_flags(vpn) == 0u;
 }
 
+/* Weak DBT hook (mirrors the mem_table.c pattern): unit builds that
+ * link the page table without the DBT core retire into the void. */
+__attribute__((weak)) void dbt_invalidate_range(uint64_t va, uint64_t len)
+{
+    (void)va;
+    (void)len;
+}
+
+int mips_vm_pages_any_set(uint64_t va, uint64_t len, unsigned flags)
+{
+    uint64_t start;
+    uint64_t end;
+    uint64_t vpn;
+    int found = 0;
+
+    if (len == 0u || flags == 0u) {
+        return 0;
+    }
+    start = va & ~(uint64_t)4095U;
+    end = (va + len + 4095U) & ~(uint64_t)4095U;
+    if (end <= start) {
+        /* Wrapped or degenerate span: retire conservatively. */
+        return 1;
+    }
+    (void)vm_page_lock();
+    if (vm_page_overflow != 0) {
+        found = 1;
+    } else {
+        for (vpn = start >> 12; vpn < (end >> 12); vpn++) {
+            vm_page_slot_t *s = vm_page_find_locked(vpn, 0);
+
+            if (s != NULL && (s->flags & flags) != 0u) {
+                found = 1;
+                break;
+            }
+            if (vpn + 1u < vpn) {
+                break;
+            }
+        }
+    }
+    (void)vm_page_unlock();
+    return found;
+}
+
+void mips_vm_pages_retire_code(uint64_t va, uint64_t len)
+{
+    if (len == 0u) {
+        return;
+    }
+    if (mips_vm_pages_any_set(va, len,
+                              (unsigned)MIPS_VM_PAGE_HAS_CODE) != 0) {
+        dbt_invalidate_range(va, len);
+    }
+}
+
 static vm_page_slot_t vm_page_saved[VM_PAGES_SLOTS];
 static int vm_page_overflow_saved;
 

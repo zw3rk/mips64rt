@@ -49,6 +49,10 @@ __attribute__((weak)) void mips_vm_file_shared_sync(mips64_ctx_t *ctx,
 static void mem_note_guest_write(mips64_ctx_t *ctx, uint64_t va, uint64_t len)
 {
     mips_vm_pages_clear(va, len, (unsigned)MIPS_VM_PAGE_COW_CLEAN);
+    /* Wave P SMC write gate: every interpreter/frame store retires
+     * translated code it overlaps, so epoch-gated DBT hits never run
+     * stale bytes (the no-code fast path is one locked page scan). */
+    mips_vm_pages_retire_code(va, len);
     mips_vm_file_shared_sync(ctx, va, len);
 }
 

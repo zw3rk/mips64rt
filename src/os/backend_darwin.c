@@ -280,6 +280,43 @@ void mips_soft_tlb_invalidate(mips64_ctx_t *ctx)
     }
 }
 
+void mips_soft_tlb_evict_write(mips64_ctx_t *ctx, uint64_t va, uint64_t len)
+{
+    u0_slot_t *s;
+    uint64_t start;
+    uint64_t end;
+    uint64_t vpn;
+
+    if (ctx == NULL || len == 0u) {
+        return;
+    }
+    s = u0_slot_for(ctx, 0);
+    if (s == NULL) {
+        return;
+    }
+    start = va & ~(uint64_t)4095U;
+    end = (va + len + 4095U) & ~(uint64_t)4095U;
+    if (end < start) {
+        return;
+    }
+    /* Only revoke slots that actually map the page: distinct vpns
+     * alias the same direct-mapped slot, so an unconditional clear
+     * would drop a live tag for an unrelated page. */
+    (void)u0_lock();
+    for (vpn = start >> 12; vpn < (end >> 12); vpn++) {
+        mips_soft_tlb_entry_t *e =
+            &s->tlb[vpn & MIPS64_SOFT_TLB_INDEX_MASK];
+
+        if (e->write_tag == (vpn << 12)) {
+            e->write_tag = UINT64_MAX;
+        }
+        if (vpn + 1u < vpn) {
+            break;
+        }
+    }
+    (void)u0_unlock();
+}
+
 void mips_soft_tlb_invalidate_all(void)
 {
     size_t i;
@@ -308,7 +345,6 @@ size_t mips_host_page_size(void)
 static _Thread_local sigjmp_buf jit_probe_jb;
 static _Thread_local volatile sig_atomic_t jit_probe_armed = 0;
 static pthread_mutex_t jit_probe_mu = PTHREAD_MUTEX_INITIALIZER;
-static pthread_once_t jit_probe_once = PTHREAD_ONCE_INIT;
 static int jit_probe_mode = 0; /* 0 unknown, 1 MAP_JIT, 2 flip */
 
 static void jit_probe_handler(int sig)
@@ -321,28 +357,25 @@ static void jit_probe_handler(int sig)
     (void)raise(sig);
 }
 
-static void jit_probe_install(void)
-{
-    struct sigaction sa;
-
-    (void)memset(&sa, 0, sizeof sa);
-    sa.sa_handler = jit_probe_handler;
-    sa.sa_flags = SA_RESTART;
-    (void)sigemptyset(&sa.sa_mask);
-    (void)sigaction(SIGBUS, &sa, NULL);
-    (void)sigaction(SIGSEGV, &sa, NULL);
-}
-
 static int jit_probe_map_jit(void)
 {
+    struct sigaction sa;
+    struct sigaction old_bus;
+    struct sigaction old_segv;
     void *p;
     int ok = 0;
 
-    p = mmap(NULL, 16384, PROT_READ | PROT_EXEC,
+    p = mmap(NULL, 16384, PROT_READ | PROT_WRITE | PROT_EXEC,
              MAP_PRIVATE | MAP_ANONYMOUS | MAP_JIT, -1, 0);
     if (p == MAP_FAILED) {
         return 0;
     }
+    (void)memset(&sa, 0, sizeof sa);
+    sa.sa_handler = jit_probe_handler;
+    sa.sa_flags = SA_RESTART;
+    (void)sigemptyset(&sa.sa_mask);
+    (void)sigaction(SIGBUS, &sa, &old_bus);
+    (void)sigaction(SIGSEGV, &sa, &old_segv);
     /* pthread_jit_write_protect_np(0) disables write protection (makes
      * MAP_JIT pages writable); (1) enables write protection (seals RX). */
     (void)pthread_jit_write_protect_np(0);
@@ -353,6 +386,8 @@ static int jit_probe_map_jit(void)
     }
     jit_probe_armed = 0;
     (void)pthread_jit_write_protect_np(1);
+    (void)sigaction(SIGBUS, &old_bus, NULL);
+    (void)sigaction(SIGSEGV, &old_segv, NULL);
     (void)munmap(p, 16384);
     return ok;
 }
@@ -361,7 +396,6 @@ static int jit_use_map_jit(void)
 {
     int mode;
 
-    (void)pthread_once(&jit_probe_once, jit_probe_install);
     (void)pthread_mutex_lock(&jit_probe_mu);
     if (jit_probe_mode == 0) {
         jit_probe_mode = jit_probe_map_jit() != 0 ? 1 : 2;
@@ -383,9 +417,9 @@ void *mips_jit_alloc(size_t size)
     if (jit_use_map_jit()) {
         /* MAP_JIT from birth: the pages can only ever execute via
          * the write-protect toggle, never via mprotect (which
-         * would break them). PROT_EXEC is set at map time;
+         * would break them). RWX is set at map time;
          * writability comes from pthread_jit_write_protect_np. */
-        p = mmap(NULL, n, PROT_READ | PROT_EXEC,
+        p = mmap(NULL, n, PROT_READ | PROT_WRITE | PROT_EXEC,
                  MAP_PRIVATE | MAP_ANONYMOUS | MAP_JIT, -1, 0);
         return p == MAP_FAILED ? NULL : p;
     }

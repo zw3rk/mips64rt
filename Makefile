@@ -77,11 +77,13 @@ BOOT_COMMON := src/main.c \
 	src/vm/vm_pages.c \
 	src/dbt/a64_emit.c \
 	src/dbt/dbt.c \
+	src/dbt/arena.c \
 	src/dbt/mem_recover.c \
 	src/dbt/emit_int.c \
 	src/dbt/emit_enc.c \
 	src/dbt/emit_alu.c \
 	src/dbt/emit_mem.c \
+	src/dbt/emit_fpmem.c \
 	src/dbt/emit_fp.c \
 	src/dbt/trampoline_a64.S \
 	src/loader.c
@@ -131,8 +133,10 @@ U0_SRCS := tests/test_u0_delay_tlb.c \
 	src/dbt/emit_enc.c \
 	src/dbt/emit_alu.c \
 	src/dbt/emit_mem.c \
+	src/dbt/emit_fpmem.c \
 	src/dbt/emit_int.c \
 	src/dbt/emit_fp.c \
+	src/dbt/arena.c \
 	src/dbt/dbt.c \
 	src/dbt/mem_recover.c \
 	src/dbt/trampoline_a64.S

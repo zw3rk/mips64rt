@@ -35,6 +35,9 @@
 /* Lane L3b FP entry point (src/dbt/emit_fp.c): 0 emitted, nonzero for
  * unknown words (dispatcher falls back to interp_step). */
 int ef_emit_fp(a64_emit_t *e, const mips_dec_t *d, uint64_t pc, int slot);
+/* Wave P COP1X FMA entry point (src/dbt/emit_fp.c): 0 emitted,
+ * nonzero for indexed words/unknown functs (UNDEF exit or decline). */
+int ef_emit_cop1x(a64_emit_t *e, const mips_dec_t *d, uint64_t pc, int slot);
 
 /* ---- Guest state access ($0 reads as XZR, writes are dropped) ---- */
 
@@ -463,6 +466,22 @@ static int ei_one(a64_emit_t *e, const mips_dec_t *d, uint64_t pc, int be,
     case 0x11u: /* COP1 (lane L3b): arithmetic/CVT/compare via emit_fp.c */
         r = ef_emit_fp(e, d, pc, slot);
         break;
+    case 0x13u: /* COP1X (Wave P): indexed FP mem via emit_fpmem.c,
+                 * MADD/MSUB/NMADD/NMSUB via emit_fp.c; others UNDEF. */
+        r = ei_fp_mem_idx(e, d, pc, be, slot);
+        if (r != 0)
+            r = ef_emit_cop1x(e, d, pc, slot);
+        if (r != 0 && slot == 0) {
+            ei_exit_undef(e, pc);
+            r = 2;
+        }
+        break;
+    case 0x31u: /* LWC1 */
+    case 0x35u: /* LDC1 */
+    case 0x39u: /* SWC1 */
+    case 0x3Du: /* SDC1 */
+        r = ei_fp_mem(e, d, pc, be, slot);
+        break;
     case 0x1Au: /* LDL */
         r = ei_unaligned(e, d, pc, 1, 1, be, be != 0 ? 0 : 3, 0, 56u,
                          slot);
@@ -521,8 +540,9 @@ static int ei_one(a64_emit_t *e, const mips_dec_t *d, uint64_t pc, int be,
     case 0x33u: /* PREF */
         r = 0;
         break;
-    default: /* COP1X/COP2/JALX/FP memory/unknown: EXIT_UNDEF
-                * (COP1 has its own case above and never reaches here). */
+    default: /* COP2/COP0X/JALX/LWC2/etc/unknown: EXIT_UNDEF
+                * (COP1/COP1X/FP memory have their own cases above and
+                * never reach here). */
         if (slot == 0) {
             ei_exit_undef(e, pc);
             r = 2;

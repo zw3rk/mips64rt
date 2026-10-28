@@ -226,29 +226,38 @@ static void ef_spill(a64_emit_t *e, int is_d, unsigned fp, unsigned fd)
 
 /* ---- Runtime guards (all exit via EXIT_UNDEF at pc on the slow path) ---- */
 
-/* Mode guard: FCSR RM != RN (bits 1:0) or FS (bit 24) set. Covers every
- * value-affecting mode bit for arithmetic and RM-sensitive CVT. Uses
- * EI_A/EI_C, dead across words. */
+/* Fast-path FCSR mask (Wave P): FS (bit 24), Enables (bits 11:7) and
+ * RM (bits 1:0). Sticky exception flags (bits 6:2) are deliberately
+ * NOT in the mask: including them would permanently disable the fast
+ * path after the first inexact operation. Any set Enable bit exits
+ * because the inline sequence never raises a guest trap. */
+#define EF_FCSR_FAST_MASK 0x01000F83u
+
+/* Mode guard: FCSR RM != RN (bits 1:0), any exception enable (bits
+ * 11:7), or flush-subnormals (FS) set. Covers every value-affecting
+ * mode bit for arithmetic and RM-sensitive CVT. Uses EI_A/EI_C, dead
+ * across words. */
 static void ef_mode_guard(a64_emit_t *e, uint64_t pc)
 {
     size_t skip;
 
     ei_ldr(e, 1, EI_A, EI_CTX, MIPS64_CTX_FCSR_OFFSET);
-    ei_mov32(e, EI_C, 0x01000003u);
+    ei_mov32(e, EI_C, EF_FCSR_FAST_MASK);
     ei_and(e, 1, EI_A, EI_A, EI_C);
     skip = ei_cbz(e, 1, 0, EI_A);
     ei_exit_undef(e, pc);
     ei_patch(e, skip, 0);
 }
 
-/* FS-only guard for fixed-rounding conversions (FRINT modes are
- * RM-independent, but a subnormal input still depends on guest FS). */
+/* Guard for fixed-rounding conversions (FRINT modes are
+ * RM-independent, but a subnormal input still depends on guest FS
+ * and any enabled exception still expects a guest trap). */
 static void ef_fs_guard(a64_emit_t *e, uint64_t pc)
 {
     size_t skip;
 
     ei_ldr(e, 1, EI_A, EI_CTX, MIPS64_CTX_FCSR_OFFSET);
-    ei_mov32(e, EI_C, 0x01000000u);
+    ei_mov32(e, EI_C, EF_FCSR_FAST_MASK);
     ei_and(e, 1, EI_A, EI_A, EI_C);
     skip = ei_cbz(e, 1, 0, EI_A);
     ei_exit_undef(e, pc);
@@ -280,7 +289,7 @@ static void ef_roundtrip_guard(a64_emit_t *e, int is_d, int is_l,
     ef_scvtf(e, is_l, is_d, is_d != 0 ? EF_D3 : EF_S3, EI_B);
     ef_fcmp(e, is_d, is_d != 0 ? EF_D3 : EF_S3, fp);
     ei_cset(e, EI_C, EI_EQ);
-    skip = ei_cbz(e, 1, 0, EI_C);
+    skip = ei_cbz(e, 1, 1, EI_C);
     ei_exit_undef(e, pc);
     ei_patch(e, skip, 0);
 }
@@ -340,6 +349,16 @@ static int ef_arith(a64_emit_t *e, const mips_dec_t *d, uint64_t pc, int slot,
     ef_fill(e, is_d, s0, fs);
     ef_fill(e, is_d, s1, ft);
     ef_mode_guard(e, pc);
+    if (d->funct == 0x03u) {
+        size_t nz;
+
+        ef_fmov_bit(e, is_d, 0, is_d != 0 ? EF_D3 : EF_S3, EI_XZR);
+        ef_fcmp(e, is_d, s1, is_d != 0 ? EF_D3 : EF_S3);
+        ei_cset(e, EI_B, EI_EQ);
+        nz = ei_cbz(e, 1, 0, EI_B);
+        ei_exit_undef(e, pc);
+        ei_patch(e, nz, 0);
+    }
     ef_f2(e, base, s2, s0, s1);
     ef_nan_guard(e, s2, is_d, pc);
     ef_spill(e, is_d, s2, fd);
@@ -396,12 +415,13 @@ static void ef_round_op(a64_emit_t *e, int is_d, unsigned mode, uint64_t pc)
 {
     unsigned s0 = is_d != 0 ? EF_D0 : EF_S0;
     unsigned s2 = is_d != 0 ? EF_D2 : EF_S2;
-    unsigned s3 = is_d != 0 ? EF_D3 : EF_S3;
     uint32_t base = 0u;
 
     (void)pc;
+    (void)ef_fhalf;
     switch (mode) {
     case 0:
+    case 4:
         base = is_d != 0 ? EF_FRINTN_D : EF_FRINTN_S;
         break;
     case 1:
@@ -416,35 +436,7 @@ static void ef_round_op(a64_emit_t *e, int is_d, unsigned mode, uint64_t pc)
     default:
         break;
     }
-    if (mode != 4) {
-        ef_f1(e, base, s2, s0);
-        return;
-    }
-    /* Ties away from zero: r = copysign(floor(|x| + 0.5), x). Exact for
-     * all finite x; NaN/Inf flow through to the NaN/round-trip audits. */
-    ef_f1(e, is_d != 0 ? EF_FABS_D : EF_FABS_S, s2, s0);
-    ef_fhalf(e, is_d, s3);
-    ef_f2(e, is_d != 0 ? EF_FADD_D : EF_FADD_S, s2, s2, s3);
-    ef_f1(e, is_d != 0 ? EF_FRINTM_D : EF_FRINTM_S, s2, s2);
-    if (is_d != 0) {
-        ei_mov64(e, EI_C, 0x7FFFFFFFFFFFFFFFu);
-        ef_fmov_bit(e, 1, 1, EI_B, s2);
-        ei_and(e, 0, EI_B, EI_B, EI_C);
-        ei_mov64(e, EI_C, 0x8000000000000000u);
-        ef_fmov_bit(e, 1, 1, EI_A, s0);
-        ei_and(e, 0, EI_A, EI_A, EI_C);
-        ei_orr(e, 0, EI_B, EI_B, EI_A);
-        ef_fmov_bit(e, 1, 0, s2, EI_B);
-    } else {
-        ei_mov32(e, EI_C, 0x7FFFFFFFu);
-        ef_fmov_bit(e, 0, 1, EI_B, s2);
-        ei_and(e, 1, EI_B, EI_B, EI_C);
-        ei_mov32(e, EI_C, 0x80000000u);
-        ef_fmov_bit(e, 0, 1, EI_A, s0);
-        ei_and(e, 1, EI_A, EI_A, EI_C);
-        ei_orr(e, 1, EI_B, EI_B, EI_A);
-        ef_fmov_bit(e, 0, 0, s2, EI_B);
-    }
+    ef_f1(e, base, s2, s0);
 }
 
 static int ef_cvt_to_int(a64_emit_t *e, const mips_dec_t *d, uint64_t pc,
@@ -466,7 +458,7 @@ static int ef_cvt_to_int(a64_emit_t *e, const mips_dec_t *d, uint64_t pc,
     }
     ef_round_op(e, is_d, (int)mode, pc);
     ef_fcvtsz(e, is_l, is_d, EI_B, s2);
-    ef_roundtrip_guard(e, is_d, is_l, s2, pc);
+    ef_roundtrip_guard(e, is_d, is_l, mode == 0u ? s0 : s2, pc);
     if (is_l != 0) {
         ei_str(e, 0, EI_B, EI_CTX, EF_OFF_FPR(fd));
     } else {
@@ -697,6 +689,27 @@ int ef_emit_fp(a64_emit_t *e, const mips_dec_t *d, uint64_t pc, int slot)
          * ei_branch (extended for the FCSR condition source). */
         return 1;
     }
+    if ((d->sa == 0u && d->funct == 0u) &&
+        (d->rs == 0x00u || d->rs == 0x01u || d->rs == 0x04u ||
+         d->rs == 0x05u)) {
+        unsigned rt = d->rt & 31u;
+        unsigned fs = d->rd & 31u;
+
+        if (d->rs == 0x00u) { /* MFC1 */
+            ei_ldrsw(e, EI_A, EI_CTX, EF_OFF_FPR(fs));
+            ei_gst(e, EI_A, rt);
+        } else if (d->rs == 0x01u) { /* DMFC1 */
+            ei_ldr(e, 0, EI_A, EI_CTX, EF_OFF_FPR(fs));
+            ei_gst(e, EI_A, rt);
+        } else if (d->rs == 0x04u) { /* MTC1 */
+            ei_gld(e, EI_A, rt);
+            ei_str(e, 1, EI_A, EI_CTX, EF_OFF_FPR(fs));
+        } else { /* DMTC1 */
+            ei_gld(e, EI_A, rt);
+            ei_str(e, 0, EI_A, EI_CTX, EF_OFF_FPR(fs));
+        }
+        return 0;
+    }
     if (d->rs == 0x10u) {
         return ef_fmt_sd(e, d, pc, slot, 0);
     }
@@ -714,4 +727,121 @@ int ef_emit_fp(a64_emit_t *e, const mips_dec_t *d, uint64_t pc, int slot)
         return 1;
     }
     return 1;
+}
+
+/* ---- COP1X fused multiply-add (Wave P, lane P4) ----
+ *
+ * MIPS64r2 COP1X (op 0x13) MADD/MSUB/NMADD/NMSUB (.S/.D) lower to the
+ * single-rounding host FMA family, matching the interp oracle
+ * (src/interp/fp_ps.c uses fmaf/fma, likewise single-rounding):
+ *   MADD.S/D   fd = fr + fs*ft   FMADD  fd, fs, ft, fr
+ *   MSUB.S/D   fd = fs*ft - fr   FNMSUB fd, fs, ft, fr
+ *   NMADD.S/D  fd = -(fr + fs*ft) FNMADD fd, fs, ft, fr
+ *   NMSUB.S/D  fd = fr - fs*ft   FMSUB  fd, fs, ft, fr
+ * Field layout (decode.c): fr = rs, ft = rt, fs = rd, fd = sa.
+ *
+ * Exactness policy (same as ef_arith): the FCSR fast-path guard exits
+ * when RM != RN, any enable is set, or FS is set; any NaN result
+ * (propagated inputs, 0*Inf, SNaN) exits so interp owns default-NaN
+ * canonicalization and Invalid flags. Sticky Inexact/Overflow flags
+ * are deferred per the RC3 adjudication, exactly like S/D arithmetic.
+ * Indexed COP1X memory words (LWXC1/LDXC1/SWXC1/SDXC1/PREFX) fault in
+ * the interp oracle, so they return 1 here and the dispatcher replays
+ * them (fault-identical). Guarded words never emit in delay slots. */
+
+/* Assembler-verified FMA bases (Rd=0,Rn=0,Rm=0,Ra=0 probed with
+ * aarch64 clang; o1 = bit 21, o0 = bit 15, type = bit 22):
+ * FMADD = (0,0), FMSUB = (0,1), FNMADD = (1,0), FNMSUB = (1,1). */
+#define EF_FMADD_S 0x1F000000u
+#define EF_FMSUB_S 0x1F008000u
+#define EF_FNMADD_S 0x1F200000u
+#define EF_FNMSUB_S 0x1F208000u
+#define EF_FMADD_D 0x1F400000u
+#define EF_FMSUB_D 0x1F408000u
+#define EF_FNMADD_D 0x1F600000u
+#define EF_FNMSUB_D 0x1F608000u
+
+/* Four-source FMA: word = base | Rm<<16 | Ra<<10 | Rn<<5 | Rd. */
+static void ef_fma(a64_emit_t *e, uint32_t base, unsigned rd, unsigned rn,
+                   unsigned rm, unsigned ra)
+{
+    if (ra > 4u) {
+        if (e != NULL) {
+            e->err = 1;
+        }
+        return;
+    }
+    ef_put(e, base | ((rm & 31u) << 16) | ((ra & 31u) << 10) |
+               ((rn & 31u) << 5) | (rd & 31u),
+           rd, rn, rm, EI_XZR, EI_XZR);
+}
+
+/* Entry point for op 0x13 (called from the COP1X case in
+ * src/dbt/emit_int.c): 0 emitted, nonzero for the dispatcher to fall
+ * back (indexed words, unknown functs, guarded words in slots). */
+int ef_emit_cop1x(a64_emit_t *e, const mips_dec_t *d, uint64_t pc, int slot)
+{
+    unsigned fr = d->rs & 31u;
+    unsigned ft = d->rt & 31u;
+    unsigned fs = d->rd & 31u;
+    unsigned fd = d->sa & 31u;
+    uint32_t base = 0u;
+    int is_d = 0;
+
+    if (e == NULL || d == NULL || e->err != 0) {
+        return 1;
+    }
+    if (d->op != 0x13u) {
+        return 1;
+    }
+    if (slot != 0) {
+        return 1;
+    }
+    switch (d->funct) {
+    case 0x20u: /* MADD.S */
+        base = EF_FMADD_S;
+        break;
+    case 0x28u: /* MSUB.S */
+        base = EF_FNMSUB_S;
+        break;
+    case 0x30u: /* NMADD.S */
+        base = EF_FNMADD_S;
+        break;
+    case 0x38u: /* NMSUB.S */
+        base = EF_FMSUB_S;
+        break;
+    case 0x21u: /* MADD.D */
+        base = EF_FMADD_D;
+        is_d = 1;
+        break;
+    case 0x29u: /* MSUB.D */
+        base = EF_FNMSUB_D;
+        is_d = 1;
+        break;
+    case 0x31u: /* NMADD.D */
+        base = EF_FNMADD_D;
+        is_d = 1;
+        break;
+    case 0x39u: /* NMSUB.D */
+        base = EF_FMSUB_D;
+        is_d = 1;
+        break;
+    default: /* Indexed memory words and PREFX fault in interp. */
+        return 1;
+    }
+    ef_fill(e, is_d, is_d != 0 ? EF_D0 : EF_S0, fr);
+    ef_fill(e, is_d, is_d != 0 ? EF_D1 : EF_S1, fs);
+    ef_fill(e, is_d, is_d != 0 ? EF_D2 : EF_S2, ft);
+    ef_mode_guard(e, pc);
+    /* rd = fd, rn = fs, rm = ft, ra = fr. */
+    if (is_d != 0) {
+        ef_fma(e, base, EF_D3, EF_D1, EF_D2, EF_D0);
+        ef_nan_guard(e, EF_D3, 1, pc);
+        ef_spill(e, 1, EF_D3, fd);
+    } else {
+        ef_fma(e, base, EF_S3, EF_S1, EF_S2, EF_S0);
+        ef_nan_guard(e, EF_S3, 0, pc);
+        ef_spill(e, 0, EF_S3, fd);
+    }
+    return 0;
 }

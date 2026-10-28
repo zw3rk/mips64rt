@@ -312,6 +312,8 @@ int64_t mips_sc_read(mips64_ctx_t *ctx, uint64_t fd, uint64_t buf,
     if (n > 0) {
         mips_vm_pages_clear(buf, (uint64_t)n,
                             (unsigned)MIPS_VM_PAGE_COW_CLEAN);
+        /* Wave P SMC write gate (this path bypasses guest_range). */
+        mips_vm_pages_retire_code(buf, (uint64_t)n);
         mips_vm_file_shared_sync(ctx, buf, (uint64_t)n);
     }
     return l2a_ret(ctx, (int64_t)n);

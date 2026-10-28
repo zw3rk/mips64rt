@@ -55,6 +55,7 @@
 #include "os/syscall_nr.h"
 #include "os/quiesce.h"
 #include "os/signal_core.h"
+#include "vm/vm_pages.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -637,6 +638,8 @@ int64_t mips_sc_waitid(mips64_ctx_t *ctx, uint64_t which, uint64_t pid,
                 uint8_t *p =
                     (uint8_t *)mips64_guest_ptr(ctx, infop_va);
                 memset(p, 0, 128);
+                /* Wave P SMC write gate (bypasses guest_st). */
+                mips_vm_pages_retire_code(infop_va, 128U);
             }
         }
         return exec_ret(ctx, 0);
@@ -678,6 +681,8 @@ int64_t mips_sc_waitid(mips64_ctx_t *ctx, uint64_t which, uint64_t pid,
             uint8_t *p = (uint8_t *)mips64_guest_ptr(ctx, infop_va);
             memset(p + base_off + 12U, 0,
                    (size_t)(128U - base_off - 12U));
+            /* Wave P SMC write gate (bypasses guest_st). */
+            mips_vm_pages_retire_code(infop_va, 128U);
         }
     }
     return exec_ret(ctx, 0);

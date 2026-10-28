@@ -175,6 +175,16 @@ void mips_soft_tlb_fill(mips64_ctx_t *ctx, uint64_t va);
  * a no-op. */
 void mips_soft_tlb_invalidate(mips64_ctx_t *ctx);
 
+/* Revoke the writable Soft-TLB tag for every page in [va, va+len)
+ * (Wave P code-page write gate): after translated code is published
+ * for a guest range, future stores to those pages must take the slow
+ * miss path so SMC retires the translation first. Only the calling
+ * ctx's slot is touched (each thread owns its slot); entries that do
+ * not currently map the page are left alone. NULL ctx or a zero
+ * length is a no-op. */
+void mips_soft_tlb_evict_write(mips64_ctx_t *ctx, uint64_t va,
+                               uint64_t len);
+
 /* Invalidate every entry of every live slot (quiescence step 5). */
 void mips_soft_tlb_invalidate_all(void);
 
