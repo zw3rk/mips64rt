@@ -134,39 +134,7 @@ static void ef_fhalf(a64_emit_t *e, int is_d, unsigned rd)
     ef_put(e, base | (rd & 31u), rd, 0u, 0u, EI_XZR, EI_XZR);
 }
 
-/* SIMD&FP LDR/STR (unsigned offset): S scales by 4, D by 8. */
-static void ef_ldst(a64_emit_t *e, int is_load, int is_d, unsigned rt,
-                    unsigned rn, uint32_t off)
-{
-    uint32_t base;
-    uint32_t div;
-
-    if (!ef_ok_fp(rt) || !ef_ok_r(rn)) {
-        if (e != NULL) {
-            e->err = 1;
-        }
-        return;
-    }
-    /* Assembler-verified bases (probe: ldr s0 = 0xBD416260,
-     * str s1 = 0xBD016A61, ldr d2 = 0xFD413262, str d3 = 0xFD017E63):
-     * bit 26 selects SIMD&FP lanes (integer STR uses 0xB9000000 /
-     * 0xF9000000 and must never appear here). */
-    if (is_d != 0) {
-        base = is_load != 0 ? 0xFD400000u : 0xFD000000u;
-        div = 8u;
-    } else {
-        base = is_load != 0 ? 0xBD400000u : 0xBD000000u;
-        div = 4u;
-    }
-    if ((off % div) != 0u || (off / div) >= 4096u) {
-        if (e != NULL) {
-            e->err = 1;
-        }
-        return;
-    }
-    ef_put(e, base | ((off / div) << 10) | ((rn & 31u) << 5) | (rt & 31u),
-           rt, 0u, 0u, rn, EI_XZR);
-}
+/* SIMD&FP LDR/STR lives in src/dbt/emit_fpmem.c (Wave P13 cache). */
 
 /* FCVTZS Wd/Xd, Sn/Dn (toward zero; saturates, NaN -> 0). */
 static void ef_fcvtsz(a64_emit_t *e, int is_x, int is_d, unsigned rd,
@@ -215,19 +183,8 @@ static void ef_fmov_bit(a64_emit_t *e, int is_d, int to_gpr, unsigned rd,
     a64e_u32(e, base | ((rn & 31u) << 5) | (rd & 31u));
 }
 
-/* ---- FPR lane spill/fill (FR=1 64-bit lanes; S = low 32 bits) ---- */
-
-static void ef_fill(a64_emit_t *e, int is_d, unsigned fp, unsigned fs)
-{
-    ef_ldst(e, 1, is_d, fp, EI_CTX, EF_OFF_FPR(fs & 31u));
-}
-
-static void ef_spill(a64_emit_t *e, int is_d, unsigned fp, unsigned fd)
-{
-    ef_ldst(e, 0, is_d, fp, EI_CTX, EF_OFF_FPR(fd & 31u));
-}
-
-/* ---- Runtime guards (all exit via EXIT_UNDEF at pc on the slow path) ---- */
+/* FPR lane spill/fill lives in src/dbt/emit_fpmem.c (Wave P13 d8..d15
+ * write-through cache); guards below exit via EXIT_UNDEF at pc. */
 
 /* Fast-path FCSR mask (Wave P): FS (bit 24), Enables (bits 11:7) and
  * RM (bits 1:0). Sticky exception flags (bits 6:2) are deliberately
@@ -461,9 +418,13 @@ static int ef_cvt_to_int(a64_emit_t *e, const mips_dec_t *d, uint64_t pc,
     ef_roundtrip_guard(e, is_d, is_l, mode == 0u ? s0 : s2, gpc);
     if (is_l != 0) {
         ei_str(e, 0, EI_B, EI_CTX, EF_OFF_FPR(fd));
+        /* Wave P13: full-lane integer result writes through. */
+        ef_cache_write_d(e, fd, EI_B);
     } else {
         /* Word result: low 32 bits written, upper lane preserved. */
         ei_str(e, 1, EI_B, EI_CTX, EF_OFF_FPR(fd));
+        /* Wave P13: low-half write invalidates the cached lane. */
+        ef_fpr_invalidate(e, fd);
     }
     return 0;
 }
@@ -477,10 +438,15 @@ static int ef_cvt_from_int(a64_emit_t *e, const mips_dec_t *d, uint64_t pc,
     unsigned fd = d->sa & 31u;
     uint64_t gpc = slot != 0 ? (pc - 4u) : pc;
 
+    /* Wave P13: cached lanes feed the integer source without a load. */
     if (is_l != 0) {
-        ei_ldr(e, 0, EI_B, EI_CTX, EF_OFF_FPR(fs));
+        if (ef_cache_read_d(e, fs, EI_B) == 0) {
+            ei_ldr(e, 0, EI_B, EI_CTX, EF_OFF_FPR(fs));
+        }
     } else {
-        ei_ldr(e, 1, EI_B, EI_CTX, EF_OFF_FPR(fs));
+        if (ef_cache_read_s(e, fs, EI_B) == 0) {
+            ei_ldr(e, 1, EI_B, EI_CTX, EF_OFF_FPR(fs));
+        }
     }
     ef_mode_guard(e, gpc);
     if (to_d != 0) {
@@ -513,6 +479,8 @@ static int ef_movbit(a64_emit_t *e, const mips_dec_t *d, uint64_t pc, int is_d)
             return 1;
         }
         ei_str(e, 0, EI_A, EI_CTX, EF_OFF_FPR(fd));
+        /* Wave P13: full-lane producer writes through to d(8+slot). */
+        ef_cache_write_d(e, fd, EI_A);
     } else {
         /* Word lane: low 32 bits only, upper 32 preserved. */
         ei_ldr(e, 1, EI_A, EI_CTX, EF_OFF_FPR(fs));
@@ -526,6 +494,8 @@ static int ef_movbit(a64_emit_t *e, const mips_dec_t *d, uint64_t pc, int is_d)
             return 1;
         }
         ei_str(e, 1, EI_A, EI_CTX, EF_OFF_FPR(fd));
+        /* Wave P13: low-half write invalidates the cached lane. */
+        ef_fpr_invalidate(e, fd);
     }
     return 0;
 }
@@ -700,9 +670,13 @@ int ef_emit_fp(a64_emit_t *e, const mips_dec_t *d, uint64_t pc, int slot)
         } else if (d->rs == 0x04u) { /* MTC1 */
             ei_gld(e, EI_A, rt);
             ei_str(e, 1, EI_A, EI_CTX, EF_OFF_FPR(fs));
+            /* Wave P13: raw low-half bits invalidate the cached lane. */
+            ef_fpr_invalidate(e, fs);
         } else { /* DMTC1 */
             ei_gld(e, EI_A, rt);
             ei_str(e, 0, EI_A, EI_CTX, EF_OFF_FPR(fs));
+            /* Wave P13: raw full-lane bits invalidate the cached lane. */
+            ef_fpr_invalidate(e, fs);
         }
         return 0;
     }

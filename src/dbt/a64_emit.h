@@ -34,6 +34,17 @@ typedef struct {
     int err;
     uint8_t gpr_cache_valid;
     uint8_t gpr_cache_reg[8];
+    /* Wave P13: 8-slot write-through scalar FPR cache in the
+     * AAPCS64 callee-saved d8..d15 (slot s holds guest fpr
+     * fpr_slot_reg[s]; fpr_is_d tracks 64-bit .D (1) vs 32-bit .S
+     * (0) occupancy). Write-through, so ctx->fpr[] stays exact on
+     * faults, traps, and block exits; the trampoline saves and
+     * restores d8..d15 across mips64_dbt_enter. Integer emission
+     * never touches d8..d15, and every FP cache write drops the
+     * aliased GPR slot (d(8+s) shares x(8+s) with x9..x15). */
+    uint8_t fpr_valid;
+    uint8_t fpr_is_d;
+    uint8_t fpr_slot_reg[8];
 } a64_emit_t;
 
 /* Bounds-checked append of one raw A64 word. */

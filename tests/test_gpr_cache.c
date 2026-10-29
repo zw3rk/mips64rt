@@ -213,6 +213,12 @@ static void test_init_zeroes(void)
     for (i = 0u; i < 8u; i++) {
         CHECK(e.gpr_cache_reg[i] == 0u);
     }
+    /* Wave P13 FPR cache starts empty too. */
+    CHECK(e.fpr_valid == 0u);
+    CHECK(e.fpr_is_d == 0u);
+    for (i = 0u; i < 8u; i++) {
+        CHECK(e.fpr_slot_reg[i] == 0u);
+    }
 }
 
 static void test_hit(void)

@@ -46,6 +46,16 @@ int ef_emit_cop1x(a64_emit_t *e, const mips_dec_t *d, uint64_t pc, int slot);
  * x18). Write-through, so `ctx->r[]` stays exact for faults, traps,
  * and block exits. The caller invalidates (`gpr_cache_valid = 0`)
  * wherever emitted control flow diverges and merges. */
+/* Wave P13: writing x(9+g) destroys the FP cache reg d(g+9) (same
+ * physical register), so every integer write into x9..x16 drops the
+ * aliased FP slot. */
+static void ei_fpr_clobber(a64_emit_t *e, unsigned xreg)
+{
+    if (e != NULL && xreg >= 9u && xreg <= 15u) {
+        e->fpr_valid &= (uint8_t)(~(1u << (xreg - 8u)));
+    }
+}
+
 void ei_gld(a64_emit_t *e, unsigned tmp, unsigned r)
 {
     unsigned slot;
@@ -64,6 +74,7 @@ void ei_gld(a64_emit_t *e, unsigned tmp, unsigned r)
             if (tmp >= 9u && tmp <= 16u) {
                 e->gpr_cache_valid &= (uint8_t)(~(1u << (tmp - 9u)));
             }
+            ei_fpr_clobber(e, tmp);
         }
         return;
     }
@@ -76,9 +87,13 @@ void ei_gld(a64_emit_t *e, unsigned tmp, unsigned r)
         }
         e->gpr_cache_valid |= (uint8_t)(1u << slot);
         e->gpr_cache_reg[slot] = (uint8_t)r;
+        /* The x(9+slot) fill destroys aliased d(slot+9). */
+        ei_fpr_clobber(e, creg);
     }
     if (tmp != creg) {
         ei_mov(e, tmp, creg);
+        /* The scratch copy destroys aliased d(tmp) when tmp < 16. */
+        ei_fpr_clobber(e, tmp);
     }
 }
 
@@ -95,6 +110,8 @@ void ei_gst(a64_emit_t *e, unsigned tmp, unsigned r)
     ei_str(e, 0, tmp, EI_CTX, EI_OFF_GPR(r));
     if (tmp != creg) {
         ei_mov(e, creg, tmp);
+        /* The x(9+slot) copy destroys aliased d(slot+9). */
+        ei_fpr_clobber(e, creg);
     }
     if (e != NULL) {
         e->gpr_cache_valid |= (uint8_t)(1u << slot);
@@ -487,6 +504,7 @@ static int ei_branch(a64_emit_t *e, const mips_dec_t *d, const mips_dec_t *s,
          * cached fills that never execute on the taken path. */
         if (e != NULL) {
             e->gpr_cache_valid = 0;
+            e->fpr_valid = 0;
         }
         ei_mem_branch_note(pc, (unsigned)RT_NPC_STATIC_TARGET,
                            (int32_t)(tgt - pc));

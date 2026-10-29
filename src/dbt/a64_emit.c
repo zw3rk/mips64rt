@@ -39,6 +39,13 @@ void a64e_init(a64_emit_t *e, uint32_t *buf, size_t cap)
     for (i = 0u; i < 8u; i++) {
         e->gpr_cache_reg[i] = 0u;
     }
+    /* Fresh block: the Wave P13 FPR cache starts empty (a64e_init zeroes
+     * fpr_valid); each ei_branch slot copy re-invalidates. */
+    e->fpr_valid = 0u;
+    e->fpr_is_d = 0u;
+    for (i = 0u; i < 8u; i++) {
+        e->fpr_slot_reg[i] = 0u;
+    }
 }
 
 /* Register gate: `x18`, `x29`, `x30` are never scratch-encodable.

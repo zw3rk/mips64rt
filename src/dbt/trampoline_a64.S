@@ -55,6 +55,13 @@ mips64_dbt_enter:
     stp x23, x24, [sp, #-16]!
     stp x25, x26, [sp, #-16]!
     stp x27, x28, [sp, #-16]!
+    /* Wave P13: the 8-slot FPR cache lives in callee-saved d8..d15,
+     * which compiled blocks freely clobber; save them across the
+     * whole enter so the host's own FP state survives. */
+    stp d8, d9, [sp, #-16]!
+    stp d10, d11, [sp, #-16]!
+    stp d12, d13, [sp, #-16]!
+    stp d14, d15, [sp, #-16]!
     /* Pin the guest context and U0 soft-TLB base; stash the chaining
      * state in callee-saved regs (compiled blocks never touch
      * x26-x28, so they survive across `blr` with no stack traffic):
@@ -97,6 +104,10 @@ mips64_dbt_enter:
     b .Lchain_enter
 .Lchain_done:
     /* w0 still carries the final exit code; restore and return it. */
+    ldp d14, d15, [sp], #16
+    ldp d12, d13, [sp], #16
+    ldp d10, d11, [sp], #16
+    ldp d8, d9, [sp], #16
     ldp x27, x28, [sp], #16
     ldp x25, x26, [sp], #16
     ldp x23, x24, [sp], #16

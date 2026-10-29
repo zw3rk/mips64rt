@@ -32,7 +32,8 @@
 
 #ifndef MIPS64RT_HAVE_A64_EMIT_H
 /* Frozen cross-lane shape (must match src/dbt/a64_emit.h). Owned by L2b.
- * The trailing GPR cache pins guest `r` in host `x(9 + (r & 7))`. */
+ * The trailing GPR cache pins guest `r` in host `x(9 + (r & 7))`; the
+ * Wave P13 FPR cache pins guest `fpr` in callee-saved `d(8 + (f & 7))`. */
 typedef struct {
     uint32_t *buf;
     size_t cap;
@@ -40,6 +41,9 @@ typedef struct {
     int err;
     uint8_t gpr_cache_valid;
     uint8_t gpr_cache_reg[8];
+    uint8_t fpr_valid;
+    uint8_t fpr_is_d;
+    uint8_t fpr_slot_reg[8];
 } a64_emit_t;
 
 /* Bounds-checked append; sets e->err on overflow. Owned by L2b. */
@@ -220,6 +224,15 @@ int ei_fp_mem(a64_emit_t *e, const mips_dec_t *d, uint64_t pc, int be,
               int slot);
 int ei_fp_mem_idx(a64_emit_t *e, const mips_dec_t *d, uint64_t pc, int be,
                   int slot);
+/* Wave P13 8-slot write-through scalar FPR cache in d8..d15
+ * (src/dbt/emit_fpmem.c): lane spill/fill routed through the cache,
+ * integer-side read/write/invalidate for lane-bit producers. */
+void ef_fill(a64_emit_t *e, int is_d, unsigned fp, unsigned fs);
+void ef_spill(a64_emit_t *e, int is_d, unsigned fp, unsigned fd);
+void ef_fpr_invalidate(a64_emit_t *e, unsigned fs);
+int ef_cache_read_d(a64_emit_t *e, unsigned fs, unsigned xd);
+int ef_cache_read_s(a64_emit_t *e, unsigned fs, unsigned wd);
+void ef_cache_write_d(a64_emit_t *e, unsigned fs, unsigned xn);
 /* Lane U12 block-site framing: every memory word records one relative
  * site (see dbt/emit_mem.h) between begin and end; end emits the
  * per-site 2-insn stubs plus the single shared miss epilogue (which

@@ -163,10 +163,15 @@ GATE_SRCS := tests/test_u0_gate.c \
 GPR_SRCS := tests/test_gpr_cache.c \
 	$(filter-out tests/test_u0_delay_tlb.c,$(U0_SRCS))
 
+# Wave P13: focused FPR-cache regression gate (host-native; same TU as
+# the GPR gate with the driver swapped, so it links the real emitter).
+FPR_SRCS := tests/test_fpr_cache.c \
+	$(filter-out tests/test_u0_delay_tlb.c,$(U0_SRCS))
+
 # Lane U12: host-native sibling of `build` for macOS/Apple Silicon.
 # Same TU list, host C compiler, PIE without `-static-pie` (the macOS
 # linker rejects it). AArch64-only (the trampoline is A64 assembly).
-build-darwin: $(BUILD)/mips64rt-darwin $(BUILD)/test_u0_delay_tlb $(BUILD)/test_u0_fill_retry $(BUILD)/test_u0_gate $(BUILD)/test_gpr_cache
+build-darwin: $(BUILD)/mips64rt-darwin $(BUILD)/test_u0_delay_tlb $(BUILD)/test_u0_fill_retry $(BUILD)/test_u0_gate $(BUILD)/test_gpr_cache $(BUILD)/test_fpr_cache
 
 $(BUILD)/mips64rt-darwin: $(DARWIN_SRCS) src/core/cpu.h src/os/syscall_nr.h src/os/host_compat.h src/dbt/emit_mem.h
 	@mkdir -p $(BUILD)
@@ -188,6 +193,11 @@ $(BUILD)/test_gpr_cache: $(GPR_SRCS) src/core/cpu.h src/os/backend.h src/vm/vm64
 	@mkdir -p $(BUILD)
 	$(HOST_CC) -std=c11 -Werror=vla -pedantic -Wall -Wextra -Werror -pthread $(INCLUDES) $(GPR_SRCS) -o $@
 	$(BUILD)/test_gpr_cache
+
+$(BUILD)/test_fpr_cache: $(FPR_SRCS) src/core/cpu.h src/os/backend.h src/vm/vm64.h src/vm/vm_file.h src/dbt/dbt.h
+	@mkdir -p $(BUILD)
+	$(HOST_CC) -std=c11 -Werror=vla -pedantic -Wall -Wextra -Werror -pthread $(INCLUDES) $(FPR_SRCS) -o $@
+	$(BUILD)/test_fpr_cache
 
 check: build check-line-limits
 	@$(CC) $(CFLAGS) $(INCLUDES) -fsyntax-only src/core/cpu.h src/os/syscall_nr.h
