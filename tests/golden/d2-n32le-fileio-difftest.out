@@ -1,0 +1,5 @@
+mips64rt: difftest clean (N I-lines compared)
+D2-FILEIO alpha
+D2-FILEIO beta
+D2-FILEIO gamma
+D2-FILEIO ok 3 lines

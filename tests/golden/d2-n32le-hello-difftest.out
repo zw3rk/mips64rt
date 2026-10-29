@@ -1,0 +1,2 @@
+mips64rt: difftest clean (N I-lines compared)
+D2-HELLO hello from static libc

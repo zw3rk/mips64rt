@@ -1,0 +1,5 @@
+mips64rt: difftest clean (N I-lines compared)
+D2-PRINTF [dec=-42 uns=42 hex=deadbeef HEX=DEADBEEF oct=777] n=48
+D2-PRINTF str=[hello] ch=[Q] pct=[%]
+D2-PRINTF ll=[-123456789012345] llu=[123456789012345]
+D2-PRINTF width=[      42][42      ][00000042] prec=[abc][   07]

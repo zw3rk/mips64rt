@@ -1,0 +1,4 @@
+mips64rt: difftest clean (N I-lines compared)
+D2-QSORT ints: -100 -3 -3 0 4 5 8 17 17 42
+D2-QSORT words: apple apple banana fig pear
+D2-QSORT bsearch=17

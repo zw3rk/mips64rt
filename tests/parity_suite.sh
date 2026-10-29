@@ -1,138 +1,384 @@
 #!/bin/sh
-# tests/parity_suite.sh — Lane U12 interp-vs-dbt parity gate.
+# tests/parity_suite.sh — mips64rt cross-engine parity gate.
 #
 # Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
 # SPDX-License-Identifier: Apache-2.0
 #
-# What it does, end to end:
-#   1. Host section (always runs, no Docker): structural proof that
-#      `src/rt64/` is gone, plus the host-portable unit gates —
-#      `tests/test_mem_sites` (24-byte site records, bump table,
-#      serialization, 2-insn stub words), `tests/check_host_contract`
-#      (the fixed host-cc command from its header), and the
-#      `check-abi-invariants` / `test_decode` recipes from `make check`.
-#   2. Docker section (one bounded `--platform linux/arm64`
-#      container; SKIP when Docker is unusable): rebuild the N64LE
-#      `test_p1_isa` guest, capture the `qemu-mips64el` golden, run the
-#      host cross-built `_build/mips64rt` under `--interp` and `--dbt`,
-#      and byte-compare all three. Prints `P-RESULT: PASS` iff every
-#      executed check passes (SKIP never passes, FAIL always fails).
+# Two tiers, one script (environment-selected):
 #
-# Exit status: 0 iff zero FAIL (SKIP allowed, counted separately).
+#   smoke (default): `sh tests/parity_suite.sh`
+#     Hermetic, <30s, no Docker, no network, no qemu. Runs on Darwin and
+#     Linux with identical goldens:
+#       T0 host unit checks: test_mem_sites, check_host_contract,
+#          check_abi_invariants, test_decode, test_u0_fill_retry,
+#          test_u0_gate.
+#       T1 static guests: test_p1_isa and test_p3_fp_simd for all 4 ABI
+#          variants (n64le, n64be, n32le, n32be) under --interp and --dbt,
+#          compared byte-for-bit against tests/golden/ (guest argv[0] is
+#          always absolute: the static glibc startup aborts on a relative
+#          AT_EXECFN path).
+#       T2 --difftest legs: hello, printf, qsort, and fileio fixtures
+#          for all 4 ABI variants with MIPS64RT_RANDSEED=1 (fixed
+#          AT_RANDOM so the two lockstep engines agree), compared
+#          against tests/golden/.
+#       T3 bench smoke: ../rt-series/_build/bench/bench-mips64el --smoke
+#          under --interp and --dbt with us=/ops_sec= timings normalized.
+#     Guest legs run in parallel background jobs (at most MAXJOBS at a
+#     time; rows are still emitted in fixed order from the parent, so
+#     output is deterministic). Every row is PASS or the suite fails
+#     closed (never SKIP, never GAP in smoke; a missing
+#     translator/guest/golden is a GAP row and fails the gate via
+#     parity_summary).
+#
+#   qualify: `PARITY_TIER=qualify sh tests/parity_suite.sh`
+#     (alias PARITY_DOCKER=1). Runs the smoke tiers above, then one
+#     bounded `--platform linux/arm64` container rebuilds every guest
+#     from source, captures the live qemu-mips64el/qemu-mips64/
+#     qemu-mipsn32el/qemu-mipsn32 oracles, and checks interp == dbt ==
+#     oracle (plus --difftest, dynamic P5, and BusyBox). Inner exit 0 =
+#     full oracle parity, 2 = documented oracle GAP (engines agree,
+#     oracle differs), anything else = FAIL.
+#
+# Golden regeneration (review the diff before committing):
+#   PARITY_UPDATE_GOLDEN=1 sh tests/parity_suite.sh
+# regenerates tests/golden/ from the current engines.
+#
+# Coverage notes (grounded, not worked around):
+#   P1 guest self-verdict is FAIL (11 unaligned LWL/LWR/SWL/SWR/LDL/SDL
+#   canonical-pair checks; exit 1): both engines agree byte-for-bit, so
+#   the rows pin engine parity, not oracle truth. Oracle truth is the
+#   qualify tier's job.
+#   P4 (threads/signals), P6, H1, H4, dynamic P5, and BusyBox have no
+#   committed Darwin-runnable guests (P4 SIGBUS-faults under the Darwin
+#   translator on all 4 ABIs) and are qualify-tier-only.
+#   d2-malloc is qualify-tier-only: each --difftest leg takes 20-30s
+#   (brk-heavy soak under lockstep), which alone exceeds the smoke
+#   budget; the qualify container runs it under --difftest on all 4
+#   ABIs.
+#
+# Environment:
+#   TRANSLATOR  translator binary (default _build/mips64rt-darwin on
+#               Darwin, _build/mips64rt elsewhere).
+#   BENCH_BIN   bench guest (default
+#               ../rt-series/_build/bench/bench-mips64el).
+#   PARITY_TIER smoke|qualify (default smoke; contract default).
+#   PARITY_DOCKER=1  alias for the qualify Docker leg.
+#   PARITY_UPDATE_GOLDEN=1  refresh tests/golden/ from current engines.
 set -u
-cd "$(dirname "$0")/.." || exit 1
 
-pass=0
-fail=0
-skip=0
-gapn=0
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+CONTRACT="$ROOT/../rt-series/tools/parity_contract.sh"
+if [ ! -f "$CONTRACT" ]; then
+    echo "parity_suite: missing frozen contract $CONTRACT" >&2
+    exit 1
+fi
+# shellcheck disable=SC1090
+. "$CONTRACT"
+parity_init "mips64rt"
 
-ok() { pass=$((pass + 1)); echo "P-PASS: $1"; }
-bad() { fail=$((fail + 1)); echo "P-FAIL: $1"; }
-skipped() { skip=$((skip + 1)); echo "P-SKIP: $1"; }
-gap() { gapn=$((gapn + 1)); echo "P-GAP: $1"; }
-
+HOST_OS="$(uname -s | tr 'A-Z' 'a-z')"
+HOST_M="$(uname -m)"
+HOST_TAG="${HOST_OS}-${HOST_M}"
+GOLDEN_DIR="$ROOT/tests/golden"
+GUEST_DIR="$ROOT/tests/guests"
+OUT_DIR="${OUTDIR:-/tmp/mips64rt-parity}"
+mkdir -p "$OUT_DIR"
 CC_HOST="${HOST_CC:-cc}"
 
-# U0: src/os/mem.c calls mips_fixade_enabled/mips_bus_fault, defined in
-# exactly one OS backend TU. Mirror the Makefile backend selection: the
-# backend follows the compiler target triple, never the build host.
-if "${CC_HOST:-cc}" -dumpmachine 2>/dev/null | grep -q darwin; then
-    OS_BACKEND="src/os/backend_darwin.c"
+if [ -n "${TRANSLATOR:-}" ]; then
+    RT="$TRANSLATOR"
+elif [ "$HOST_OS" = "darwin" ]; then
+    RT="$ROOT/_build/mips64rt-darwin"
 else
-    OS_BACKEND="src/os/backend_linux.c"
+    RT="$ROOT/_build/mips64rt"
+fi
+BENCH_BIN="${BENCH_BIN:-$ROOT/../rt-series/_build/bench/bench-mips64el}"
+
+if [ ! -x "$RT" ]; then
+    parity_row "host" "$HOST_TAG" "translator-present" "host" "GAP" 0 "no executable $RT (run make build / build-darwin)"
+    parity_summary
+    exit $?
 fi
 
-# --- 1. Host section -------------------------------------------------
-if [ -d src/rt64 ]; then
-    bad "src/rt64 still present"
-else
-    ok "src/rt64 absent"
-fi
+# --- T0: host unit checks (always run, no Docker) --------------------
+case "$HOST_OS" in
+    darwin) OS_BACKEND="src/os/backend_darwin.c" ;;
+    *) OS_BACKEND="src/os/backend_linux.c" ;;
+esac
+cd "$ROOT" || exit 1
 
-mkdir -p _build
-if ( [ -x _build/test_mem_sites ] || "$CC_HOST" -std=c11 -Werror=vla -pedantic -Wall -Wextra -Werror \
-    -pthread -Isrc tests/test_mem_sites.c src/dbt/emit_mem.c \
-    src/dbt/aot/sites.c \
-    src/dbt/emit_enc.c src/dbt/a64_emit.c src/dbt/emit_int.c \
-    src/dbt/emit_alu.c src/dbt/emit_fp.c src/interp/decode.c \
-    src/os/mem.c src/os/mem_table.c src/vm/vm_pages.c "$OS_BACKEND" tests/stubs_signal.c \
-    -o _build/test_mem_sites ) && _build/test_mem_sites >/dev/null; then
-    ok "test_mem_sites (24B relative rows + AOT file round-trip)"
-else
-    bad "test_mem_sites"
-fi
-
-if ( [ -x _build/check_host_contract ] || "$CC_HOST" -std=c11 -Werror=vla -pedantic -Wall -Wextra -Werror \
-    -pthread -Isrc -o _build/check_host_contract \
-    tests/check_host_contract.c "$OS_BACKEND" src/vm/vm_pages.c ) \
-    && _build/check_host_contract >/dev/null; then
-    ok "check_host_contract"
-else
-    bad "check_host_contract"
-fi
-
-if ( [ -x _build/check_abi_invariants ] || "$CC_HOST" -std=c11 -Werror=vla -pedantic -Wall -Wextra -Werror \
-    -Isrc tests/check_abi_invariants.c \
-    -o _build/check_abi_invariants ) && _build/check_abi_invariants >/dev/null; then
-    ok "check_abi_invariants"
-else
-    bad "check_abi_invariants"
-fi
-
-if ( [ -x _build/test_decode ] || "$CC_HOST" -std=c11 -Werror=vla -pedantic -Wall -Wextra -Werror \
-    -pthread -Isrc tests/test_decode.c src/interp/decode.c src/os/mem.c \
-    src/os/mem_table.c src/vm/vm_pages.c "$OS_BACKEND" tests/stubs_signal.c -o _build/test_decode ) \
-    && _build/test_decode >/dev/null; then
-    ok "test_decode"
-else
-    bad "test_decode"
-fi
-
-if ( [ -x _build/test_u0_fill_retry ] && [ -x _build/test_u0_gate ] || make build-darwin >/dev/null 2>&1 ) && _build/test_u0_fill_retry >/dev/null; then
-    ok "test_u0_fill_retry (cold-page fill-and-retry)"
-else
-    bad "test_u0_fill_retry (cold-page fill-and-retry)"
-fi
-
-if _build/test_u0_gate >/dev/null; then
-    ok "test_u0_gate (write gate + Provider A)"
-else
-    bad "test_u0_gate (write gate + Provider A)"
-fi
-
-# --- 2. Docker section (bounded, guarded) ----------------------------
-if docker image inspect mips64rt-parity-env:trixie >/dev/null 2>&1; then
-    IMG="mips64rt-parity-env:trixie"
-else
-    IMG="debian:trixie-slim"
-fi
-NAME="mips64rt-parity-$$"
-
-cleanup() {
-    docker rm -f "$NAME" >/dev/null 2>&1 || true
+run_unit() {
+    # run_unit <case> <cmd...>
+    _ru_case="$1"; shift
+    _t0=$(parity_now_ms)
+    if "$@" >"$OUT_DIR/u-$_ru_case.log" 2>&1; then
+        _st="PASS"; _det="exit 0"
+    else
+        _st="FAIL"; _det="exit $?"
+    fi
+    parity_row "host" "$HOST_TAG" "$_ru_case" "host" "$_st" "$(( $(parity_now_ms) - _t0 ))" "$_det"
 }
-trap cleanup EXIT INT TERM
 
-# Container exit codes: 0 full oracle parity, 2 documented GAP
-# (engines agree, oracle differs), anything else FAIL. Infrastructure
-# failures (no daemon, no image) never reach the container and SKIP.
-#
-# Known GAP (covering reason, pre-existing, not a U12 regression):
-# `pageend-offset`: qemu-mips64el reports 4, both engines report 8.
-# The P1 page-end probe faults one guest instruction later under the
-# translator (fault-address reporting on the delay-slot path); interp
-# and dbt agree byte-for-byte, so engine parity holds while the oracle
-# diverges. Re-check this reason whenever the fault path is touched.
-if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
-    skipped "docker unavailable: oracle parity not executed"
-elif [ ! -x _build/mips64rt ] && ! make build >/dev/null 2>&1; then
-    skipped "cross-build failed: oracle parity not executed"
+if [ -x _build/test_mem_sites ] || "$CC_HOST" -std=c11 -Werror=vla -pedantic -Wall -Wextra -Werror \
+    -pthread -Isrc tests/test_mem_sites.c src/dbt/emit_mem.c src/dbt/aot/sites.c \
+    src/dbt/emit_enc.c src/dbt/a64_emit.c src/dbt/emit_int.c src/dbt/emit_alu.c \
+    src/dbt/emit_fp.c src/interp/decode.c src/os/mem.c src/os/mem_table.c \
+    src/vm/vm_pages.c "$OS_BACKEND" tests/stubs_signal.c \
+    -o _build/test_mem_sites >/dev/null 2>&1; then
+    run_unit "test_mem_sites" ./_build/test_mem_sites
 else
+    _t0=$(parity_now_ms)
+    parity_row "host" "$HOST_TAG" "test_mem_sites" "host" "FAIL" "$(( $(parity_now_ms) - _t0 ))" "build failed"
+fi
+
+if [ -x _build/check_host_contract ] || "$CC_HOST" -std=c11 -Werror=vla -pedantic -Wall -Wextra -Werror \
+    -pthread -Isrc -o _build/check_host_contract \
+    tests/check_host_contract.c "$OS_BACKEND" src/vm/vm_pages.c >/dev/null 2>&1; then
+    run_unit "check_host_contract" ./_build/check_host_contract
+else
+    _t0=$(parity_now_ms)
+    parity_row "host" "$HOST_TAG" "check_host_contract" "host" "FAIL" "$(( $(parity_now_ms) - _t0 ))" "build failed"
+fi
+
+if [ -x _build/check_abi_invariants ] || "$CC_HOST" -std=c11 -Werror=vla -pedantic -Wall -Wextra -Werror \
+    -Isrc tests/check_abi_invariants.c \
+    -o _build/check_abi_invariants >/dev/null 2>&1; then
+    run_unit "check_abi_invariants" ./_build/check_abi_invariants
+else
+    _t0=$(parity_now_ms)
+    parity_row "host" "$HOST_TAG" "check_abi_invariants" "host" "FAIL" "$(( $(parity_now_ms) - _t0 ))" "build failed"
+fi
+
+if [ -x _build/test_decode ] || "$CC_HOST" -std=c11 -Werror=vla -pedantic -Wall -Wextra -Werror \
+    -pthread -Isrc tests/test_decode.c src/interp/decode.c src/os/mem.c \
+    src/os/mem_table.c src/vm/vm_pages.c "$OS_BACKEND" tests/stubs_signal.c \
+    -o _build/test_decode >/dev/null 2>&1; then
+    run_unit "test_decode" ./_build/test_decode
+else
+    _t0=$(parity_now_ms)
+    parity_row "host" "$HOST_TAG" "test_decode" "host" "FAIL" "$(( $(parity_now_ms) - _t0 ))" "build failed"
+fi
+
+if [ -x _build/test_u0_fill_retry ] && [ -x _build/test_u0_gate ]; then
+    run_unit "test_u0_fill_retry" ./_build/test_u0_fill_retry
+    run_unit "test_u0_gate" ./_build/test_u0_gate
+elif [ "$HOST_OS" = "darwin" ] && make build-darwin >/dev/null 2>&1 \
+    && [ -x _build/test_u0_fill_retry ] && [ -x _build/test_u0_gate ]; then
+    run_unit "test_u0_fill_retry" ./_build/test_u0_fill_retry
+    run_unit "test_u0_gate" ./_build/test_u0_gate
+else
+    _t0=$(parity_now_ms)
+    parity_row "host" "$HOST_TAG" "test_u0_fill_retry" "host" "FAIL" "$(( $(parity_now_ms) - _t0 ))" "binary missing and build-darwin failed"
+    _t0=$(parity_now_ms)
+    parity_row "host" "$HOST_TAG" "test_u0_gate" "host" "FAIL" "$(( $(parity_now_ms) - _t0 ))" "binary missing and build-darwin failed"
+fi
+
+# --- parallel smoke lanes (one background job per ABI) ---------------
+# do_stdout/do_difftest execute the engine and record raw output, exit
+# code, and timing into $OUT_DIR/job-<tag>.*; emit_* runs in the parent
+# afterwards and turns those records into contract rows in fixed order.
+do_stdout() {
+    # do_stdout <tag> <guest> <engine>
+    _d_tag="$1"; _d_guest="$2"; _d_eng="$3"
+    _t0=$(parity_now_ms)
+    "$RT" "--$_d_eng" "$_d_guest" >"$OUT_DIR/job-$_d_tag.raw" 2>&1
+    printf '%s\n' "$?" >"$OUT_DIR/job-$_d_tag.rc"
+    printf '%s %s\n' "$_t0" "$(parity_now_ms)" >"$OUT_DIR/job-$_d_tag.ms"
+}
+
+do_difftest() {
+    # do_difftest <tag> <guest> [stdin-file]
+    _d_tag="$1"; _d_guest="$2"
+    _t0=$(parity_now_ms)
+    if [ $# -ge 3 ]; then
+        MIPS64RT_RANDSEED=1 "$RT" --difftest "$_d_guest" <"$3" >"$OUT_DIR/job-$_d_tag.raw" 2>&1
+    else
+        MIPS64RT_RANDSEED=1 "$RT" --difftest "$_d_guest" >"$OUT_DIR/job-$_d_tag.raw" 2>&1
+    fi
+    printf '%s\n' "$?" >"$OUT_DIR/job-$_d_tag.rc"
+    printf '%s %s\n' "$_t0" "$(parity_now_ms)" >"$OUT_DIR/job-$_d_tag.ms"
+}
+
+job_ms() {
+    # job_ms <tag>: elapsed ms recorded by the background job.
+    if [ -f "$OUT_DIR/job-$1.ms" ]; then
+        # shellcheck disable=SC2086
+        set -- $(cat "$OUT_DIR/job-$1.ms")
+        echo "$(($2 - $1))"
+    else
+        echo "0"
+    fi
+}
+
+job_rc() {
+    if [ -f "$OUT_DIR/job-$1.rc" ]; then
+        cat "$OUT_DIR/job-$1.rc"
+    else
+        echo "127"
+    fi
+}
+
+# emit_stdout <abi> <case> <engine> <norm:0|1>
+emit_stdout() {
+    _abi="$1"; _case="$2"; _eng="$3"; _norm="$4"
+    _tag="$_case-$_eng"
+    if [ "$_case" = "bench-smoke" ]; then
+        _guest="$BENCH_BIN"
+    else
+        _guest="$GUEST_DIR/$_case"
+    fi
+    if [ ! -f "$_guest" ] && [ ! -x "$_guest" ]; then
+        parity_row "$_abi" "$HOST_TAG" "$_tag" "$_eng" "GAP" 0 "missing guest $_guest"
+        return
+    fi
+    if [ ! -f "$OUT_DIR/job-$_tag.raw" ]; then
+        parity_row "$_abi" "$HOST_TAG" "$_tag" "$_eng" "FAIL" 0 "background job produced no output"
+        return
+    fi
+    if [ "$_norm" = "1" ]; then
+        sed -E 's/(us|ops_sec)=[0-9]+/\1=N/g; s/[0-9][0-9]* I-lines/N I-lines/' \
+            "$OUT_DIR/job-$_tag.raw" >"$OUT_DIR/$_tag.out"
+    else
+        cp "$OUT_DIR/job-$_tag.raw" "$OUT_DIR/$_tag.out"
+    fi
+    _rc=$(job_rc "$_tag")
+    _ms=$(job_ms "$_tag")
+    if [ "$PARITY_UPDATE_GOLDEN" = "1" ]; then
+        mkdir -p "$GOLDEN_DIR"
+        cp "$OUT_DIR/$_tag.out" "$GOLDEN_DIR/$_case.out"
+        printf '%s\n' "$_rc" >"$GOLDEN_DIR/$_case.exit"
+        parity_row "$_abi" "$HOST_TAG" "$_tag" "$_eng" "PASS" "$_ms" "exit $_rc, golden recorded"
+        return
+    fi
+    if [ ! -f "$GOLDEN_DIR/$_case.out" ]; then
+        parity_row "$_abi" "$HOST_TAG" "$_tag" "$_eng" "GAP" "$_ms" "missing golden tests/golden/$_case.out"
+        return
+    fi
+    if [ -f "$GOLDEN_DIR/$_case.exit" ]; then
+        _exprc="$(cat "$GOLDEN_DIR/$_case.exit")"
+    else
+        _exprc="$_rc"
+    fi
+    if [ "$_rc" != "$_exprc" ]; then
+        parity_row "$_abi" "$HOST_TAG" "$_tag" "$_eng" "FAIL" "$_ms" "exit $_rc, golden wants $_exprc"
+    elif parity_check_golden "$GOLDEN_DIR/$_case.out" "$OUT_DIR/$_tag.out"; then
+        parity_row "$_abi" "$HOST_TAG" "$_tag" "$_eng" "PASS" "$_ms" "exit $_rc, matches golden"
+    else
+        parity_row "$_abi" "$HOST_TAG" "$_tag" "$_eng" "FAIL" "$_ms" "exit $_rc, output differs from golden"
+    fi
+}
+
+# emit_difftest <abi> <case>
+emit_difftest() {
+    _abi="$1"; _case="$2"
+    _tag="$_case-difftest"
+    if [ ! -f "$GUEST_DIR/$D2_SUB/$_case" ]; then
+        parity_row "$_abi" "$HOST_TAG" "$_tag" "difftest" "GAP" 0 "missing guest $GUEST_DIR/$D2_SUB/$_case"
+        return
+    fi
+    if [ ! -f "$OUT_DIR/job-$_tag.raw" ]; then
+        parity_row "$_abi" "$HOST_TAG" "$_tag" "difftest" "FAIL" 0 "background job produced no output"
+        return
+    fi
+    sed -E 's/[0-9][0-9]* I-lines/N I-lines/' \
+        "$OUT_DIR/job-$_tag.raw" >"$OUT_DIR/$_tag.out"
+    _rc=$(job_rc "$_tag")
+    _ms=$(job_ms "$_tag")
+    if [ "$PARITY_UPDATE_GOLDEN" = "1" ]; then
+        mkdir -p "$GOLDEN_DIR"
+        cp "$OUT_DIR/$_tag.out" "$GOLDEN_DIR/$_tag.out"
+        printf '%s\n' "$_rc" >"$GOLDEN_DIR/$_tag.exit"
+        parity_row "$_abi" "$HOST_TAG" "$_tag" "difftest" "PASS" "$_ms" "exit $_rc, golden recorded"
+        return
+    fi
+    if [ ! -f "$GOLDEN_DIR/$_tag.out" ]; then
+        parity_row "$_abi" "$HOST_TAG" "$_tag" "difftest" "GAP" "$_ms" "missing golden tests/golden/$_tag.out"
+        return
+    fi
+    if [ -f "$GOLDEN_DIR/$_tag.exit" ]; then
+        _exprc="$(cat "$GOLDEN_DIR/$_tag.exit")"
+    else
+        _exprc="$_rc"
+    fi
+    if [ "$_rc" != "$_exprc" ]; then
+        parity_row "$_abi" "$HOST_TAG" "$_tag" "difftest" "FAIL" "$_ms" "exit $_rc, golden wants $_exprc"
+    elif ! grep -q "difftest clean" "$OUT_DIR/$_tag.out"; then
+        parity_row "$_abi" "$HOST_TAG" "$_tag" "difftest" "FAIL" "$_ms" "exit $_rc, no 'difftest clean' marker"
+    elif parity_check_golden "$GOLDEN_DIR/$_tag.out" "$OUT_DIR/$_tag.out"; then
+        parity_row "$_abi" "$HOST_TAG" "$_tag" "difftest" "PASS" "$_ms" "exit $_rc, 0 divergences, matches golden"
+    else
+        parity_row "$_abi" "$HOST_TAG" "$_tag" "difftest" "FAIL" "$_ms" "exit $_rc, output differs from golden"
+    fi
+}
+
+D2_SUB="d2"
+printf 'D2-FILEIO alpha\nD2-FILEIO beta\nD2-FILEIO gamma\n' >"$OUT_DIR/d2seed.txt"
+
+# Launch one background job per (abi, leg); at most MAXJOBS concurrent.
+# Rows are emitted afterwards in fixed order, so output is deterministic
+# regardless of completion order.
+MAXJOBS=8
+_njobs=0
+launch() {
+    "$@" &
+    _njobs=$((_njobs + 1))
+    if [ "$_njobs" -ge "$MAXJOBS" ]; then
+        wait
+        _njobs=0
+    fi
+}
+
+for _abi in n64le n64be n32le n32be; do
+    for _t in p1 p3; do
+        launch do_stdout "$_t-$_abi-interp" "$GUEST_DIR/$_t-$_abi" "interp"
+        launch do_stdout "$_t-$_abi-dbt" "$GUEST_DIR/$_t-$_abi" "dbt"
+    done
+    for _fix in hello printf qsort fileio; do
+        if [ "$_fix" = "fileio" ]; then
+            launch do_difftest "d2-$_abi-$_fix-difftest" "$GUEST_DIR/$D2_SUB/d2-$_abi-$_fix" "$OUT_DIR/d2seed.txt"
+        else
+            launch do_difftest "d2-$_abi-$_fix-difftest" "$GUEST_DIR/$D2_SUB/d2-$_abi-$_fix"
+        fi
+    done
+done
+launch do_stdout "bench-smoke-interp" "$BENCH_BIN" "interp"
+launch do_stdout "bench-smoke-dbt" "$BENCH_BIN" "dbt"
+wait
+
+# --- emit rows in fixed order -----------------------------------------
+for _abi in n64le n64be n32le n32be; do
+    for _t in p1 p3; do
+        emit_stdout "$_abi" "$_t-$_abi" "interp" 0
+        emit_stdout "$_abi" "$_t-$_abi" "dbt" 0
+    done
+done
+for _abi in n64le n64be n32le n32be; do
+    for _fix in hello printf qsort fileio; do
+        emit_difftest "$_abi" "d2-$_abi-$_fix"
+    done
+done
+emit_stdout "n64le" "bench-smoke" "interp" 1
+emit_stdout "n64le" "bench-smoke" "dbt" 1
+
+# --- qualify tier: full Docker live-QEMU rebuild ----------------------
+if [ "${PARITY_DOCKER:-0}" = "1" ] || [ "${PARITY_TIER:-smoke}" = "qualify" ]; then
+    if [ "$(docker image inspect mips64rt-parity-env:trixie >/dev/null 2>&1; echo $?)" = "0" ]; then
+        IMG="mips64rt-parity-env:trixie"
+    else
+        IMG="debian:trixie-slim"
+    fi
+    NAME="mips64rt-parity-$$"
+    cleanup() {
+        docker rm -f "$NAME" >/dev/null 2>&1 || true
+    }
+    trap cleanup EXIT INT TERM
+    # Container exit codes: 0 full oracle parity, 2 documented oracle GAP
+    # (engines agree, oracle differs), anything else = FAIL.
+    _t0=$(parity_now_ms)
     set +e
     timeout --kill-after=30s 480s docker run --rm \
         --name "$NAME" --memory 2g --cpus 4 --platform linux/arm64 \
-        -v "$PWD:/w" -w /w "$IMG" sh -c '
+        -v "$ROOT:/w" -w /w "$IMG" sh -c '
 set -u
 if ! command -v mips64el-linux-gnuabi64-g++ >/dev/null 2>&1; then
     apt-get update -qq
@@ -170,15 +416,6 @@ run_abi() {
     [ "$qrc" = "$irc" ] || { echo "P-FAIL: $abi interp exit differs from oracle"; fails=$((fails + 1)); return; }
     [ "$qrc" = "$drc" ] || { echo "P-FAIL: $abi dbt exit differs from oracle"; fails=$((fails + 1)); return; }
     cmp -s /tmp/o-interp /tmp/o-dbt || { echo "P-FAIL: $abi interp != dbt"; fails=$((fails + 1)); return; }
-    # Known oracle quirk (see test_p1_isa.c pageend_body note): a
-    # never-taken branch-likely annuls its delay slot, so the first
-    # execution fetch fault lands on the fall-through (offset 8),
-    # which both engines report byte-identically. qemu-user instead
-    # faults while translating the annulled delay word itself
-    # (offset 4). The engines are architecturally right and agree
-    # with each other; only this one observation line is normalized
-    # out of the oracle comparison. Any other oracle difference is
-    # still a GAP.
     grep -v "^P1-INFO pageend-offset=" /tmp/o-qemu > /tmp/o-qemu-n
     grep -v "^P1-INFO pageend-offset=" /tmp/o-interp > /tmp/o-interp-n
     if cmp -s /tmp/o-qemu-n /tmp/o-interp-n; then
@@ -314,7 +551,7 @@ if [ ! -x /x/bb/bin/busybox ]; then
     cd /tmp
     wget -q http://deb.debian.org/debian/dists/bookworm/main/binary-mips64el/Packages.gz && \
     FN=$(zcat Packages.gz | grep -A25 "^Package: busybox-static$" | grep "^Filename:" | head -1 | cut -d" " -f2) && \
-    wget -q "http://deb.debian.org/debian/$FN" -O /tmp/bb.deb && \
+    wget -q "http://deb.debian.org/debian/$FN" -o /tmp/bb.deb && \
     mkdir -p /x/bb && dpkg-deb -x /tmp/bb.deb /x/bb || {
         echo "P-FAIL: busybox fetch failed"; fails=$((fails + 1))
     }
@@ -343,27 +580,25 @@ echo "abis done: fails=$fails gaps=$gaps"
 [ "$fails" -eq 0 ] || exit 1
 [ "$gaps" -eq 0 ] || exit 2
 exit 0
-' >/tmp/parity-docker.log 2>&1
+' >"$OUT_DIR/qualify-docker.log" 2>&1
     crc=$?
     set -e
+    _t1=$(parity_now_ms)
     if [ "$crc" -eq 0 ]; then
-        ok "P1/P3/P4/P5/P6/H1/H4/--difftest 4-ABI + BusyBox oracle parity (interp == dbt == qemu)"
+        parity_row "all" "$HOST_TAG" "qualify-docker-oracle" "oracle" "PASS" "$((_t1 - _t0))" "P1/P3/P4/P5/P6/H1/H4/--difftest/BusyBox oracle parity"
     elif [ "$crc" -eq 2 ]; then
-        gap "P1/P3/P4/P5/P6/H1/H4 oracle GAP (interp == dbt, oracle differs)"
-        sed -n '1,25p' /tmp/parity-docker.log
+        parity_row "all" "$HOST_TAG" "qualify-docker-oracle" "oracle" "GAP" "$((_t1 - _t0))" "engines agree, oracle differs (see $OUT_DIR/qualify-docker.log)"
     else
-        bad "docker oracle section failed (exit $crc)"
-        tail -30 /tmp/parity-docker.log
+        parity_row "all" "$HOST_TAG" "qualify-docker-oracle" "oracle" "FAIL" "$((_t1 - _t0))" "docker leg exit $crc (see $OUT_DIR/qualify-docker.log)"
+        tail -30 "$OUT_DIR/qualify-docker.log" >&2 || true
+    fi
+    trap - EXIT INT TERM
+    cleanup
+    if docker ps --format "{{.Names}}" 2>/dev/null | grep -q "^${NAME}$"; then
+        parity_row "all" "$HOST_TAG" "qualify-docker-cleanup" "host" "FAIL" 0 "container $NAME still present"
+    else
+        parity_row "all" "$HOST_TAG" "qualify-docker-cleanup" "host" "PASS" 0 "container removed"
     fi
 fi
 
-trap - EXIT INT TERM
-cleanup
-if docker ps --format "{{.Names}}" 2>/dev/null | grep -q "^${NAME}$"; then
-    echo "container $NAME still present"
-    fail=$((fail + 1))
-fi
-
-echo "P-RESULT: pass=$pass fail=$fail skip=$skip gap=$gapn"
-# Zero-GAP, zero-SKIP gate: any fail, skip, or parity gap fails the suite.
-[ "$fail" -eq 0 ] && [ "$skip" -eq 0 ] && [ "$gapn" -eq 0 ]
+parity_summary
