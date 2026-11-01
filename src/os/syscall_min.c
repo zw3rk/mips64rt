@@ -9,6 +9,7 @@
  */
 
 #include "core/cpu.h"
+#include "os/errno_map.h"
 #include "os/syscall_nr.h"
 #include "vm/vm_pages.h"
 
@@ -156,13 +157,8 @@ __attribute__((weak)) void dbt_invalidate_range(uint64_t va, uint64_t len);
 #define MIPS_UTS_FIELD 65U
 #define MIPS_UTS_SIZE (6U * MIPS_UTS_FIELD)
 
-static int32_t mips_errno_from_host(int host_errno)
-{
-    if (host_errno == 38) {
-        return 89; /* MIPS ENOSYS (asm/errno.h), not asm-generic 38 */
-    }
-    return (int32_t)host_errno;
-}
+/* MIPS errno translation lives in os/errno_map.h
+ * (l2a_errno_from_host, shared with syscalls.c). */
 
 /* Record the $a3 convention in the guest regs; return raw host value. */
 static int64_t sc_ret(mips64_ctx_t *ctx, int64_t raw)
@@ -174,7 +170,7 @@ static int64_t sc_ret(mips64_ctx_t *ctx, int64_t raw)
             e = 4095;
         }
         ctx->gpr[MIPS64_REG_V0] =
-            (uint64_t)mips_errno_from_host((int)e);
+            (uint64_t)l2a_errno_from_host((int)e);
         ctx->gpr[MIPS64_REG_A3] = 1U;
     } else {
         ctx->gpr[MIPS64_REG_V0] = (uint64_t)raw;
@@ -342,6 +338,19 @@ static int64_t sc_mmap(mips64_ctx_t *ctx, uint64_t addr, uint64_t len,
     if ((flags & MIPS_MAP_FIXED) != 0U) {
         va = addr;
         rc = mips_mem_map_replace(ctx, va, size, (uint32_t)(prot & 7U), "map");
+        if (rc == -ENOMEM &&
+            sysconf(_SC_PAGESIZE) > (long)MIPS64_PAGE_SIZE) {
+            /* Big-host fallback: the fixed mmap above only fails
+             * for 4 KiB-granular ranges inside a 16 KiB host page.
+             * Unmap retires the covered regions, map re-adds with
+             * RW cover (a second quiescence section; FIXED maps
+             * are rare and the fast path stays atomic). */
+            rc = mips_mem_unmap(ctx, va, size);
+            if (rc == 0) {
+                rc = mips_mem_map(ctx, va, size, (uint32_t)(prot & 7U),
+                                  "map");
+            }
+        }
     } else if ((flags & MIPS_MAP_FIXED_NOREPLACE) != 0U && addr != 0U) {
         va = addr;
         rc = mips_mem_map(ctx, va, size, (uint32_t)(prot & 7U), "map");

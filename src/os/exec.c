@@ -69,8 +69,8 @@
 #include <unistd.h>
 
 /* Loader entry (src/loader.c, lane L1c). Rebuilds stack/auxv and sets pc. */
-extern int mips_load_elf(mips64_ctx_t *ctx, const char *path, char **argv,
-                         char **envp);
+extern int mips_load_elf(mips64_ctx_t *ctx, const char *path,
+                         const char *guest_path, char **argv, char **envp);
 /* Guest exe path noted by the /proc/self layer (src/os/proc.c). */
 extern const char *mips_proc_exe_path(void);
 /* Guest window + endian-aware accessors (src/os/mem.c, lane L1c). */
@@ -346,6 +346,7 @@ int64_t mips_sc_exec(mips64_ctx_t *ctx, uint64_t nr, uint64_t path_va,
     uint64_t envp = 0;
     uint64_t flags = 0;
     char path_buf[EXEC_PATH_MAX];
+    char guest_buf[EXEC_PATH_MAX];
     char **host_argv = NULL;
     char **host_envp = NULL;
     size_t argc = 0;
@@ -421,6 +422,9 @@ int64_t mips_sc_exec(mips64_ctx_t *ctx, uint64_t nr, uint64_t path_va,
         }
         path_buf[k] = '\0';
     }
+    /* Snapshot the guest path for AT_EXECFN and /proc/self/exe
+     * (the join below overwrites path_buf with the host path). */
+    memcpy(guest_buf, path_buf, sizeof guest_buf);
     /* Guest-absolute paths resolve against the start-up sysroot (the
      * loader, the host-execve fallthrough, and AT_EXECFN below all
      * consume `exec_path`). */
@@ -462,7 +466,7 @@ int64_t mips_sc_exec(mips64_ctx_t *ctx, uint64_t nr, uint64_t path_va,
         mips_mem_snapshot(backup->regions, MIPS64_MAX_REGIONS);
     old_base = backup->guest_base;
     old_size = backup->task_size;
-    rc = mips_load_elf(ctx, path_buf, host_argv, host_envp);
+    rc = mips_load_elf(ctx, path_buf, guest_buf, host_argv, host_envp);
     if (rc != 0) {
         int e = errno != 0 ? errno : ENOEXEC;
         /* Tear down the partial new window, restore the old image. */

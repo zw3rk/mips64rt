@@ -10,7 +10,9 @@
  * paths (plus readlink of /proc/self/exe) is served from translator
  * state:
  *
- *   exe     -> the guest executable path passed to mips_load_elf;
+ *   exe     -> the guest executable path passed to mips_load_elf
+ *              (absolutized against cwd when relative: Linux reports
+ *              /proc/self/exe absolute);
  *   maps    -> guest mappings from the region table (guest VAs, guest
  *              prot flags), sorted by address, no pathnames (so no host
  *              path can ever leak);
@@ -114,10 +116,27 @@ void mips_proc_note_exec(const char *guest_path, int argc, char **argv,
 
     if (guest_path != NULL) {
         size_t k = 0U;
+        size_t j = 0U;
 
-        while (guest_path[k] != '\0' && k + 1U < sizeof proc_exe) {
-            proc_exe[k] = guest_path[k];
+        if (guest_path[0] != '\0' && guest_path[0] != '/') {
+            /* Linux reports /proc/self/exe absolute (ld.so's
+             * _dl_get_origin asserts it): resolve a relative exec
+             * path against the working directory (guest and host
+             * cwd agree: chdir is host-backed). */
+            if (getcwd(proc_exe, sizeof proc_exe) != NULL) {
+                k = proc_cstr_len(proc_exe);
+                if (k + 1U < sizeof proc_exe) {
+                    proc_exe[k] = '/';
+                    k++;
+                } else {
+                    k = 0U;
+                }
+            }
+        }
+        while (guest_path[j] != '\0' && k + 1U < sizeof proc_exe) {
+            proc_exe[k] = guest_path[j];
             k++;
+            j++;
         }
         proc_exe[k] = '\0';
     }

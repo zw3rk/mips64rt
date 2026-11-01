@@ -1,0 +1,7 @@
+H4-PASS unwind-depth code-ok=1 order-ok=1 n=3
+H4-PASS unwind-rethrow what-ok=1 star-ok=1 lambda=11 lord=1
+H4-PASS rtti-dynamic-cast down=1 null=1 cross=1 bad=1 tid=1
+H4-PASS threads sum=4001 ret-ok=1 detached-ok=1
+H4-PASS thread-local ctors=4 dtors=4 sum=1000 iso-fail=0 str=h4
+H4 checks: 5 pass, 0 fail
+H4-RESULT: PASS

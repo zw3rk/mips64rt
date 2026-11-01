@@ -16,6 +16,7 @@
 
 #include "core/cpu.h"
 
+#include "os/errno_map.h"
 #include "os/host_args.h"
 #include "os/syscall_nr.h"
 #include "os/sigframe_mips64rt.h"
@@ -162,8 +163,9 @@ int64_t mips_sc_stat_at(mips64_ctx_t *ctx, uint64_t dirfd, uint64_t path_va,
     if (rc < 0) {
         return l2a_ret(ctx, rc);
     }
-    if ((flags & ~(uint64_t)(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH |
-                             AT_NO_AUTOMOUNT)) != 0U) {
+    if ((flags & ~(uint64_t)(L2A_AT_SYMLINK_NOFOLLOW |
+                             L2A_AT_EMPTY_PATH |
+                             L2A_AT_NO_AUTOMOUNT)) != 0U) {
         return l2a_ret(ctx, -(int64_t)EINVAL);
     }
     /* Guest-absolute paths resolve against the start-up sysroot (no
@@ -172,8 +174,18 @@ int64_t mips_sc_stat_at(mips64_ctx_t *ctx, uint64_t dirfd, uint64_t path_va,
                             sizeof full) != 0) {
         return l2a_ret(ctx, -(int64_t)ENAMETOOLONG);
     }
-    if (fstatat((int)dirfd, full, &hs, (int)flags) != 0) {
-        return l2a_ret(ctx, -(int64_t)errno);
+    if ((flags & (uint64_t)L2A_AT_EMPTY_PATH) != 0U && path[0] == '\0') {
+        /* AT_EMPTY_PATH with an empty path stats the dirfd itself
+         * (Linux semantics); host fstat honors it everywhere. */
+        if (fstat(l2a_host_dirfd(dirfd), &hs) != 0) {
+            return l2a_ret(ctx, -(int64_t)errno);
+        }
+    } else {
+        /* macOS lacks AT_EMPTY_PATH/AT_NO_AUTOMOUNT: keep NOFOLLOW. */
+        if (fstatat(l2a_host_dirfd(dirfd), full, &hs,
+                    l2a_host_at_nofollow(flags)) != 0) {
+            return l2a_ret(ctx, -(int64_t)errno);
+        }
     }
     l2a_stat_norm(&hs);
     rc = emit_stat(ctx, &hs, buf_va);

@@ -4,9 +4,7 @@
  * Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0
  *
- * Host mappings inside the reservation are process-global, so the region
- * table is process-global too, serialized on a recursive mutex with
- * quiescence preemption blocked across table critical sections.
+ * Table is process-global, serialized with quiescence preemption blocked.
  */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -24,8 +22,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
-/* macOS hides MAP_NORESERVE under strict feature macros; the reservation
- * is an overcommit hint only, so degrading to 0 there is correct. */
+/* MAP_NORESERVE is an overcommit hint only; degrade to 0 on macOS. */
 #ifndef MAP_NORESERVE
 #define MAP_NORESERVE 0
 #endif
@@ -225,8 +222,7 @@ int mips_mem_ok(const mips64_ctx_t *ctx, uint64_t va, uint64_t len,
     return ok;
 }
 
-/* Map [va, va+len) inside the reservation with the given guest prot
- * (PROT_EXEC stripped on host). Returns 0, -EINVAL, -EEXIST, -ENOMEM. */
+/* Map [va, va+len); host EXEC stripped. Returns 0/-errno. */
 int mips_mem_map(mips64_ctx_t *ctx, uint64_t va, uint64_t len, uint32_t prot,
                  const char *tag)
 {
@@ -292,8 +288,7 @@ size_t mips_mem_snapshot(mips64_region_t *out, size_t cap);
 void mips_mem_restore(const mips64_region_t *regs, size_t count);
 static mips64_region_t g_saved_regions[MIPS64_MAX_REGIONS];
 
-/* Release [va, va+len): drop covered region records and punch a
- * PROT_NONE hole so the reservation stays contiguous. */
+/* Release: host stays RW when host page > 4 KiB (superset). */
 int mips_mem_unmap(mips64_ctx_t *ctx, uint64_t va, uint64_t len)
 {
     uint64_t end;
@@ -318,8 +313,10 @@ int mips_mem_unmap(mips64_ctx_t *ctx, uint64_t va, uint64_t len)
         mips_qs_abort(ctx);
         return -ENOMEM;
     }
-    got = mmap((void *)(uintptr_t)(ctx->guest_base + va), (size_t)len,
-               PROT_NONE, MAP_PRIVATE | MAP_FIXED | MAP_ANONYMOUS, -1, 0);
+    got = sysconf(_SC_PAGESIZE) > (long)MIPS64_PAGE_SIZE ?
+        (void *)(uintptr_t)(ctx->guest_base + va) :
+        mmap((void *)(uintptr_t)(ctx->guest_base + va), (size_t)len,
+             PROT_NONE, MAP_PRIVATE | MAP_FIXED | MAP_ANONYMOUS, -1, 0);
     if (got == MAP_FAILED) {
         int e = errno;
 
@@ -407,8 +404,7 @@ int mips_mem_map_replace(mips64_ctx_t *ctx, uint64_t va, uint64_t len,
     return 0;
 }
 
-/* Change protection on a fully mapped range; -ENOMEM when any byte is
- * unmapped. Zero length is a no-op; positive length rounds up to 4 KiB. */
+/* Protect: skip host downgrade; upgrades use host-rounded range. */
 int mips_mem_protect(mips64_ctx_t *ctx, uint64_t va, uint64_t len,
                      uint32_t prot)
 {
@@ -438,17 +434,23 @@ int mips_mem_protect(mips64_ctx_t *ctx, uint64_t va, uint64_t len,
                (end < ctx->task_size &&
                 split_at(ctx->task_size, end) != 0)) {
         rc = -ENOMEM;
-    } else if (mprotect((void *)(uintptr_t)(ctx->guest_base + va),
-                        (size_t)len, host_prot(prot)) != 0 &&
-               sysconf(_SC_PAGESIZE) <= (long)MIPS64_PAGE_SIZE) {
-        rc = -errno;
     } else {
-        for (i = 0; i < g_region_count; i++) {
-            if (g_regions[i].start >= va && g_regions[i].end <= end)
-                g_regions[i].prot = prot;
+        if ((prot & MIPS_PROT_WRITE) != 0) {
+            long hps = sysconf(_SC_PAGESIZE);
+            uint64_t hlo = va & ~((uint64_t)hps - 1u);
+            uint64_t hhi = (va + len + (uint64_t)hps - 1u) & ~((uint64_t)hps - 1u);
+            if (mprotect((void *)(uintptr_t)(ctx->guest_base + hlo),
+                         (size_t)(hhi - hlo), host_prot(prot)) != 0)
+                rc = -errno;
         }
-        mips_vm_file_protect_hook(va, len, prot);
-        dbt_invalidate_range(va, len);
+        if (rc == 0) {
+            for (i = 0; i < g_region_count; i++) {
+                if (g_regions[i].start >= va && g_regions[i].end <= end)
+                    g_regions[i].prot = prot;
+            }
+            mips_vm_file_protect_hook(va, len, prot);
+            dbt_invalidate_range(va, len);
+        }
     }
     mem_unlock();
     if (rc != 0)

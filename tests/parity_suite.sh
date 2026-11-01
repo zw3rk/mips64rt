@@ -16,13 +16,22 @@
 #          variants (n64le, n64be, n32le, n32be) under --interp and --dbt,
 #          compared byte-for-bit against tests/golden/ (guest argv[0] is
 #          always absolute: the static glibc startup aborts on a relative
-#          AT_EXECFN path).
+#          AT_EXECFN path); plus n64le-only p4_threads, h1_smc, h4_cxx,
+#          p3_torture, and tcg_smoke under both engines.
+#       T1d dynamic guests: p5_dyn (P5_SENTINEL=dyn-env-ok, argv
+#          p5arg1 p5arg2) and h4_cxx-dyn under both engines with the
+#          committed tests/sysroot/ (--sysroot, guest path absolute
+#          under the sysroot), compared against tests/golden/.
 #       T2 --difftest legs: hello, printf, qsort, and fileio fixtures
 #          for all 4 ABI variants with MIPS64RT_RANDSEED=1 (fixed
 #          AT_RANDOM so the two lockstep engines agree), compared
 #          against tests/golden/.
 #       T3 bench smoke: ../rt-series/_build/bench/bench-mips64el --smoke
 #          under --interp and --dbt with us=/ops_sec= timings normalized.
+#       T4 AOT round-trip: real guest ELF (tcg-n64le) cold-emit into a
+#          fresh --cache dir then warm-reload in a fresh process; stdout
+#          must be identical and match the tcg golden, with exactly one
+#          <hex>.aot leaf left behind.
 #     Guest legs run in parallel background jobs (at most MAXJOBS at a
 #     time; rows are still emitted in fixed order from the parent, so
 #     output is deterministic). Every row is PASS or the suite fails
@@ -48,9 +57,10 @@
 #   canonical-pair checks; exit 1): both engines agree byte-for-bit, so
 #   the rows pin engine parity, not oracle truth. Oracle truth is the
 #   qualify tier's job.
-#   P4 (threads/signals), P6, H1, H4, dynamic P5, and BusyBox have no
-#   committed Darwin-runnable guests (P4 SIGBUS-faults under the Darwin
-#   translator on all 4 ABIs) and are qualify-tier-only.
+#   P6 and BusyBox have no committed Darwin-runnable guests and are
+#   qualify-tier-only. P4 (threads/signals), H1, H4 (static and
+#   dynamic), dynamic P5, p3_torture, and tcg_smoke run in smoke on
+#   n64le via committed tests/guests/ + tests/sysroot/ guests.
 #   d2-malloc is qualify-tier-only: each --difftest leg takes 20-30s
 #   (brk-heavy soak under lockstep), which alone exceeds the smoke
 #   budget; the qualify container runs it under --difftest on all 4
@@ -81,6 +91,7 @@ HOST_M="$(uname -m)"
 HOST_TAG="${HOST_OS}-${HOST_M}"
 GOLDEN_DIR="$ROOT/tests/golden"
 GUEST_DIR="$ROOT/tests/guests"
+SYSROOT_DIR="$ROOT/tests/sysroot"
 OUT_DIR="${OUTDIR:-/tmp/mips64rt-parity}"
 mkdir -p "$OUT_DIR"
 CC_HOST="${HOST_CC:-cc}"
@@ -199,6 +210,26 @@ do_difftest() {
     printf '%s %s\n' "$_t0" "$(parity_now_ms)" >"$OUT_DIR/job-$_d_tag.ms"
 }
 
+do_dyn() {
+    # do_dyn <tag> <engine> <sysroot-guest-path> <sentinel|-> [guest args...]
+    # Dynamic leg: minimal scrubbed env, committed tests/sysroot, guest
+    # path absolute under the sysroot (argv[0] dir locates bundled .so).
+    _d_tag="$1"; _d_eng="$2"; _d_guest="$3"; _d_sentinel="$4"; shift 4
+    _t0=$(parity_now_ms)
+    if [ "$_d_sentinel" = "-" ]; then
+        env -i PATH=/usr/bin:/bin HOSTNAME=mips64rt \
+            "$RT" "--$_d_eng" --sysroot "$SYSROOT_DIR" "$_d_guest" "$@" \
+            >"$OUT_DIR/job-$_d_tag.raw" 2>&1
+    else
+        # shellcheck disable=SC2086
+        env -i PATH=/usr/bin:/bin HOSTNAME=mips64rt $_d_sentinel \
+            "$RT" "--$_d_eng" --sysroot "$SYSROOT_DIR" "$_d_guest" "$@" \
+            >"$OUT_DIR/job-$_d_tag.raw" 2>&1
+    fi
+    printf '%s\n' "$?" >"$OUT_DIR/job-$_d_tag.rc"
+    printf '%s %s\n' "$_t0" "$(parity_now_ms)" >"$OUT_DIR/job-$_d_tag.ms"
+}
+
 job_ms() {
     # job_ms <tag>: elapsed ms recorded by the background job.
     if [ -f "$OUT_DIR/job-$1.ms" ]; then
@@ -218,11 +249,13 @@ job_rc() {
     fi
 }
 
-# emit_stdout <abi> <case> <engine> <norm:0|1>
+# emit_stdout <abi> <case> <engine> <norm:0|1> [guest-override]
 emit_stdout() {
     _abi="$1"; _case="$2"; _eng="$3"; _norm="$4"
     _tag="$_case-$_eng"
-    if [ "$_case" = "bench-smoke" ]; then
+    if [ -n "${5:-}" ]; then
+        _guest="$5"
+    elif [ "$_case" = "bench-smoke" ]; then
         _guest="$BENCH_BIN"
     else
         _guest="$GUEST_DIR/$_case"
@@ -343,6 +376,14 @@ for _abi in n64le n64be n32le n32be; do
 done
 launch do_stdout "bench-smoke-interp" "$BENCH_BIN" "interp"
 launch do_stdout "bench-smoke-dbt" "$BENCH_BIN" "dbt"
+for _t in p4 h1 h4 p3torture tcg; do
+    launch do_stdout "$_t-n64le-interp" "$GUEST_DIR/$_t-n64le" "interp"
+    launch do_stdout "$_t-n64le-dbt" "$GUEST_DIR/$_t-n64le" "dbt"
+done
+launch do_dyn "p5-dyn-n64le-interp" "interp" "/p5-n64le" "P5_SENTINEL=dyn-env-ok" "p5arg1" "p5arg2"
+launch do_dyn "p5-dyn-n64le-dbt" "dbt" "/p5-n64le" "P5_SENTINEL=dyn-env-ok" "p5arg1" "p5arg2"
+launch do_dyn "h4-dyn-n64le-interp" "interp" "/h4-dyn-n64le" "-"
+launch do_dyn "h4-dyn-n64le-dbt" "dbt" "/h4-dyn-n64le" "-"
 wait
 
 # --- emit rows in fixed order -----------------------------------------
@@ -359,6 +400,57 @@ for _abi in n64le n64be n32le n32be; do
 done
 emit_stdout "n64le" "bench-smoke" "interp" 1
 emit_stdout "n64le" "bench-smoke" "dbt" 1
+for _t in p4 h1 h4 p3torture tcg; do
+    emit_stdout "n64le" "$_t-n64le" "interp" 0
+    emit_stdout "n64le" "$_t-n64le" "dbt" 0
+done
+emit_stdout "n64le" "p5-dyn-n64le" "interp" 0 "$SYSROOT_DIR/p5-n64le"
+emit_stdout "n64le" "p5-dyn-n64le" "dbt" 0 "$SYSROOT_DIR/p5-n64le"
+emit_stdout "n64le" "h4-dyn-n64le" "interp" 0 "$SYSROOT_DIR/h4-dyn-n64le"
+emit_stdout "n64le" "h4-dyn-n64le" "dbt" 0 "$SYSROOT_DIR/h4-dyn-n64le"
+
+# --- T4 AOT round-trip: cold emit -> warm reload (real guest ELF) --------
+# Cold run emits into a fresh cache dir, warm run reloads in a fresh
+# process; stdout must be identical (and equal the tcg dbt leg output),
+# both exits 0 with silent stderr, and exactly one `<hex>.aot` leaf must
+# exist afterwards (cold created it, warm reused it).
+AOT_DIR="$OUT_DIR/aot-roundtrip"
+rm -rf "$AOT_DIR"
+mkdir -p "$AOT_DIR"
+if [ -f "$GUEST_DIR/tcg-n64le" ]; then
+    _t0=$(parity_now_ms)
+    "$RT" --dbt --cache "$AOT_DIR" "$GUEST_DIR/tcg-n64le" \
+        >"$OUT_DIR/aot-cold.out" 2>"$OUT_DIR/aot-cold.err"
+    _crc=$?
+    "$RT" --dbt --cache "$AOT_DIR" "$GUEST_DIR/tcg-n64le" \
+        >"$OUT_DIR/aot-warm.out" 2>"$OUT_DIR/aot-warm.err"
+    _wrc=$?
+    _ams=$(( $(parity_now_ms) - _t0 ))
+    if [ "$PARITY_UPDATE_GOLDEN" = "1" ]; then
+        _aot_want="$OUT_DIR/tcg-n64le-dbt.out"
+    else
+        _aot_want="$GOLDEN_DIR/tcg-n64le.out"
+    fi
+    if [ "$PARITY_UPDATE_GOLDEN" != "1" ] && [ ! -f "$_aot_want" ]; then
+        parity_row "n64le" "$HOST_TAG" "aot-roundtrip-output" "dbt" "GAP" "$_ams" "missing golden tests/golden/tcg-n64le.out"
+    elif [ "$_crc" = "0" ] && [ "$_wrc" = "0" ] \
+        && [ ! -s "$OUT_DIR/aot-cold.err" ] && [ ! -s "$OUT_DIR/aot-warm.err" ] \
+        && cmp -s "$OUT_DIR/aot-cold.out" "$OUT_DIR/aot-warm.out" \
+        && parity_check_golden "$_aot_want" "$OUT_DIR/aot-cold.out"; then
+        parity_row "n64le" "$HOST_TAG" "aot-roundtrip-output" "dbt" "PASS" "$_ams" "cold==warm rc=0, matches tcg golden"
+    else
+        parity_row "n64le" "$HOST_TAG" "aot-roundtrip-output" "dbt" "FAIL" "$_ams" "cold rc=$_crc warm rc=$_wrc"
+    fi
+    _nleaf=$(find "$AOT_DIR" -name '*.aot' | grep -c .)
+    if [ "$_nleaf" = "1" ]; then
+        parity_row "n64le" "$HOST_TAG" "aot-roundtrip-cache" "dbt" "PASS" 0 "single leaf reused cold->warm"
+    else
+        parity_row "n64le" "$HOST_TAG" "aot-roundtrip-cache" "dbt" "FAIL" 0 "leaves=$_nleaf, want 1"
+    fi
+else
+    parity_row "n64le" "$HOST_TAG" "aot-roundtrip-output" "dbt" "GAP" 0 "missing guest $GUEST_DIR/tcg-n64le"
+    parity_row "n64le" "$HOST_TAG" "aot-roundtrip-cache" "dbt" "GAP" 0 "missing guest $GUEST_DIR/tcg-n64le"
+fi
 
 # --- qualify tier: full Docker live-QEMU rebuild ----------------------
 if [ "${PARITY_DOCKER:-0}" = "1" ] || [ "${PARITY_TIER:-smoke}" = "qualify" ]; then

@@ -589,6 +589,16 @@ int ei_atomic(a64_emit_t *e, const mips_dec_t *d, uint64_t pc, int be,
         (is_load != 0 ? 0u : (unsigned)DBT_MEM_F_STORE) |
         (be != 0 ? (unsigned)DBT_MEM_F_BE : 0u) |
         (slot != 0 ? (unsigned)DBT_MEM_F_IN_DELAY_SLOT : 0u);
+    /* SC/SCD decline to the interpreter: the inline LDXR/STXR fast
+     * path below loses updates under two-thread contention on both
+     * Darwin and Linux hosts (p3torture atomic-race flakes ~60%
+     * under --dbt while the locked interp do_sc passes 100%). Root
+     * cause not isolated; re-enable the fast path if it is fixed.
+     * LL/LLD stay inline (their reservation records feed the interp
+     * SC correctly, verified by the same runs). */
+    if (is_load == 0) {
+        return 1;
+    }
     ei_mem_addr(e, d);
     miss = ei_probe_open(e, pc, d, width, flags, d->rt, is_load == 0,
                          slot);
@@ -602,14 +612,15 @@ int ei_atomic(a64_emit_t *e, const mips_dec_t *d, uint64_t pc, int be,
         ei_mov32(e, EI_T, 1u);
         ei_strb(e, EI_T, EI_CTX, MIPS64_CTX_LLBIT_OFFSET);
         ei_str(e, 0, EI_A, EI_CTX, MIPS64_CTX_LLADDR_OFFSET);
+        /* LLVAL must equal interp do_ll/do_lld (guest order,
+         * zero-extended): the declined SC compares it against a fresh
+         * guest load, so a pre-swap value wedges BE retry loops. */
+        if (be != 0) {
+            ei_rev(e, is_d != 0 ? 0xDAC00C00u : 0x5AC00800u, EI_C, EI_C);
+        }
         ei_str(e, 0, EI_C, EI_CTX, MIPS64_CTX_LLVAL_OFFSET);
         if (is_d == 0) {
-            if (be != 0) {
-                ei_rev(e, 0x5AC00800u, EI_C, EI_C);
-            }
             ei_sxt(e, 31u, EI_C, EI_C);
-        } else if (be != 0) {
-            ei_rev(e, 0xDAC00C00u, EI_C, EI_C);
         }
         ei_gst(e, EI_C, d->rt);
         ei_probe_close(e);

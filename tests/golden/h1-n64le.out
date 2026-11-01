@@ -1,0 +1,32 @@
+H1-SMC: start
+H1 stack-protect: PASS rwx
+H1 stack-exec-1: PASS ret=11 iters=64
+H1 stack-rewrite: PASS ret=12
+H1 stack-restore: PASS rw
+H1 heap-protect: PASS rwx
+H1 heap-exec-1: PASS ret=21 iters=64
+H1 heap-rewrite: PASS ret=22
+H1 mmap-protect-rx: PASS rx
+H1 mmap-exec-1: PASS ret=31 iters=64
+H1 mmap-rewrite-protect: PASS rw-patch-rx
+H1 mmap-mprotect-rewrite: PASS ret=32 iters=64
+H1 mmap-rewrite-again: PASS ret=32
+H1 mmap-unmap: PASS unmapped
+H1 munmap-protect-rx: PASS rx
+H1 munmap-exec-1: PASS ret=41
+H1 munmap-unmap: PASS unmapped
+H1 munmap-stale: PASS code=1 off=0
+H1 munmap-remap-protect: PASS rx
+H1 munmap-remap: PASS ret=42 iters=64
+H1 munmap-cleanup: PASS unmapped
+H1 wx-protect: PASS rx-rw
+H1 wx-rx-exec: PASS ret=43
+H1 wx-rx-write: PASS code=2 off=16
+H1 wx-rw-exec: PASS code=2 off=4096
+H1 wx-promote: PASS rw-to-rx
+H1 wx-promote-exec: PASS ret=44 iters=64
+H1 wx-demote: PASS rx-to-rw
+H1 wx-demote-noexec: PASS code=2 off=4096
+H1 wx-cleanup: PASS unmapped
+H1-SUMMARY: pass=29 fail=0
+H1-SMC-RESULT: PASS

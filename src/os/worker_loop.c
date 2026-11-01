@@ -539,7 +539,8 @@ int mips64_worker_loop_run(const mips64_run_config_t *config, int guest_argc,
         int rc;
 
         mips_loader_init_ctx(&ctx);
-        if (mips_load_elf(&ctx, open_path, guest_argv, environ) != 0) {
+        if (mips_load_elf(&ctx, open_path, exec_path, guest_argv,
+                          environ) != 0) {
             int e = errno;
 
             fprintf(stderr, "mips64rt: cannot load '%s'\n", open_path);

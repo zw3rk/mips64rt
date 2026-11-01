@@ -20,7 +20,10 @@
 #include "core/cpu.h"
 
 void mips_loader_init_ctx(mips64_ctx_t *ctx);
-int mips_load_elf(mips64_ctx_t *ctx, const char *path, char **argv,
-                  char **envp);
+/* path names the host file to open; guest_path is the guest-visible
+ * image path (AT_EXECFN and /proc/self/exe). NULL guest_path falls
+ * back to path. */
+int mips_load_elf(mips64_ctx_t *ctx, const char *path,
+                  const char *guest_path, char **argv, char **envp);
 
 #endif /* MIPS64RT_LOADER_H */

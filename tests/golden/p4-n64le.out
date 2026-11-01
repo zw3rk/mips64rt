@@ -1,0 +1,44 @@
+P4 threads+signals suite abi=N64 endian=LE
+P4-INFO model abi=N64 endian=LE void*=8 long=8
+P4-PASS datamodel
+P4-PASS sigusr1-install
+P4-PASS sigusr1-raise
+P4-INFO sigusr1 si_code=0
+P4-PASS sigusr1-handler-ran
+P4-PASS sigusr1-si-code
+P4-PASS sigusr1-pc-nonzero
+P4-PASS sigusr1-old-s0
+P4-PASS sigusr1-s0-edited
+P4-PASS sigsegv-mmap
+P4-PASS sigsegv-install
+P4-PASS sigsegv-protect
+P4-PASS sigsegv-handler-ran
+P4-PASS sigsegv-recovered-value
+P4-PASS altstack-install
+P4-PASS altstack-handler-install
+P4-PASS altstack-raise
+P4-PASS altstack-handler-ran
+P4-PASS altstack-onstack
+P4-PASS llsc-single-succeeds
+P4-PASS threads-create
+P4-PASS threads-join
+P4-PASS threads-atomic-total
+P4-PASS threads-llsc-total
+P4-PASS futex-thread-create
+P4-PASS futex-wake
+P4-PASS futex-thread-join
+P4-PASS futex-word
+P4-PASS exec-pipe-wait4
+P4-PASS fork-wait4
+P4-PASS exec-output-wait4
+P4-PASS wait4-child-wait4
+P4-PASS exec-pipe-waitid
+P4-PASS fork-waitid
+P4-PASS exec-output-waitid
+P4-PASS waitid-ok-waitid
+P4-PASS waitid-signo-waitid
+P4-PASS waitid-code-waitid
+P4-PASS waitid-pid-waitid
+P4-PASS waitid-status-waitid
+P4-SUMMARY failed=0 total=39
+P4-RESULT: PASS

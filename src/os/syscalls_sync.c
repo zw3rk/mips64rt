@@ -159,9 +159,8 @@ int64_t mips_sc_rt_sigprocmask(mips64_ctx_t *ctx, uint64_t how,
     return l2a_ret(ctx, 0);
 }
 
-/* Robust lists are recorded in ctx, never installed on the host:
- * single-threaded guests never contend, so the host kernel has nothing
- * to clean up. Phase 4 installs a real host-side list for threads. */
+/* Robust lists are recorded in ctx, never installed on the host.
+ * len is sizeof(struct robust_list_head): 24 on N64 (3x8), 12 on N32. */
 int64_t mips_sc_robust(mips64_ctx_t *ctx, int set, uint64_t a0, uint64_t a1,
                        uint64_t a2)
 {
@@ -171,7 +170,7 @@ int64_t mips_sc_robust(mips64_ctx_t *ctx, int set, uint64_t a0, uint64_t a1,
     int be = ctx->is_be != 0U;
 
     if (set) {
-        if (a1 != (uint64_t)ws) {
+        if (a1 != (uint64_t)(3U * ws)) {
             return l2a_ret(ctx, -(int64_t)EINVAL);
         }
         ctx->robust_list_head = a0;

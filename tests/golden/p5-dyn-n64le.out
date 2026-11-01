@@ -1,0 +1,37 @@
+P5-ABI: N64 le
+hello p5dyn
+dlopen: ok
+P5-PASS dlopen
+P5-PASS dlsym
+P5-PASS lib-answer
+P5-PASS lib-name
+lib-name: p5_dynlib
+P5-PASS main-tls-init
+P5-PASS main-tls-set
+P5-PASS lib-tls-bump
+P5-PASS lib-tls-get
+sorted: 1 2 3 4 5 6 7 8
+P5-PASS qsort
+auxv: pagesz=4096 clktck=100 entry=1 base=1 phdr=1
+P5-PASS auxv-consts
+P5-PASS auxv-entry-nonzero
+P5-PASS auxv-base-nonzero
+P5-PASS auxv-entry-self
+cmdline:/p5-n64le|p5arg1|p5arg2
+P5-PASS cmdline-match
+exe: /p5-n64le
+P5-PASS exe-readlink
+P5-PASS exe-match
+maps: rx=1 rw=1 nohost=1
+P5-PASS maps-rx
+P5-PASS maps-rw
+P5-PASS maps-nohost
+stat: comm=p5-n64le
+P5-PASS stat-comm
+P5-PASS auxv-entry-match
+env-sentinel: dyn-env-ok
+P5-PASS env-sentinel
+P5-PASS env-scrub
+argc: 3
+P5-PASS argc
+P5-RESULT: PASS

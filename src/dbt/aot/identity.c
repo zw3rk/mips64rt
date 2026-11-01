@@ -13,8 +13,13 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#endif
 
 int mips64_runtime_digest(const char *path, uint8_t out[MIPS64_SHA256_BYTES])
 {
@@ -54,18 +59,37 @@ int mips64_runtime_digest(const char *path, uint8_t out[MIPS64_SHA256_BYTES])
 int mips64_runtime_digest_self(uint8_t out[MIPS64_SHA256_BYTES])
 {
     char link[4096];
+#if !defined(__APPLE__)
     ssize_t n;
+#endif
 
     if (out == NULL) {
         errno = EINVAL;
         return -1;
     }
-    /* Linux-only; macOS hosts have no `/proc/self/exe`. */
+#if defined(__APPLE__)
+    /* macOS hosts have no `/proc/self/exe`; `_NSGetExecutablePath`
+     * may return a relative or symlinked path, so canonicalize. */
+    {
+        char canon[4096];
+        uint32_t size = (uint32_t)sizeof link;
+
+        if (_NSGetExecutablePath(link, &size) != 0) {
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+        if (realpath(link, canon) == NULL)
+            return -1;
+        return mips64_runtime_digest(canon, out);
+    }
+#else
+    /* Linux hosts expose the runtime image via `/proc/self/exe`. */
     n = readlink("/proc/self/exe", link, sizeof link - 1u);
     if (n < 0)
         return -1;
     link[n] = '\0';
     return mips64_runtime_digest(link, out);
+#endif
 }
 
 void mips64_digest_hex(const uint8_t digest[MIPS64_SHA256_BYTES],

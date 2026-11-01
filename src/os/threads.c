@@ -111,6 +111,9 @@ static long l4b_gettid(void)
 
 /* Host FUTEX_WAKE for the clear-tid word on thread exit (best effort:
  * the joining thread may already be gone). */
+extern int64_t mips_futex_op(mips64_ctx_t *ctx, uint64_t uaddr, uint64_t op,
+                             uint64_t val, uint64_t timeout_va, uint64_t uaddr2,
+                             uint64_t val3);
 static void l4b_futex_wake(uint32_t *word)
 {
 #if defined(__linux__) && defined(SYS_futex)
@@ -119,6 +122,12 @@ static void l4b_futex_wake(uint32_t *word)
 #else
     (void)word;
 #endif
+}
+/* Guest wake for the clear-tid word (Darwin condvar table; no-op on
+ * Linux where the host wake above already wakes host-futex waiters). */
+static void l4b_guest_wake(mips64_ctx_t *ctx, uint64_t va)
+{
+    (void)mips_futex_op(ctx, va, 1u, (uint64_t)INT_MAX, 0u, 0u, 0u);
 }
 
 /* Live-thread table: slot per spawned pthread, guarded by l4b_mu. The
@@ -410,6 +419,7 @@ void mips_thread_exit(mips64_ctx_t *ctx, int status)
         mips_mem_ok(ctx, clear_va, 4U, (uint32_t)MIPS_PROT_WRITE)) {
         (void)guest_st32(ctx, clear_va, 0U);
         l4b_futex_wake((uint32_t *)mips64_guest_ptr(ctx, clear_va));
+        l4b_guest_wake(ctx, clear_va);
     }
     (void)pthread_mutex_lock(&l4b_mu);
     for (i = 0U; i < L4B_THREAD_MAX; i++) {

@@ -557,7 +557,7 @@ static int read_interp_path(int fd, const ehdr_t *eh, char *out, size_t cap)
 static int build_stack(mips64_ctx_t *ctx, int argc, char **argv, char **envp,
                        uint64_t phdr_va, uint64_t phent, uint64_t phnum,
                        uint64_t entry, uint64_t interp_base, int have_interp,
-                       const char *path)
+                       const char *guest_path)
 {
     int w32 = ctx->is_n32 != 0U ? 1 : 0;
     uint64_t ws = w32 ? 4U : 8U;
@@ -591,7 +591,7 @@ static int build_stack(mips64_ctx_t *ctx, int argc, char **argv, char **envp,
         }
         nenv++;
     }
-    str_size += (uint64_t)str_len(path) + 1U + 16U;
+    str_size += (uint64_t)str_len(guest_path) + 1U + 16U;
     /* Auxv rows: 15 for static guests (14 + AT_NULL); the interpreter
      * handoff adds AT_BASE + AT_HWCAP2 for 17 rows. */
     frame = ws + ws * ((uint64_t)argc + 1U) + ws * (kept + 1U) +
@@ -612,7 +612,7 @@ static int build_stack(mips64_ctx_t *ctx, int argc, char **argv, char **envp,
     s = stack_top;
     s -= 16U;
     rnd_va = s;
-    s -= (uint64_t)str_len(path) + 1U;
+    s -= (uint64_t)str_len(guest_path) + 1U;
     execfn_va = s;
     for (i = (int)nenv - 1; i >= 0; i--) {
         if (!env_hidden(envp[i])) {
@@ -643,7 +643,8 @@ static int build_stack(mips64_ctx_t *ctx, int argc, char **argv, char **envp,
                 q += (uint64_t)n;
             }
         }
-        memcpy(mem + (execfn_va - stack_base), path, str_len(path) + 1U);
+        memcpy(mem + (execfn_va - stack_base), guest_path,
+           str_len(guest_path) + 1U);
         rand16(rnd);
         memcpy(mem + (rnd_va - stack_base), rnd, 16U);
     }
@@ -722,7 +723,7 @@ static int build_stack(mips64_ctx_t *ctx, int argc, char **argv, char **envp,
         /* Hand the guest-visible state to the /proc/self layer: a copy
          * of the argv strings (the caller's vectors may be freed after
          * exec) and the exact auxv rows placed on the stack. */
-        mips_proc_note_exec(path, argc, argv, ctx);
+        mips_proc_note_exec(guest_path, argc, argv, ctx);
         mips_proc_note_auxv(auxv, (size_t)naux / 2U);
     }
     ctx->gpr[MIPS64_REG_SP] = sp;
@@ -731,8 +732,8 @@ static int build_stack(mips64_ctx_t *ctx, int argc, char **argv, char **envp,
     return 0;
 }
 
-int mips_load_elf(mips64_ctx_t *ctx, const char *path, char **argv,
-                  char **envp)
+int mips_load_elf(mips64_ctx_t *ctx, const char *path,
+                  const char *guest_path, char **argv, char **envp)
 {
     ehdr_t eh;
     uint64_t bias;
@@ -751,6 +752,9 @@ int mips_load_elf(mips64_ctx_t *ctx, const char *path, char **argv,
         argv[0] == NULL) {
         errno = EINVAL;
         return -1;
+    }
+    if (guest_path == NULL) {
+        guest_path = path;
     }
     while (argv[argc] != NULL) {
         argc++;
@@ -851,7 +855,7 @@ int mips_load_elf(mips64_ctx_t *ctx, const char *path, char **argv,
     ctx->brk_curr = ctx->brk_base;
     if (build_stack(ctx, argc, argv, envp, phdr, eh.is64 ? 56U : 32U,
                       (uint64_t)eh.phnum, entry, interp_base, have_interp,
-                      path) != 0) {
+                      guest_path) != 0) {
         return -1;
     }
     ctx->interp_base = have_interp != 0 ? interp_base : 0U;

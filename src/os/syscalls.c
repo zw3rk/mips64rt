@@ -37,6 +37,7 @@
 
 /* Non-Linux host fallbacks (dup3/pipe2/close_range/getrandom/
  * clock_nanosleep shapes); Linux keeps the direct syscalls. */
+#include "os/errno_map.h"
 #include "os/host_compat.h"
 
 /* linux/close_range.h values (arch-independent); this toolchain's
@@ -97,12 +98,8 @@ extern int mips_mem_ok(const mips64_ctx_t *ctx, uint64_t va, uint64_t len,
 
 #define L2A_PATH_MAX 4096U
 
-/* MIPS errno: shares asm-generic values except ENOSYS (MIPS 89, host
- * 38). Mirrors mips_errno_from_host in src/os/syscall_min.c. */
-static int32_t l2a_errno_from_host(int host_errno)
-{
-    return host_errno == 38 ? 89 : (int32_t)host_errno;
-}
+/* MIPS errno translation lives in os/errno_map.h
+ * (l2a_errno_from_host, shared with syscall_min.c). */
 
 /* Record the $a3 convention; return raw host value. Shared with the
  * sibling syscalls_*.c files. */
@@ -303,7 +300,8 @@ int64_t mips_sc_openat(mips64_ctx_t *ctx, uint64_t dirfd, uint64_t path_va,
                             sizeof full) != 0) {
         return l2a_ret(ctx, -(int64_t)ENAMETOOLONG);
     }
-    fd = openat((int)dirfd, full, hflags, (mode_t)(mode & 0777U));
+    fd = openat(l2a_host_dirfd(dirfd), full, hflags,
+              (mode_t)(mode & 0777U));
     if (fd < 0) {
         return l2a_ret(ctx, -(int64_t)errno);
     }
@@ -482,14 +480,17 @@ int64_t mips_sc_access_at(mips64_ctx_t *ctx, uint64_t dirfd,
     if (rc < 0) {
         return l2a_ret(ctx, rc);
     }
-    if ((flags & ~(uint64_t)(AT_SYMLINK_NOFOLLOW | AT_EACCESS)) != 0U) {
+    if ((flags & ~(uint64_t)(L2A_AT_SYMLINK_NOFOLLOW |
+                             L2A_AT_EACCESS)) != 0U) {
         return l2a_ret(ctx, -(int64_t)EINVAL);
     }
     if (mips64_sysroot_join(mips64_host_sysroot(), path, full,
                             sizeof full) != 0) {
         return l2a_ret(ctx, -(int64_t)ENAMETOOLONG);
     }
-    if (faccessat((int)dirfd, full, (int)mode, (int)flags) != 0) {
+    if (faccessat(l2a_host_dirfd(dirfd), full, (int)mode,
+                  l2a_host_at_nofollow(flags) |
+                      l2a_host_at_eaccess(flags)) != 0) {
         return l2a_ret(ctx, -(int64_t)errno);
     }
     return l2a_ret(ctx, 0);
@@ -525,7 +526,8 @@ int64_t mips_sc_readlinkat(mips64_ctx_t *ctx, uint64_t dirfd,
                                sizeof full) != 0) {
             return l2a_ret(ctx, -(int64_t)ENAMETOOLONG);
         }
-        n = readlinkat((int)dirfd, full, (char *)p, (size_t)size);
+        n = readlinkat(l2a_host_dirfd(dirfd), full, (char *)p,
+                       (size_t)size);
     }
     if (n < 0) {
         return l2a_ret(ctx, -(int64_t)errno);
@@ -543,14 +545,15 @@ int64_t mips_sc_unlinkat(mips64_ctx_t *ctx, uint64_t dirfd, uint64_t path_va,
     if (rc < 0) {
         return l2a_ret(ctx, rc);
     }
-    if ((flags & ~(uint64_t)AT_REMOVEDIR) != 0U) {
+    if ((flags & ~(uint64_t)L2A_AT_REMOVEDIR) != 0U) {
         return l2a_ret(ctx, -(int64_t)EINVAL);
     }
     if (mips64_sysroot_join(mips64_host_sysroot(), path, full,
                             sizeof full) != 0) {
         return l2a_ret(ctx, -(int64_t)ENAMETOOLONG);
     }
-    if (unlinkat((int)dirfd, full, (int)flags) != 0) {
+    if (unlinkat(l2a_host_dirfd(dirfd), full,
+                 l2a_host_at_removedir(flags)) != 0) {
         return l2a_ret(ctx, -(int64_t)errno);
     }
     return l2a_ret(ctx, 0);
@@ -717,7 +720,7 @@ int64_t mips_sc_getdents64(mips64_ctx_t *ctx, uint64_t fd, uint64_t dirp_va,
  * glibc unlink() still emits the legacy number (qemu-observed). */
 int64_t mips_sc_unlink(mips64_ctx_t *ctx, uint64_t path_va)
 {
-    return mips_sc_unlinkat(ctx, (uint64_t)(int64_t)-100, path_va, 0U);
+    return mips_sc_unlinkat(ctx, L2A_AT_FDCWD, path_va, 0U);
 }
 
 /* Lane U12 Provider A mutation hooks (src/vm/vm_file.c). */
@@ -781,7 +784,7 @@ int64_t mips_sc_symlinkat(mips64_ctx_t *ctx, uint64_t target_va,
                             sizeof full) != 0) {
         return l2a_ret(ctx, -(int64_t)ENAMETOOLONG);
     }
-    if (symlinkat(target, (int)dirfd, full) != 0) {
+    if (symlinkat(target, l2a_host_dirfd(dirfd), full) != 0) {
         return l2a_ret(ctx, -(int64_t)errno);
     }
     return l2a_ret(ctx, 0);
