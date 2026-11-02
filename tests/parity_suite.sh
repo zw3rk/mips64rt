@@ -10,8 +10,8 @@
 #     Hermetic, <30s, no Docker, no network, no qemu. Runs on Darwin and
 #     Linux with identical goldens:
 #       T0 host unit checks: test_mem_sites, check_host_contract,
-#          check_abi_invariants, test_decode, test_u0_fill_retry,
-#          test_u0_gate.
+#          check_abi_invariants, test_decode, test_r3_defects,
+#          test_u0_fill_retry, test_u0_gate.
 #       T1 static guests: test_p1_isa and test_p3_fp_simd for all 4 ABI
 #          variants (n64le, n64be, n32le, n32be) under --interp and --dbt,
 #          compared byte-for-bit against tests/golden/ (guest argv[0] is
@@ -172,6 +172,24 @@ if [ -x _build/test_decode ] || "$CC_HOST" -std=c11 -Werror=vla -pedantic -Wall 
 else
     _t0=$(parity_now_ms)
     parity_row "host" "$HOST_TAG" "test_decode" "host" "FAIL" "$(( $(parity_now_ms) - _t0 ))" "build failed"
+fi
+
+if [ -x _build/test_r3_defects ] || "$CC_HOST" -std=c11 -Werror=vla -pedantic -Wall -Wextra -Werror \
+    -pthread -Isrc tests/test_r3_defects.c src/interp/decode.c src/interp/interp.c \
+    src/interp/unaligned.c src/interp/fpmove.c src/interp/fp.c src/interp/fp_cvt.c \
+    src/interp/fp_ps.c src/os/mem.c src/os/mem_table.c src/os/backend_state.c \
+    src/os/proc.c src/os/syscalls.c src/os/syscalls_extra.c src/os/syscalls_sync.c \
+    src/os/syscalls_time.c src/os/syscalls_stat.c src/os/host_args.c src/os/quiesce.c \
+    src/os/signal_core.c src/vm/vm64.c src/vm/vm_file.c src/vm/vm_pages.c \
+    src/dbt/aot/sites.c src/dbt/a64_emit.c src/dbt/emit_enc.c src/dbt/emit_alu.c \
+    src/dbt/emit_mem.c src/dbt/emit_fpmem.c src/dbt/emit_int.c src/dbt/emit_fp.c \
+    src/dbt/arena.c src/dbt/dbt.c src/dbt/mem_recover.c src/dbt/trampoline_a64.S \
+    "$OS_BACKEND" tests/stubs_signal.c \
+    -o _build/test_r3_defects >/dev/null 2>&1; then
+    run_unit "test_r3_defects" ./_build/test_r3_defects
+else
+    _t0=$(parity_now_ms)
+    parity_row "host" "$HOST_TAG" "test_r3_defects" "host" "FAIL" "$(( $(parity_now_ms) - _t0 ))" "build failed"
 fi
 
 if [ -x _build/test_u0_fill_retry ] && [ -x _build/test_u0_gate ]; then

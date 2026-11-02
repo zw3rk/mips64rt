@@ -212,17 +212,84 @@ static void l2a_commit_guest_write(mips64_ctx_t *ctx, uint64_t va,
     mips_vm_file_shared_sync(ctx, va, n);
 }
 
+static void l2a_vec_free(uint8_t **kbuf, uint64_t n)
+{
+    uint64_t k;
+
+    for (k = 0U; k < n; k++) {
+        free(kbuf[k]);
+    }
+}
+
+static void l2a_vec_free_desc(struct iovec *hv, uint64_t *gva,
+                              uint64_t *glen, uint8_t **kbuf,
+                              uint64_t iovcnt)
+{
+    l2a_vec_free(kbuf, iovcnt);
+    if (iovcnt > 64U) {
+        free(hv);
+        free(gva);
+        free(glen);
+        free(kbuf);
+    }
+}
+
+/* Copy staged read bytes into guest destinations (R3-4): returns
+ * the committed byte count, or -EFAULT when nothing was committed.
+ * A later destination fault (mapping changed across the blocking
+ * host call) reports the bytes already committed instead of hiding
+ * them behind an error. Raw return (the caller applies l2a_ret). */
+int64_t l2a_vec_copyout(mips64_ctx_t *ctx, const uint64_t *gva,
+                        const uint64_t *glen, uint8_t **kbuf,
+                        uint64_t iovcnt, uint64_t nbytes)
+{
+    uint64_t rem = nbytes;
+    uint64_t committed = 0U;
+    uint64_t k;
+
+    for (k = 0U; k < iovcnt && rem > 0U; k++) {
+        uint64_t take = glen[k] < rem ? glen[k] : rem;
+
+        if (take == 0U) {
+            continue;
+        }
+        if (!mips_mem_ok(ctx, gva[k], take, MIPS_PROT_WRITE)) {
+            break;
+        }
+        l2a_commit_guest_write(ctx, gva[k], kbuf[k], take);
+        committed += take;
+        rem -= take;
+    }
+    if (rem > 0U) {
+        return committed != 0U ? (int64_t)committed : -(int64_t)EFAULT;
+    }
+    return (int64_t)(nbytes - rem);
+}
+
 /* Vectored I/O for readv/writev/preadv/pwritev. The MIPS iovec is
- * {base, len} in the ABI word size; entries stream to the host in
- * 64-entry chunks with the offset advanced, preserving short-count
- * semantics. Staging buffers allow releasing the quiescence lease
- * across blocking host I/O and revalidating guest mappings on copyout. */
+ * {base, len} in the ABI word size. The complete guest vector is
+ * imported and issued as a single host call (R3-3): splitting a
+ * 65-entry writev into two host calls would emit two datagrams and
+ * lose small-pipe-write atomicity. The L2A_IO_MAX cap applies to the
+ * aggregate request, not to each element. Staging buffers allow
+ * releasing the quiescence lease across the blocking host call;
+ * guest mappings are revalidated before copyout, and bytes already
+ * committed are reported when a later destination faults (R3-4). */
 int64_t mips_sc_vec(mips64_ctx_t *ctx, uint64_t fd, uint64_t iov_va,
                     uint64_t iovcnt, uint64_t off, int is_p, int is_write)
 {
-    uint64_t total = 0U;
-    uint64_t idx = 0U;
-    uint64_t cur = off;
+    struct iovec hv_st[64];
+    uint64_t gva_st[64];
+    uint64_t glen_st[64];
+    uint8_t *kbuf_st[64];
+    struct iovec *hv = hv_st;
+    uint64_t *gva = gva_st;
+    uint64_t *glen = glen_st;
+    uint8_t **kbuf = kbuf_st;
+    uint64_t want = 0U;
+    uint64_t k;
+    ssize_t rc;
+    int saved_err;
     int be = ctx->is_be != 0U;
     int n32 = ctx->is_n32 != 0U;
     uint64_t step = n32 ? 8U : 16U;
@@ -237,143 +304,92 @@ int64_t mips_sc_vec(mips64_ctx_t *ctx, uint64_t fd, uint64_t iov_va,
                       (uint32_t)MIPS_PROT_READ)) {
         return l2a_ret(ctx, -(int64_t)EFAULT);
     }
-    while (idx < iovcnt) {
-        struct iovec hv[64];
-        uint64_t gva[64];
-        uint64_t glen[64];
-        uint8_t *kbuf[64];
-        uint64_t n = iovcnt - idx;
-        uint64_t want = 0U;
-        uint64_t k;
-        ssize_t rc;
-        int saved_err;
-
-        if (n > 64U) {
-            n = 64U;
+    if (iovcnt > 64U) {
+        hv = (struct iovec *)calloc((size_t)iovcnt, sizeof *hv);
+        gva = (uint64_t *)calloc((size_t)iovcnt, sizeof *gva);
+        glen = (uint64_t *)calloc((size_t)iovcnt, sizeof *glen);
+        kbuf = (uint8_t **)calloc((size_t)iovcnt, sizeof *kbuf);
+        if (hv == NULL || gva == NULL || glen == NULL || kbuf == NULL) {
+            free(hv);
+            free(gva);
+            free(glen);
+            free(kbuf);
+            return l2a_ret(ctx, -(int64_t)ENOMEM);
         }
-        if (!mips_mem_ok(ctx, iov_va + idx * step, n * step,
-                         (uint32_t)MIPS_PROT_READ)) {
-            return total != 0U ? l2a_ret(ctx, (int64_t)total)
-                               : l2a_ret(ctx, -(int64_t)EFAULT);
-        }
-        memset(kbuf, 0, sizeof kbuf);
-        for (k = 0U; k < n; k++) {
-            const uint8_t *e = (const uint8_t *)mips64_guest_ptr(
-                ctx, iov_va + (idx + k) * step);
-            uint64_t base;
-            uint64_t len;
-
-            if (n32) {
-                base = getn(e, 4, be);
-                len = getn(e + 4, 4, be);
-            } else {
-                base = getn(e, 8, be);
-                len = getn(e + 8, 8, be);
-            }
-            if (len > L2A_IO_MAX) {
-                len = L2A_IO_MAX;
-            }
-            gva[k] = base;
-            glen[k] = len;
-            hv[k].iov_len = (size_t)len;
-            hv[k].iov_base = NULL;
-            if (len == 0U) {
-                continue;
-            }
-            if (!mips_mem_ok(ctx, base, len,
-                             is_write ? MIPS_PROT_READ : MIPS_PROT_WRITE)) {
-                uint64_t j;
-                for (j = 0U; j < k; j++) {
-                    free(kbuf[j]);
-                }
-                return total != 0U ? l2a_ret(ctx, (int64_t)total)
-                                   : l2a_ret(ctx, -(int64_t)EFAULT);
-            }
-            kbuf[k] = (uint8_t *)malloc((size_t)len);
-            if (kbuf[k] == NULL) {
-                uint64_t j;
-                for (j = 0U; j < k; j++) {
-                    free(kbuf[j]);
-                }
-                return total != 0U ? l2a_ret(ctx, (int64_t)total)
-                                   : l2a_ret(ctx, -(int64_t)ENOMEM);
-            }
-            if (is_write != 0) {
-                memcpy(kbuf[k], mips64_guest_ptr(ctx, base), (size_t)len);
-            }
-            hv[k].iov_base = kbuf[k];
-            want += len;
-        }
-        mips_qs_lease_exit(ctx);
-        if (is_p) {
-            rc = is_write ? pwritev((int)fd, hv, (int)n, (off_t)cur) :
-                            preadv((int)fd, hv, (int)n, (off_t)cur);
-        } else {
-            rc = is_write ? writev((int)fd, hv, (int)n) :
-                            readv((int)fd, hv, (int)n);
-        }
-        saved_err = errno;
-        mips_qs_lease_enter(ctx);
-        if (rc < 0) {
-            for (k = 0U; k < n; k++) {
-                free(kbuf[k]);
-            }
-            if (total != 0U) {
-                if (is_write != 0) {
-                    if (is_p != 0) {
-                        mips_vm_file_post_write(ctx, (int)fd, off,
-                                                total);
-                    } else {
-                        mips_vm_file_post_write_seq(ctx, (int)fd,
-                                                    total);
-                    }
-                }
-                return l2a_ret(ctx, (int64_t)total);
-            }
-            return l2a_ret(ctx, -(int64_t)saved_err);
-        }
-        if (rc > 0 && is_write == 0) {
-            uint64_t rem = (uint64_t)rc;
-            int fault = 0;
-
-            for (k = 0U; k < n && rem > 0U; k++) {
-                uint64_t take = glen[k] < rem ? glen[k] : rem;
-                if (take == 0U) {
-                    continue;
-                }
-                if (!mips_mem_ok(ctx, gva[k], take, MIPS_PROT_WRITE)) {
-                    fault = 1;
-                    break;
-                }
-                l2a_commit_guest_write(ctx, gva[k], kbuf[k], take);
-                rem -= take;
-            }
-            if (fault != 0) {
-                for (k = 0U; k < n; k++) {
-                    free(kbuf[k]);
-                }
-                return total != 0U ? l2a_ret(ctx, (int64_t)total)
-                                   : l2a_ret(ctx, -(int64_t)EFAULT);
-            }
-        }
-        for (k = 0U; k < n; k++) {
-            free(kbuf[k]);
-        }
-        total += (uint64_t)rc;
-        cur += (uint64_t)rc;
-        idx += n;
-        if ((uint64_t)rc < want || rc == 0) {
-            break;
-        }
+    } else {
+        memset(kbuf_st, 0, sizeof kbuf_st);
     }
-    if (total != 0U && is_write != 0) {
+    for (k = 0U; k < iovcnt; k++) {
+        const uint8_t *e = (const uint8_t *)mips64_guest_ptr(
+            ctx, iov_va + k * step);
+        uint64_t base;
+        uint64_t len;
+
+        if (n32) {
+            base = getn(e, 4, be);
+            len = getn(e + 4, 4, be);
+        } else {
+            base = getn(e, 8, be);
+            len = getn(e + 8, 8, be);
+        }
+        if (want >= L2A_IO_MAX) {
+            len = 0U;
+        } else if (len > L2A_IO_MAX - want) {
+            len = L2A_IO_MAX - want;
+        }
+        gva[k] = base;
+        glen[k] = len;
+        hv[k].iov_len = (size_t)len;
+        hv[k].iov_base = NULL;
+        if (len == 0U) {
+            continue;
+        }
+        if (!mips_mem_ok(ctx, base, len,
+                         is_write ? MIPS_PROT_READ : MIPS_PROT_WRITE)) {
+            l2a_vec_free_desc(hv, gva, glen, kbuf, iovcnt);
+            return l2a_ret(ctx, -(int64_t)EFAULT);
+        }
+        kbuf[k] = (uint8_t *)malloc((size_t)len);
+        if (kbuf[k] == NULL) {
+            l2a_vec_free_desc(hv, gva, glen, kbuf, iovcnt);
+            return l2a_ret(ctx, -(int64_t)ENOMEM);
+        }
+        if (is_write != 0) {
+            memcpy(kbuf[k], mips64_guest_ptr(ctx, base), (size_t)len);
+        }
+        hv[k].iov_base = kbuf[k];
+        want += len;
+    }
+    mips_qs_lease_exit(ctx);
+    if (is_p) {
+        rc = is_write ? pwritev((int)fd, hv, (int)iovcnt, (off_t)off) :
+                        preadv((int)fd, hv, (int)iovcnt, (off_t)off);
+    } else {
+        rc = is_write ? writev((int)fd, hv, (int)iovcnt) :
+                        readv((int)fd, hv, (int)iovcnt);
+    }
+    saved_err = errno;
+    mips_qs_lease_enter(ctx);
+    if (rc < 0) {
+        l2a_vec_free_desc(hv, gva, glen, kbuf, iovcnt);
+        return l2a_ret(ctx, -(int64_t)saved_err);
+    }
+    if (rc > 0 && is_write == 0) {
+        int64_t cr = l2a_vec_copyout(ctx, gva, glen, kbuf, iovcnt,
+                                     (uint64_t)rc);
+
+        l2a_vec_free_desc(hv, gva, glen, kbuf, iovcnt);
+        return l2a_ret(ctx, cr);
+    }
+    l2a_vec_free_desc(hv, gva, glen, kbuf, iovcnt);
+    if (rc > 0 && is_write != 0) {
         if (is_p != 0) {
-            mips_vm_file_post_write(ctx, (int)fd, off, total);
+            mips_vm_file_post_write(ctx, (int)fd, off, (uint64_t)rc);
         } else {
-            mips_vm_file_post_write_seq(ctx, (int)fd, total);
+            mips_vm_file_post_write_seq(ctx, (int)fd, (uint64_t)rc);
         }
     }
-    return l2a_ret(ctx, (int64_t)total);
+    return l2a_ret(ctx, (int64_t)rc);
 }
 
 /* Scalar read/write and pread64/pwrite64: stage through a temporary

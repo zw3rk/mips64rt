@@ -81,6 +81,10 @@
 extern int mips_mem_ok(const mips64_ctx_t *ctx, uint64_t va, uint64_t len,
                        uint32_t need);
 
+/* Serialized copyout (owned by src/os/syscalls.c, lane L2a). */
+extern int64_t mips_sc_copyout(mips64_ctx_t *ctx, uint64_t va,
+                               const void *src, uint64_t len);
+
 /* Process-global region table walk (owned by src/os/mem_table.c). */
 extern size_t mips_mem_region_count(void);
 extern int mips_mem_region_at(size_t idx, uint64_t *start, uint64_t *end,
@@ -468,7 +472,6 @@ long mips_proc_open(const char *guest_path, uint64_t flags)
 long mips_proc_readlink(const char *guest_path, uint64_t buf_va,
                         uint64_t bufsiz)
 {
-    uint8_t *dst;
     size_t len;
 
     if (proc_self_kind(guest_path) != 1) {
@@ -480,14 +483,15 @@ long mips_proc_readlink(const char *guest_path, uint64_t buf_va,
     if (proc_ctx == NULL) {
         return -(long)EFAULT;
     }
-    if (!mips_mem_ok(proc_ctx, buf_va, bufsiz, (uint32_t)MIPS_PROT_WRITE)) {
-        return -(long)EFAULT;
-    }
-    dst = (uint8_t *)mips64_guest_ptr(proc_ctx, buf_va);
     len = proc_cstr_len(proc_exe);
     if (len > (size_t)bufsiz) {
         len = (size_t)bufsiz;
     }
-    memcpy(dst, proc_exe, len);
+    /* The noted context is genuinely mutable here (the store clears
+     * the LL bit per E05); commit under sc_lock (R3-1). */
+    if (mips_sc_copyout((mips64_ctx_t *)proc_ctx, buf_va, proc_exe,
+                        (uint64_t)len) != 0) {
+        return -(long)EFAULT;
+    }
     return (long)len;
 }

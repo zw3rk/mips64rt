@@ -65,6 +65,7 @@ BOOT_COMMON := src/main.c \
 	src/os/proc.c \
 	src/os/syscall_min.c \
 	src/os/syscalls.c \
+	src/os/syscalls_extra.c \
 	src/os/syscalls_stat.c \
 	src/os/syscalls_sync.c \
 	src/os/syscalls_time.c \

@@ -5,13 +5,14 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * Byte-granular LWL/LWR/SWL/SWR merge rules (32-bit, result
- * sign-extended) and LDL/LDR/SDL/SDR merge rules (64-bit). Spans follow
- * the E02 tables: LDL/SDL take the right span mem[addr..pa+7], LDR/SDR
- * the left span mem[pa..addr]; placement into rt is endian-natural, so
- * the canonical (0,7) pair round-trips on every variant (manual-correct
- * on all four, per the RC-E adjudication in experiments/E02 — never the
- * qemu-mips64el/mipsn32el swapped-role behavior). LL/SC/LLD/SCD follow
- * E05 (exact-address reservation in llbit/lladdr/llval).
+ * sign-extended) and LDL/LDR/SDL/SDR merge rules (64-bit). LDL/LDR
+ * spans are endian-specific: on LE, LDL takes mem[pa..pa+k] into the
+ * HIGH bytes of rt and LDR takes mem[pa+k..pa+7] into the LOW bytes;
+ * on BE the spans swap (LDL takes mem[pa+k..pa+7] into HIGH, LDR
+ * takes mem[pa..pa+k] into LOW). The LE canonical pair does not
+ * compose a full doubleword (architectural, matches qemu-LE).
+ * LL/SC/LLD/SCD follow E05 (exact-address reservation in
+ * llbit/lladdr/llval).
  *
  * This file also hosts interp_exec_mem, the aligned load/store
  * dispatcher that shares the helpers above (keeps interp.c under the

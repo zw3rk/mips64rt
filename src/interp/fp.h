@@ -53,7 +53,6 @@ float fp_bits_f(uint32_t u);
 void fp_put_s(mips64_ctx_t *ctx, unsigned fd, uint32_t v);
 void fp_put_d(mips64_ctx_t *ctx, unsigned fd, uint64_t v);
 unsigned fp_rm(const mips64_ctx_t *ctx);
-double fp_adj_d(double r, long double q, unsigned rm);
 float fp_adj_f(float r, long double q, unsigned rm);
 long double fp_rne_q(long double q);
 

@@ -43,7 +43,7 @@
 
 /* dup2 plus FD_CLOEXEC (stands in for dup3(2)). Returns the new fd
  * or -1 with errno set. */
-static int l2a_dup_cloexec(int oldfd, int newfd, int cloexec)
+static inline int l2a_dup_cloexec(int oldfd, int newfd, int cloexec)
 {
     int rc = dup2(oldfd, newfd);
 
@@ -56,7 +56,7 @@ static int l2a_dup_cloexec(int oldfd, int newfd, int cloexec)
 /* pipe(2) plus fcntl for O_CLOEXEC/O_NONBLOCK (stands in for
  * pipe2(2)). `hflags` carries only those two bits; anything else was
  * declined by the caller. Returns 0 or -1 with errno set. */
-static int l2a_pipe_flags(int fds[2], int hflags)
+static inline int l2a_pipe_flags(int fds[2], int hflags)
 {
     if (pipe(fds) != 0) {
         return -1;
@@ -78,7 +78,7 @@ static int l2a_pipe_flags(int fds[2], int hflags)
  * EBADF holes are skipped; the first other errno wins. Returns 0 or
  * -(errno). Compiled wherever the direct call is unavailable. */
 #if !defined(__linux__) || !defined(SYS_close_range)
-static int64_t l2a_close_range_loop(uint64_t first, uint64_t last)
+static inline int64_t l2a_close_range_loop(uint64_t first, uint64_t last)
 {
     uint64_t f;
     int64_t rc = 0;
@@ -95,7 +95,7 @@ static int64_t l2a_close_range_loop(uint64_t first, uint64_t last)
 /* getentropy(2) stream over `len` bytes (stands in for getrandom(2);
  * getentropy caps at 256 bytes per call). Returns (int64_t)len or
  * -(errno). */
-static int64_t l2a_getentropy_fill(uint8_t *p, size_t len)
+static inline int64_t l2a_getentropy_fill(uint8_t *p, size_t len)
 {
     size_t off = 0u;
 
@@ -113,7 +113,7 @@ static int64_t l2a_getentropy_fill(uint8_t *p, size_t len)
 /* Relative CLOCK_REALTIME sleep via nanosleep(2) (stands in for
  * clock_nanosleep(2)). Absolute sleeps and other clocks are -EINVAL.
  * Returns the raw nanosleep result (0/-1 with errno set). */
-static int64_t l2a_clock_sleep_fallback(uint64_t clk, uint64_t flags,
+static inline int64_t l2a_clock_sleep_fallback(uint64_t clk, uint64_t flags,
                                         const struct timespec *rq,
                                         struct timespec *remp)
 {
@@ -131,7 +131,7 @@ static int64_t l2a_clock_sleep_fallback(uint64_t clk, uint64_t flags,
 
 /* Portable thread id (mirrors src/os/threads.c): the host tid on
  * Linux, the pid elsewhere. */
-static int64_t l2a_host_tid(void)
+static inline int64_t l2a_host_tid(void)
 {
 #if defined(__linux__) && defined(SYS_gettid)
     return (int64_t)gettid();
@@ -143,7 +143,7 @@ static int64_t l2a_host_tid(void)
 /* close_range(2) where it exists, linear close elsewhere (any flag is
  * declined off Linux: CLOEXEC/UNSHARE cannot be honored). Returns the
  * l2a_ret-ready value (0/rc or -(errno)). */
-static int64_t l2a_close_range_host(uint64_t first, uint64_t last,
+static inline int64_t l2a_close_range_host(uint64_t first, uint64_t last,
                                     uint64_t flags)
 {
 #if defined(__linux__) && defined(SYS_close_range)
@@ -165,7 +165,7 @@ static int64_t l2a_close_range_host(uint64_t first, uint64_t last,
 /* getdents64(2) where it exists, -ENOSYS elsewhere (mirrors
  * src/os/futex.c: the blocking path reports -ENOSYS off Linux).
  * Returns the byte count or -1 with errno set. */
-static long l2a_getdents64_host(int fd, uint8_t *p, size_t count)
+static inline long l2a_getdents64_host(int fd, uint8_t *p, size_t count)
 {
 #if defined(__linux__) && defined(SYS_getdents64)
     return syscall(SYS_getdents64, fd, p, count);

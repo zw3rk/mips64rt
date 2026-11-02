@@ -131,6 +131,8 @@ uint64_t getn(const uint8_t *p, unsigned n, int be)
 extern void mips_vm_file_shared_sync(mips64_ctx_t *ctx, uint64_t va,
                                      uint64_t len);
 extern void mips_llsc_note_write(uint64_t addr, uint64_t size);
+extern void mips_llsc_write_lock(void);
+extern void mips_llsc_write_unlock(void);
 extern void mips_qs_lease_enter(mips64_ctx_t *ctx);
 extern void mips_qs_lease_exit(mips64_ctx_t *ctx);
 #define G_SYNC_MAX 64U
@@ -142,6 +144,36 @@ void mips_guest_range_flush(mips64_ctx_t *ctx)
     for (unsigned i = 0U; i < g_sync_cnt; i++)
         mips_vm_file_shared_sync(ctx, g_sync_va[i], g_sync_len[i]);
     g_sync_cnt = 0U;
+}
+
+/* Serialized syscall copyout (R3-1): the caller stages the output in
+ * host memory first — never holding sc_lock across a blocking host
+ * call — then commits guest bytes and LL/SC invalidation together
+ * under sc_lock, so a peer LL/SC pair observes either all or none of
+ * the bytes (same-value writes included). Mirrors the guest_st*
+ * discipline in src/os/mem.c. Returns 0, or -EFAULT when the range
+ * fails revalidation (nothing committed). */
+int64_t mips_sc_copyout(mips64_ctx_t *ctx, uint64_t va, const void *src,
+                        uint64_t len)
+{
+    if (ctx == NULL || src == NULL) {
+        return -(int64_t)EFAULT;
+    }
+    if (len == 0U) {
+        return 0;
+    }
+    if (!mips_mem_ok(ctx, va, len, (uint32_t)MIPS_PROT_WRITE)) {
+        return -(int64_t)EFAULT;
+    }
+    mips_llsc_write_lock();
+    memcpy(mips64_guest_ptr(ctx, va), src, (size_t)len);
+    mips_llsc_note_write(va, len);
+    mips_llsc_write_unlock();
+    mips_vm_pages_clear(va, len, (unsigned)MIPS_VM_PAGE_COW_CLEAN);
+    mips_vm_pages_retire_code(va, len);
+    mips_vm_file_shared_sync(ctx, va, len);
+    ctx->llbit = 0U; /* E05: an ordinary store clears the reservation */
+    return 0;
 }
 
 uint8_t *guest_range(mips64_ctx_t *ctx, uint64_t va, uint64_t len, int write)
@@ -432,10 +464,11 @@ int64_t mips_sc_pipe2(mips64_ctx_t *ctx, uint64_t fds_va, uint64_t flags)
 {
     const uint64_t allowed = (uint64_t)(MIPS_O_CLOEXEC | MIPS_O_NONBLOCK |
         MIPS_O_DIRECT);
-    uint8_t *p;
+    uint8_t img[8];
     int hflags = 0;
     size_t i;
     int fds[2];
+    int be;
 
     if ((flags & ~allowed) != 0U) {
         return l2a_ret(ctx, -(int64_t)EINVAL);
@@ -445,10 +478,7 @@ int64_t mips_sc_pipe2(mips64_ctx_t *ctx, uint64_t fds_va, uint64_t flags)
             hflags |= l2a_oflags[i].hf;
         }
     }
-    p = guest_range(ctx, fds_va, 8U, 1);
-    if (p == NULL) {
-        return l2a_ret(ctx, -(int64_t)EFAULT);
-    }
+    be = ctx->is_be != 0U;
 #if defined(__linux__)
     if (pipe2(fds, hflags) != 0) {
         return l2a_ret(ctx, -(int64_t)errno);
@@ -461,9 +491,14 @@ int64_t mips_sc_pipe2(mips64_ctx_t *ctx, uint64_t fds_va, uint64_t flags)
         return l2a_ret(ctx, -(int64_t)errno);
     }
 #endif
-    putn(p, (uint64_t)(uint32_t)fds[0], 4, ctx->is_be != 0U);
-    putn(p + 4, (uint64_t)(uint32_t)fds[1], 4, ctx->is_be != 0U);
-    mips_llsc_note_write(fds_va, 8U);
+    /* Stage in host memory, then commit under sc_lock (R3-1). */
+    putn(img, (uint64_t)(uint32_t)fds[0], 4, be);
+    putn(img + 4, (uint64_t)(uint32_t)fds[1], 4, be);
+    if (mips_sc_copyout(ctx, fds_va, img, sizeof img) != 0) {
+        close(fds[0]);
+        close(fds[1]);
+        return l2a_ret(ctx, -(int64_t)EFAULT);
+    }
     return l2a_ret(ctx, 0);
 }
 
@@ -498,7 +533,8 @@ int64_t mips_sc_readlinkat(mips64_ctx_t *ctx, uint64_t dirfd,
                            uint64_t path_va, uint64_t buf_va, uint64_t size)
 {
     char path[L2A_PATH_MAX + 1U];
-    uint8_t *p;
+    uint8_t zero = 0U;
+    uint8_t *stage = &zero;
     int64_t rc = guest_str(ctx, path_va, path);
     ssize_t n;
 
@@ -513,24 +549,43 @@ int64_t mips_sc_readlinkat(mips64_ctx_t *ctx, uint64_t dirfd,
             return l2a_ret(ctx, (int64_t)linkn);
         }
     }
-    p = guest_range(ctx, buf_va, size, 1);
-    if (size != 0U && p == NULL) {
-        return l2a_ret(ctx, -(int64_t)EFAULT);
+    if (size != 0U) {
+        if (!mips_mem_ok(ctx, buf_va, size,
+                         (uint32_t)MIPS_PROT_WRITE)) {
+            return l2a_ret(ctx, -(int64_t)EFAULT);
+        }
+        stage = (uint8_t *)malloc((size_t)size);
+        if (stage == NULL) {
+            return l2a_ret(ctx, -(int64_t)ENOMEM);
+        }
     }
     {
         char full[L2A_PATH_MAX + MIPS64RT_HOST_ARGS_PATH_MAX + 2U];
 
         if (mips64_sysroot_join(mips64_host_sysroot(), path, full,
                                sizeof full) != 0) {
+            if (stage != &zero) {
+                free(stage);
+            }
             return l2a_ret(ctx, -(int64_t)ENAMETOOLONG);
         }
-        n = readlinkat(l2a_host_dirfd(dirfd), full, (char *)p,
+        n = readlinkat(l2a_host_dirfd(dirfd), full, (char *)stage,
                        (size_t)size);
     }
     if (n < 0) {
+        if (stage != &zero) {
+            free(stage);
+        }
         return l2a_ret(ctx, -(int64_t)errno);
     }
-    mips_llsc_note_write(buf_va, size);
+    /* Commit only the bytes the host produced, under sc_lock (R3-1). */
+    if (stage != &zero) {
+        rc = mips_sc_copyout(ctx, buf_va, stage, (uint64_t)n);
+        free(stage);
+        if (rc != 0) {
+            return l2a_ret(ctx, -(int64_t)EFAULT);
+        }
+    }
     return l2a_ret(ctx, (int64_t)n);
 }
 
@@ -619,7 +674,8 @@ static uint64_t l2a_rand_calls;
 int64_t mips_sc_getrandom(mips64_ctx_t *ctx, uint64_t buf_va, uint64_t len,
                           uint64_t flags)
 {
-    uint8_t *p;
+    uint8_t zero = 0U;
+    uint8_t *stage = &zero;
 #if defined(__linux__)
     ssize_t n;
 #endif
@@ -637,9 +693,15 @@ int64_t mips_sc_getrandom(mips64_ctx_t *ctx, uint64_t buf_va, uint64_t len,
         return l2a_ret(ctx, -(int64_t)EINVAL);
     }
 #endif
-    p = guest_range(ctx, buf_va, len, 1);
-    if (len != 0U && p == NULL) {
-        return l2a_ret(ctx, -(int64_t)EFAULT);
+    if (len != 0U) {
+        if (!mips_mem_ok(ctx, buf_va, len,
+                         (uint32_t)MIPS_PROT_WRITE)) {
+            return l2a_ret(ctx, -(int64_t)EFAULT);
+        }
+        stage = (uint8_t *)malloc((size_t)len);
+        if (stage == NULL) {
+            return l2a_ret(ctx, -(int64_t)ENOMEM);
+        }
     }
     if (env != NULL && env[0] != '\0') {
         uint64_t s = (uint64_t)strtoull(env, NULL, 0) +
@@ -652,70 +714,60 @@ int64_t mips_sc_getrandom(mips64_ctx_t *ctx, uint64_t buf_va, uint64_t len,
             s ^= s << 13;
             s ^= s >> 7;
             s ^= s << 17;
-            p[i] = (uint8_t)s;
+            stage[i] = (uint8_t)s;
         }
-        mips_llsc_note_write(buf_va, len);
+        /* The deterministic stream fills the whole range; commit
+         * it under sc_lock (R3-1). */
+        if (stage != &zero) {
+            if (mips_sc_copyout(ctx, buf_va, stage, len) != 0) {
+                free(stage);
+                return l2a_ret(ctx, -(int64_t)EFAULT);
+            }
+            free(stage);
+        }
         return l2a_ret(ctx, (int64_t)len);
     }
 #if defined(__linux__)
-    n = getrandom(p, (size_t)len, (unsigned)flags);
+    n = getrandom(stage, (size_t)len, (unsigned)flags);
     if (n < 0) {
+        if (stage != &zero) {
+            free(stage);
+        }
         return l2a_ret(ctx, -(int64_t)errno);
     }
-    mips_llsc_note_write(buf_va, len);
+    /* Commit only the bytes the host produced, under sc_lock (R3-1). */
+    if (stage != &zero) {
+        int64_t cr = mips_sc_copyout(ctx, buf_va, stage, (uint64_t)n);
+
+        free(stage);
+        if (cr != 0) {
+            return l2a_ret(ctx, -(int64_t)EFAULT);
+        }
+    }
     return l2a_ret(ctx, (int64_t)n);
 #else
     {
-        int64_t gn = l2a_getentropy_fill(p, (size_t)len);
+        int64_t gn = l2a_getentropy_fill(stage, (size_t)len);
 
-        mips_llsc_note_write(buf_va, len);
+        if (stage != &zero) {
+            if (gn >= 0 &&
+                mips_sc_copyout(ctx, buf_va, stage, (uint64_t)gn) != 0) {
+                free(stage);
+                return l2a_ret(ctx, -(int64_t)EFAULT);
+            }
+            free(stage);
+        }
         return l2a_ret(ctx, gn);
     }
 #endif
 }
 
-/* getdents64 records are arch-independent; only BE guests need a
- * fixup walk over the host fill. */
-int64_t mips_sc_getdents64(mips64_ctx_t *ctx, uint64_t fd, uint64_t dirp_va,
-                           uint64_t count)
-{
-    uint8_t *p;
-    long n;
-
-    if (count == 0U) {
-        return l2a_ret(ctx, -(int64_t)EINVAL);
-    }
-    p = guest_range(ctx, dirp_va, count, 1);
-    if (p == NULL) {
-        return l2a_ret(ctx, -(int64_t)EFAULT);
-    }
-    n = l2a_getdents64_host((int)fd, p, (size_t)count);
-    if (n < 0) {
-        return l2a_ret(ctx, -(int64_t)errno);
-    }
-    if (n > 0 && ctx->is_be != 0U) {
-        int64_t off = 0;
-
-        while (off + 19 <= n) {
-            uint64_t reclen = getn(p + off + 16, 2, 0);
-
-            if (reclen < 19U || off + (int64_t)reclen > n) {
-                break;
-            }
-            putn(p + off, getn(p + off, 8, 0), 8, 1);
-            putn(p + off + 8, getn(p + off + 8, 8, 0), 8, 1);
-            putn(p + off + 16, reclen, 2, 1);
-            off += (int64_t)reclen;
-        }
-    }
-    mips_llsc_note_write(dirp_va, count);
-    return l2a_ret(ctx, (int64_t)n);
-}
-
-/* Lane H2 helpers (unlink/truncate/ftruncate/symlinkat/clock_getres/
- * clock_nanosleep): same l2a_ret/guest_str/sysroot/putn conventions.
- * Dispatch arms live in syscall_min.c (RC-H wires them). N32 fcntl64
- * stays -ENOSYS (needs a frozen syscall_nr.h number). */
+/* Lane H2 helpers (unlink/truncate/ftruncate/symlinkat): same
+ * l2a_ret/guest_str/sysroot conventions. getdents64, clock_getres,
+ * and clock_nanosleep live in src/os/syscalls_extra.c (line-limit
+ * split, same staged-copyout discipline). Dispatch arms live in
+ * syscall_min.c (RC-H wires them). N32 fcntl64 stays -ENOSYS (needs
+ * a frozen syscall_nr.h number). */
 
 /* Legacy unlink(2) (N64 5085 / N32 6085): unlinkat(AT_FDCWD).
  * glibc unlink() still emits the legacy number (qemu-observed). */
@@ -791,104 +843,5 @@ int64_t mips_sc_symlinkat(mips64_ctx_t *ctx, uint64_t target_va,
     return l2a_ret(ctx, 0);
 }
 
-/* clock_getres (N64 5223 / N32 6227): same timespec write layout as
- * the clock family in src/os/syscalls_time.c (16-byte N64/time64,
- * 8-byte N32 {s32, s32} pair). */
-int64_t mips_sc_clock_getres(mips64_ctx_t *ctx, uint64_t clk,
-                             uint64_t ts_va, int is64)
-{
-    struct timespec ts;
-    uint8_t *p;
-    int be;
-
-    if (clock_getres((clockid_t)(int)clk, &ts) != 0) {
-        return l2a_ret(ctx, -(int64_t)errno);
-    }
-    p = guest_range(ctx, ts_va, is64 ? 16U : 8U, 1);
-    if (p == NULL) {
-        return l2a_ret(ctx, -(int64_t)EFAULT);
-    }
-    be = ctx->is_be != 0U;
-    if (is64) {
-        putn(p, (uint64_t)(int64_t)ts.tv_sec, 8, be);
-        putn(p + 8, (uint64_t)(int64_t)ts.tv_nsec, 8, be);
-    } else {
-        putn(p, (uint64_t)(uint32_t)(int32_t)ts.tv_sec, 4, be);
-        putn(p + 4, (uint64_t)(uint32_t)(int32_t)ts.tv_nsec, 4, be);
-    }
-    mips_llsc_note_write(ts_va, is64 ? 16U : 8U);
-    return l2a_ret(ctx, 0);
-}
-
-/* clock_nanosleep with the true 4-arg ABI (clk, flags, req, rem)
- * (N64 5224 / N32 6228, N32 time64 6407). */
-int64_t mips_sc_clock_nanosleep(mips64_ctx_t *ctx, uint64_t clk,
-                                uint64_t flags, uint64_t req_va,
-                                uint64_t rem_va, int is64)
-{
-    struct timespec rq;
-    struct timespec rm;
-    struct timespec *remp = NULL;
-    uint8_t *p;
-    int64_t rc;
-    int be;
-    int saved_err;
-
-    if ((flags & ~(uint64_t)TIMER_ABSTIME) != 0U) {
-        return l2a_ret(ctx, -(int64_t)EINVAL);
-    }
-    p = guest_range(ctx, req_va, is64 ? 16U : 8U, 0);
-    if (p == NULL) {
-        return l2a_ret(ctx, -(int64_t)EFAULT);
-    }
-    be = ctx->is_be != 0U;
-    if (is64) {
-        rq.tv_sec = (time_t)getn(p, 8, be);
-        rq.tv_nsec = (long)getn(p + 8, 8, be);
-    } else {
-        rq.tv_sec = (time_t)(int32_t)getn(p, 4, be);
-        rq.tv_nsec = (long)(int32_t)getn(p + 4, 4, be);
-    }
-    if (rem_va != 0U) {
-        if (guest_range(ctx, rem_va, is64 ? 16U : 8U, 1) == NULL) {
-            return l2a_ret(ctx, -(int64_t)EFAULT);
-        }
-        remp = &rm;
-    }
-    if (rq.tv_nsec < 0 || rq.tv_nsec >= 1000000000L) {
-        return l2a_ret(ctx, -(int64_t)EINVAL);
-    }
-    mips_qs_lease_exit(ctx);
-#if defined(__linux__)
-    rc = (int64_t)clock_nanosleep((clockid_t)(int)clk, (int)flags, &rq,
-                                  remp);
-    saved_err = (int)rc;
-#else
-    rc = l2a_clock_sleep_fallback(clk, flags, &rq, remp);
-    saved_err = errno;
-#endif
-    mips_qs_lease_enter(ctx);
-    if (rc != 0) {
-        rc = -(int64_t)saved_err;
-        if (remp != NULL && saved_err == EINTR) {
-            uint8_t *q = guest_range(ctx, rem_va, is64 ? 16U : 8U, 1);
-
-            if (q != NULL) {
-                if (is64) {
-                    putn(q, (uint64_t)(int64_t)remp->tv_sec, 8, be);
-                    putn(q + 8, (uint64_t)(int64_t)remp->tv_nsec,
-                         8, be);
-                } else {
-                    putn(q, (uint64_t)(uint32_t)(int32_t)remp->tv_sec,
-                         4, be);
-                    putn(q + 4,
-                         (uint64_t)(uint32_t)(int32_t)remp->tv_nsec,
-                         4, be);
-                }
-                mips_llsc_note_write(rem_va, is64 ? 16U : 8U);
-            }
-        }
-        return l2a_ret(ctx, rc);
-    }
-    return l2a_ret(ctx, 0);
-}
+/* getdents64, clock_getres, and clock_nanosleep live in
+ * src/os/syscalls_extra.c (line-limit split). */

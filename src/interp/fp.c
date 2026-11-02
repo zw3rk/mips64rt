@@ -277,31 +277,6 @@ void fp_put_d(mips64_ctx_t *ctx, unsigned fd, uint64_t v)
     ctx->fpr[fd] = v;
 }
 
-/* Adjust a correctly-rounded-to-nearest host result r toward the exact
- * value q (quad, exactly computed) under rounding mode rm. Returns r
- * unchanged for RN or when r already matches q. Overflow/underflow land
- * here naturally: r = +-Inf or +-0 is compared against the finite q. */
-double fp_adj_d(double r, long double q, unsigned rm)
-{
-    long double lr;
-
-    if (rm == 0u) {
-        return r;
-    }
-    lr = (long double)r;
-    if (lr == q) {
-        return r;
-    }
-    switch (rm) {
-    case 1u: /* toward zero: step in when r overshoots in magnitude */
-        return (fabsl(q) < fabsl(lr)) ? nextafter(r, 0.0) : r;
-    case 2u: /* toward +inf: step up when r is below the true value */
-        return (q > lr) ? nextafter(r, INFINITY) : r;
-    default: /* toward -inf: step down when r is above the true value */
-        return (q < lr) ? nextafter(r, -INFINITY) : r;
-    }
-}
-
 float fp_adj_f(float r, long double q, unsigned rm)
 {
     long double lr;
@@ -691,6 +666,19 @@ static int fp_arith(mips64_ctx_t *ctx, const mips_dec_t *d, unsigned is_s)
                 fp_put_s(ctx, fd, fp_f_bits(-0.0f));
                 return 0;
             }
+        }
+        if (d->funct == 0x00u || d->funct == 0x01u) {
+            /* ADD.S/SUB.S exact residual (R3-2): the binary64 sum is
+             * the exact reference, except when the small operand is
+             * absorbed (qd == da, b != 0) — then the residual carries
+             * the small operand's sign, one long-double ulp past r. */
+            double sb = (d->funct == 0x01u) ? -(double)b : (double)b;
+            double qd = (double)a + sb;
+
+            q = (qd == (double)a && sb != 0.0) ?
+                nextafterl((long double)r,
+                           sb > 0.0 ? INFINITY : -INFINITY) :
+                (long double)qd;
         }
         {
             float rf = fp_adj_f(r, q, rm);
