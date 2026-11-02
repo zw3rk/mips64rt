@@ -295,6 +295,10 @@ static uint64_t g_llsc_epoch[LLSC_BUCKETS];
 
 static void sc_lock_acquire(void)
 {
+    if (g_sc_held > 0) {
+        g_sc_held++;
+        return;
+    }
     mips_qs_block_preempt(&g_sc_preempt_saved);
     while (__atomic_test_and_set(&sc_lock, __ATOMIC_ACQUIRE) != 0) {
     }
@@ -303,9 +307,41 @@ static void sc_lock_acquire(void)
 
 static void sc_lock_release(void)
 {
+    if (g_sc_held > 1) {
+        g_sc_held--;
+        return;
+    }
     g_sc_held = 0;
     __atomic_clear(&sc_lock, __ATOMIC_RELEASE);
     mips_qs_unblock_preempt(&g_sc_preempt_saved);
+}
+
+void mips_llsc_write_lock(void)
+{
+    sc_lock_acquire();
+}
+
+void mips_llsc_write_unlock(void)
+{
+    sc_lock_release();
+}
+
+void mips_llsc_atfork_child(const mips64_ctx_t *ctx)
+{
+    size_t i;
+
+    sc_lock = 0;
+    g_sc_held = 0;
+    for (i = 0u; i < LLSC_SLOTS; i++) {
+        if (g_llsc_slots[i].ctx != ctx) {
+            g_llsc_slots[i].ctx = NULL;
+        }
+        g_llsc_slots[i].addr = 0u;
+        g_llsc_slots[i].width = 0u;
+        g_llsc_slots[i].active = 0;
+        g_llsc_slots[i].epoch0 = 0u;
+        g_llsc_slots[i].epoch1 = 0u;
+    }
 }
 
 static llsc_slot_t *llsc_slot_locked(const mips64_ctx_t *ctx, int create)
@@ -369,7 +405,7 @@ static void llsc_note_write_locked(uint64_t va, uint64_t len)
 
 void mips_llsc_note_write(uint64_t va, uint64_t len)
 {
-    if (len == 0u || g_sc_held != 0) {
+    if (len == 0u) {
         return;
     }
     sc_lock_acquire();
@@ -467,9 +503,9 @@ int do_sc(mips64_ctx_t *ctx, uint64_t addr, unsigned rt)
             return MIPS_FAULT;
         }
         if (epoch_ok && cur == ctx->llval) {
-            /* Bump epoch and invalidate peer reservations before
-             * releasing sc_lock so the check+store is atomic. */
-            llsc_note_write_locked(addr, 4u);
+            /* Hold sc_lock across guest_st32 (which updates the epoch
+             * and invalidates peer reservations via mips_llsc_note_write)
+             * so the check+store is atomic against ordinary stores. */
             if (guest_st32(ctx, addr, ctx->gpr[rt] & 0xFFFFFFFFu) != 0) {
                 sc_lock_release();
                 return MIPS_FAULT;
@@ -549,7 +585,6 @@ int do_scd(mips64_ctx_t *ctx, uint64_t addr, unsigned rt)
             return MIPS_FAULT;
         }
         if (epoch_ok && cur == ctx->llval) {
-            llsc_note_write_locked(addr, 8u);
             if (guest_st64(ctx, addr, ctx->gpr[rt]) != 0) {
                 sc_lock_release();
                 return MIPS_FAULT;

@@ -127,25 +127,6 @@ static uint64_t l4b_frame_size(const mips64_ctx_t *ctx)
            (uint64_t)sizeof(mips64_n64_rt_sigframe_t);
 }
 
-/* Bounded pending ring (pure function of ctx; twin of the sigact.c
- * copy, which the lane keeps separate so each file links alone). */
-static int l4b_pend_enqueue(mips64_ctx_t *ctx, uint32_t signo, int32_t code,
-                            int32_t errnum, uint64_t addr)
-{
-    uint32_t slot;
-
-    if (ctx->pend_count >= 16U) {
-        return 0;
-    }
-    slot = (ctx->pend_head + ctx->pend_count) % 16U;
-    ctx->pend_queue[slot].signo = signo;
-    ctx->pend_queue[slot].code = code;
-    ctx->pend_queue[slot].errnum = errnum;
-    ctx->pend_queue[slot].addr = addr;
-    ctx->pend_count++;
-    return 0;
-}
-
 /* Remove the oldest entry for signo, reporting its code/addr when
  * present. Returns 1 when an entry was consumed. */
 static int l4b_pend_consume(mips64_ctx_t *ctx, int signo, int32_t *codep,
@@ -243,8 +224,8 @@ static void l4b_force_bad_frame(mips64_ctx_t *ctx, uint64_t frame)
     mips_l4a_action_reset(ctx, L4B_SIGSEGV);
     ctx->sig_blocked[l4b_word(L4B_SIGSEGV)] &=
         ~l4b_bit(L4B_SIGSEGV);
-    l4b_pend_enqueue(ctx, (uint32_t)L4B_SIGSEGV, L4B_SI_KERNEL, 0,
-                     frame);
+    (void)mips64_sigpend_enqueue(ctx, (uint32_t)L4B_SIGSEGV, L4B_SI_KERNEL, 0,
+                                 frame);
 }
 
 /* Build the rt_sigframe for signo on the guest (or alt) stack and
@@ -539,28 +520,33 @@ int64_t mips_rt_sigreturn(mips64_ctx_t *ctx)
  * SIGFPE, BREAK -> SIGTRAP, misaligned address -> SIGBUS. Default
  * si_code is 1 (MAPERR/ILLOPC/FPE/BRKPT/ADRALN family); other signals
  * get SI_KERNEL. */
-void mips_trap(mips64_ctx_t *ctx, int signo, uint64_t addr)
+void mips_trap_code(mips64_ctx_t *ctx, int signo, int32_t code, uint64_t addr)
 {
-    int32_t code;
-
     if (ctx == NULL || !l4b_signo_valid(signo)) {
         return;
     }
-    if (signo == L4B_SIGSEGV) {
-        /* Linux si_code: an address inside a recorded mapping is a
-         * protection fault (SEGV_ACCERR); outside any mapping it is
-         * unmapped (SEGV_MAPERR). PROT_NONE pages stay mapped, so
-         * they report ACCERR like the kernel. */
-        code = mips_mem_ok(ctx, addr, 1U, 0U) ? 2 : 1;
-    } else if (signo == L4B_SIGILL || signo == L4B_SIGFPE ||
-               signo == L4B_SIGTRAP || signo == L4B_SIGBUS) {
-        code = 1;
-    } else {
-        code = L4B_SI_KERNEL;
+    if (code == 0) {
+        if (signo == L4B_SIGSEGV) {
+            /* Linux si_code: an address inside a recorded mapping is a
+             * protection fault (SEGV_ACCERR); outside any mapping it is
+             * unmapped (SEGV_MAPERR). PROT_NONE pages stay mapped, so
+             * they report ACCERR like the kernel. */
+            code = mips_mem_ok(ctx, addr, 1U, 0U) ? 2 : 1;
+        } else if (signo == L4B_SIGILL || signo == L4B_SIGFPE ||
+                   signo == L4B_SIGTRAP || signo == L4B_SIGBUS) {
+            code = 1;
+        } else {
+            code = L4B_SI_KERNEL;
+        }
     }
-    l4b_pend_enqueue(ctx, (uint32_t)signo, code, 0, addr);
+    (void)mips64_sigpend_enqueue(ctx, (uint32_t)signo, code, 0, addr);
     if (ctx->sigactions[signo].handler >= 2U &&
         !l4b_is_blocked(ctx, signo)) {
         (void)mips_raise_guest(ctx, signo, addr);
     }
+}
+
+void mips_trap(mips64_ctx_t *ctx, int signo, uint64_t addr)
+{
+    mips_trap_code(ctx, signo, 0, addr);
 }

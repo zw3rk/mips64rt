@@ -42,13 +42,16 @@
 #endif
 
 #define QS_MAX_SLOTS 160u
+#define QS_SLOT_FREE 0
+#define QS_SLOT_INIT 1
+#define QS_SLOT_LIVE 2
 
 typedef struct {
     _Atomic(int) used;
-    const mips64_ctx_t *key;
+    _Atomic(const mips64_ctx_t *) key;
     pthread_t pthread;
-    long tid;
-    long pid;
+    _Atomic(long) tid;
+    _Atomic(long) pid;
     _Atomic(int) state;
     _Atomic(int) leases;
     int saved_leases;
@@ -75,8 +78,10 @@ static qs_slot_t *qs_slot_for(const mips64_ctx_t *ctx, int create)
         return NULL;
     }
     for (i = 0u; i < QS_MAX_SLOTS; i++) {
-        if (atomic_load(&qs_slots[i].used) != 0 &&
-            qs_slots[i].key == ctx) {
+        if (atomic_load_explicit(&qs_slots[i].used, memory_order_acquire) ==
+                QS_SLOT_LIVE &&
+            atomic_load_explicit(&qs_slots[i].key, memory_order_relaxed) ==
+                ctx) {
             return &qs_slots[i];
         }
     }
@@ -84,23 +89,32 @@ static qs_slot_t *qs_slot_for(const mips64_ctx_t *ctx, int create)
         return NULL;
     }
     for (i = 0u; i < QS_MAX_SLOTS; i++) {
-        int expect = 0;
+        int expect = QS_SLOT_FREE;
 
-        if (atomic_compare_exchange_strong(&qs_slots[i].used, &expect,
-                                           1)) {
-            atomic_fetch_add(&qs_worker_count, 1);
-            qs_slots[i].key = ctx;
+        if (atomic_compare_exchange_strong_explicit(
+                &qs_slots[i].used, &expect, QS_SLOT_INIT,
+                memory_order_acq_rel, memory_order_relaxed)) {
+            atomic_store_explicit(&qs_slots[i].key, ctx, memory_order_relaxed);
             qs_slots[i].pthread = pthread_self();
             qs_slots[i].depth = 0;
-            atomic_store(&qs_slots[i].leases, 0);
-            atomic_store(&qs_slots[i].state, MIPS_QS_RUNNING);
+            qs_slots[i].saved_leases = 0;
+            atomic_store_explicit(&qs_slots[i].leases, 0, memory_order_relaxed);
+            atomic_store_explicit(&qs_slots[i].state, MIPS_QS_RUNNING,
+                                  memory_order_relaxed);
 #if defined(__linux__)
-            qs_slots[i].tid = syscall(SYS_gettid);
-            qs_slots[i].pid = (long)getpid();
+            atomic_store_explicit(&qs_slots[i].tid, syscall(SYS_gettid),
+                                  memory_order_relaxed);
+            atomic_store_explicit(&qs_slots[i].pid, (long)getpid(),
+                                  memory_order_relaxed);
 #else
-            qs_slots[i].tid = 0L;
-            qs_slots[i].pid = (long)getpid();
+            atomic_store_explicit(&qs_slots[i].tid, 0L, memory_order_relaxed);
+            atomic_store_explicit(&qs_slots[i].pid, (long)getpid(),
+                                  memory_order_relaxed);
 #endif
+            atomic_fetch_add_explicit(&qs_worker_count, 1,
+                                      memory_order_relaxed);
+            atomic_store_explicit(&qs_slots[i].used, QS_SLOT_LIVE,
+                                  memory_order_release);
             return &qs_slots[i];
         }
     }
@@ -117,7 +131,8 @@ static void qs_touch(qs_slot_t *s)
     if (!pthread_equal(s->pthread, self)) {
         s->pthread = self;
 #if defined(__linux__)
-        s->tid = syscall(SYS_gettid);
+        atomic_store_explicit(&s->tid, syscall(SYS_gettid),
+                              memory_order_relaxed);
 #endif
     }
 }
@@ -161,7 +176,8 @@ static void qs_preempt_handler(int sig, siginfo_t *si, void *uc)
     (void)sig;
     (void)si;
     for (i = 0u; i < QS_MAX_SLOTS; i++) {
-        if (atomic_load(&qs_slots[i].used) != 0 &&
+        if (atomic_load_explicit(&qs_slots[i].used, memory_order_acquire) ==
+                QS_SLOT_LIVE &&
             pthread_equal(qs_slots[i].pthread, self)) {
             uint64_t hpc;
             uint64_t seq = 0u;
@@ -198,7 +214,10 @@ static void qs_install(void)
 static void qs_preempt_peer(qs_slot_t *s)
 {
 #if defined(__linux__)
-    (void)syscall(SYS_tgkill, s->pid, s->tid, QS_PREEMPT_SIG);
+    long pid = atomic_load_explicit(&s->pid, memory_order_relaxed);
+    long tid = atomic_load_explicit(&s->tid, memory_order_relaxed);
+
+    (void)syscall(SYS_tgkill, pid, tid, QS_PREEMPT_SIG);
 #else
     (void)pthread_kill(s->pthread, QS_PREEMPT_SIG);
 #endif
@@ -314,7 +333,8 @@ void mips_qs_begin(mips64_ctx_t *ctx)
         for (i = 0u; i < QS_MAX_SLOTS; i++) {
             int st;
 
-            if (atomic_load(&qs_slots[i].used) == 0 ||
+            if (atomic_load_explicit(&qs_slots[i].used,
+                                     memory_order_acquire) != QS_SLOT_LIVE ||
                 &qs_slots[i] == s ||
                 pthread_equal(qs_slots[i].pthread, self)) {
                 continue;
@@ -329,7 +349,8 @@ void mips_qs_begin(mips64_ctx_t *ctx)
             break;
         }
         for (i = 0u; i < QS_MAX_SLOTS; i++) {
-            if (atomic_load(&qs_slots[i].used) != 0 &&
+            if (atomic_load_explicit(&qs_slots[i].used,
+                                     memory_order_acquire) == QS_SLOT_LIVE &&
                 &qs_slots[i] != s &&
                 !pthread_equal(qs_slots[i].pthread, self) &&
                 atomic_load(&qs_slots[i].state) != MIPS_QS_PARKED &&
@@ -411,16 +432,66 @@ void mips_qs_unregister(mips64_ctx_t *ctx)
     if (s == NULL) {
         return;
     }
+    if (atomic_exchange_explicit(&s->used, QS_SLOT_INIT,
+                                 memory_order_acq_rel) != QS_SLOT_LIVE) {
+        return;
+    }
     /* Release any lease the exiting thread still held so a dead
      * worker never blocks a future mutation's drain. */
     {
-        int held = atomic_load(&s->leases);
+        int held = atomic_exchange(&s->leases, 0);
 
         if (held > 0) {
             atomic_fetch_sub(&qs_leases, held);
         }
     }
-    atomic_store(&s->state, MIPS_QS_RUNNING);
-    s->key = NULL;
-    atomic_store(&s->used, 0);
+    s->saved_leases = 0;
+    s->depth = 0;
+    atomic_store_explicit(&s->state, MIPS_QS_RUNNING, memory_order_relaxed);
+    atomic_store_explicit(&s->key, NULL, memory_order_relaxed);
+    atomic_fetch_sub_explicit(&qs_worker_count, 1, memory_order_relaxed);
+    atomic_store_explicit(&s->used, QS_SLOT_FREE, memory_order_release);
+}
+
+void mips_qs_atfork_child(mips64_ctx_t *ctx)
+{
+    pthread_mutex_t fresh = PTHREAD_MUTEX_INITIALIZER;
+    size_t i;
+
+    (void)memcpy(&qs_mu, &fresh, sizeof qs_mu);
+    atomic_store_explicit(&qs_mutating, 0, memory_order_relaxed);
+    for (i = 0u; i < QS_MAX_SLOTS; i++) {
+        atomic_store_explicit(&qs_slots[i].used, QS_SLOT_FREE,
+                              memory_order_relaxed);
+        atomic_store_explicit(&qs_slots[i].key, NULL, memory_order_relaxed);
+        atomic_store_explicit(&qs_slots[i].tid, 0L, memory_order_relaxed);
+        atomic_store_explicit(&qs_slots[i].pid, 0L, memory_order_relaxed);
+        atomic_store_explicit(&qs_slots[i].state, MIPS_QS_RUNNING,
+                              memory_order_relaxed);
+        atomic_store_explicit(&qs_slots[i].leases, 0, memory_order_relaxed);
+        qs_slots[i].saved_leases = 0;
+        qs_slots[i].depth = 0;
+    }
+    if (ctx == NULL) {
+        atomic_store_explicit(&qs_leases, 0, memory_order_relaxed);
+        atomic_store_explicit(&qs_worker_count, 0, memory_order_release);
+        return;
+    }
+    atomic_store_explicit(&qs_slots[0].key, ctx, memory_order_relaxed);
+    qs_slots[0].pthread = pthread_self();
+#if defined(__linux__)
+    atomic_store_explicit(&qs_slots[0].tid, syscall(SYS_gettid),
+                          memory_order_relaxed);
+#else
+    atomic_store_explicit(&qs_slots[0].tid, 0L, memory_order_relaxed);
+#endif
+    atomic_store_explicit(&qs_slots[0].pid, (long)getpid(),
+                          memory_order_relaxed);
+    atomic_store_explicit(&qs_slots[0].state, MIPS_QS_LEASE,
+                          memory_order_relaxed);
+    atomic_store_explicit(&qs_slots[0].leases, 1, memory_order_relaxed);
+    atomic_store_explicit(&qs_leases, 1, memory_order_relaxed);
+    atomic_store_explicit(&qs_worker_count, 1, memory_order_relaxed);
+    atomic_store_explicit(&qs_slots[0].used, QS_SLOT_LIVE,
+                          memory_order_release);
 }

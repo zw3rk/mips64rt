@@ -91,7 +91,9 @@ extern int guest_st32(mips64_ctx_t *ctx, uint64_t va, uint64_t val);
 extern int mips_sig_enqueue(mips64_ctx_t *ctx, int signo, int32_t code,
                             uint64_t addr);
 extern void mips_llsc_release(const mips64_ctx_t *ctx);
+extern void mips_llsc_atfork_child(const mips64_ctx_t *ctx);
 extern void dbt_thread_exit(mips64_ctx_t *ctx);
+void mips_threads_atfork_child(mips64_ctx_t *ctx);
 
 /* N32 carries 32-bit pointers: truncate the register to the low word
  * (the frozen N32 pointer rule; N64 VAs use the full 64 bits). */
@@ -408,6 +410,7 @@ static int64_t l4b_clone_fork(mips64_ctx_t *ctx, uint64_t flags,
         mips64_ctx_clear_ll(ctx);
         ctx->is_thread_clone = false;
         ctx->host_tid = 0;
+        mips_threads_atfork_child(ctx);
         if ((flags & L4B_CLONE_CHILD_CLEARTID) != 0U) {
             ctx->clear_child_tid = child_tid_va;
         }
@@ -699,4 +702,21 @@ int mips_hostfault_run(mips64_ctx_t *ctx, void *code, uint32_t *reasonp)
 void mips_hostfault_disarm(void)
 {
     l4b_armed = 0;
+}
+
+void mips_threads_atfork_child(mips64_ctx_t *ctx)
+{
+    pthread_mutex_t fresh_mu = PTHREAD_MUTEX_INITIALIZER;
+    pthread_cond_t fresh_cv = PTHREAD_COND_INITIALIZER;
+
+    if (ctx != NULL) {
+        mips64_ctx_clear_ll(ctx);
+    }
+    (void)memcpy(&l4b_mu, &fresh_mu, sizeof l4b_mu);
+    (void)memcpy(&l4b_cv, &fresh_cv, sizeof l4b_cv);
+    (void)memcpy(&l4b_hmu, &fresh_mu, sizeof l4b_hmu);
+    (void)memset(l4b_slots, 0, sizeof l4b_slots);
+    l4b_leader_ctx = ctx;
+    mips_qs_atfork_child(ctx);
+    mips_llsc_atfork_child(ctx);
 }

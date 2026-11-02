@@ -130,6 +130,9 @@ uint64_t getn(const uint8_t *p, unsigned n, int be)
 
 extern void mips_vm_file_shared_sync(mips64_ctx_t *ctx, uint64_t va,
                                      uint64_t len);
+extern void mips_llsc_note_write(uint64_t addr, uint64_t size);
+extern void mips_qs_lease_enter(mips64_ctx_t *ctx);
+extern void mips_qs_lease_exit(mips64_ctx_t *ctx);
 #define G_SYNC_MAX 64U
 static _Thread_local uint64_t g_sync_va[G_SYNC_MAX], g_sync_len[G_SYNC_MAX];
 static _Thread_local unsigned g_sync_cnt;
@@ -150,10 +153,8 @@ uint8_t *guest_range(mips64_ctx_t *ctx, uint64_t va, uint64_t len, int write)
     if (!mips_mem_ok(ctx, va, len, need))
         return NULL;
     if (write != 0) {
+        mips_llsc_note_write(va, len);
         mips_vm_pages_clear(va, len, (unsigned)MIPS_VM_PAGE_COW_CLEAN);
-        /* Wave P SMC write gate: syscall copyouts retire translated
-         * code they overlap (read/readv/pread/getdents/getrandom and
-         * the signal-frame build all funnel through here). */
         mips_vm_pages_retire_code(va, len);
         if (g_sync_cnt >= G_SYNC_MAX)
             mips_guest_range_flush(ctx);
@@ -821,14 +822,7 @@ int64_t mips_sc_clock_getres(mips64_ctx_t *ctx, uint64_t clk,
 }
 
 /* clock_nanosleep with the true 4-arg ABI (clk, flags, req, rem)
- * (N64 5224 / N32 6228, N32 time64 6407). The current dispatch arm
- * calls mips_sc_nanosleep with the 3-arg shift (a0, a1, a2 for
- * clk, req, rem), so it reads the flags word (0) as the request
- * pointer — address 0 is unmapped and every glibc nanosleep (which
- * lowers to clock_nanosleep, qemu-observed) fails with -EFAULT.
- * This entry takes (clk, flags, req, rem) in order; only
- * TIMER_ABSTIME is defined (other bits are -EINVAL, matching Linux).
- * The EINTR remainder writeback mirrors mips_sc_nanosleep. */
+ * (N64 5224 / N32 6228, N32 time64 6407). */
 int64_t mips_sc_clock_nanosleep(mips64_ctx_t *ctx, uint64_t clk,
                                 uint64_t flags, uint64_t req_va,
                                 uint64_t rem_va, int is64)
@@ -839,6 +833,7 @@ int64_t mips_sc_clock_nanosleep(mips64_ctx_t *ctx, uint64_t clk,
     uint8_t *p;
     int64_t rc;
     int be;
+    int saved_err;
 
     if ((flags & ~(uint64_t)TIMER_ABSTIME) != 0U) {
         return l2a_ret(ctx, -(int64_t)EINVAL);
@@ -864,18 +859,19 @@ int64_t mips_sc_clock_nanosleep(mips64_ctx_t *ctx, uint64_t clk,
     if (rq.tv_nsec < 0 || rq.tv_nsec >= 1000000000L) {
         return l2a_ret(ctx, -(int64_t)EINVAL);
     }
+    mips_qs_lease_exit(ctx);
 #if defined(__linux__)
     rc = (int64_t)clock_nanosleep((clockid_t)(int)clk, (int)flags, &rq,
                                   remp);
+    saved_err = (int)rc;
 #else
-    /* No clock_nanosleep(2) on this host (absolute sleeps wait for
-     * Phase 4 even on Linux); the shared block below converts the
-     * raw result exactly like the clock path. */
     rc = l2a_clock_sleep_fallback(clk, flags, &rq, remp);
+    saved_err = errno;
 #endif
+    mips_qs_lease_enter(ctx);
     if (rc != 0) {
-        rc = -(int64_t)errno;
-        if (remp != NULL && errno == EINTR) {
+        rc = -(int64_t)saved_err;
+        if (remp != NULL && saved_err == EINTR) {
             uint8_t *q = guest_range(ctx, rem_va, is64 ? 16U : 8U, 1);
 
             if (q != NULL) {

@@ -16,5 +16,10 @@
  * `MIPS64_N32_SIGTRAMP` below `MIPS64_N32_TASK_SIZE`. */
 uint64_t mips64_signal_trampoline_addr(int is_n32);
 void mips64_ctx_clear_ll(mips64_ctx_t *ctx);
+int mips64_sigpend_enqueue(mips64_ctx_t *ctx, uint32_t signo, int32_t code,
+                           int32_t errnum, uint64_t addr);
+void mips_trap_code(mips64_ctx_t *ctx, int signo, int32_t code, uint64_t addr);
+void mips_insn_trap_code(mips64_ctx_t *ctx, int signo, int32_t code,
+                         uint64_t addr);
 
 #endif

@@ -36,6 +36,7 @@
 #include "core/cpu.h"
 
 #include "os/sigframe_mips64rt.h"
+#include "os/signal_core.h"
 #include "os/syscall_nr.h"
 
 #include <errno.h>
@@ -132,26 +133,7 @@ static void l4a_mark_active(mips64_ctx_t *ctx)
     l4a_active = ctx;
 }
 
-/* Pending ring helpers (bounded 16-entry queue in the frozen ctx
- * tail; overflow drops, the documented RC4 limitation shared by both
- * engines). Pure functions of ctx, duplicated in sigframe.c. */
-static int l4a_pend_enqueue(mips64_ctx_t *ctx, uint32_t signo, int32_t code,
-                            int32_t errnum, uint64_t addr)
-{
-    uint32_t slot;
-
-    if (ctx->pend_count >= 16U) {
-        return 0;
-    }
-    slot = (ctx->pend_head + ctx->pend_count) % 16U;
-    ctx->pend_queue[slot].signo = signo;
-    ctx->pend_queue[slot].code = code;
-    ctx->pend_queue[slot].errnum = errnum;
-    ctx->pend_queue[slot].addr = addr;
-    ctx->pend_count++;
-    return 0;
-}
-
+/* Pending ring purge helper (enqueue lives in src/os/signal_core.c). */
 static void l4a_pend_purge(mips64_ctx_t *ctx, int signo)
 {
     uint32_t kept = 0U;
@@ -520,7 +502,7 @@ int mips_sig_enqueue(mips64_ctx_t *ctx, int signo, int32_t code,
     if (handler == 1U) {
         return 0;
     }
-    l4a_pend_enqueue(ctx, (uint32_t)signo, code, 0, addr);
+    (void)mips64_sigpend_enqueue(ctx, (uint32_t)signo, code, 0, addr);
     return 0;
 }
 
@@ -661,7 +643,7 @@ static int64_t l4a_queueinfo(mips64_ctx_t *ctx, uint64_t pid,
     if (ctx->sigactions[signo].handler == 1U) {
         return l2a_ret(ctx, 0);
     }
-    l4a_pend_enqueue(ctx, (uint32_t)signo, code, errnum, addr);
+    (void)mips64_sigpend_enqueue(ctx, (uint32_t)signo, code, errnum, addr);
     return l2a_ret(ctx, 0);
 }
 

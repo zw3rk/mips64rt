@@ -125,17 +125,12 @@ int dbt_npc_resume(mips64_ctx_t *ctx)
  * declarations are unchanged. */
 
 /* ------------------------------------------------------------------ */
-/* W^X code pages.                                                    */
+/* W^X code arena + Block cache + IBTC + RAS.                         */
 /* ------------------------------------------------------------------ */
-
-/* Block publication lives in src/dbt/arena.c (Wave P bump-allocated
- * W^X arena). Guest data pages are never `PROT_EXEC` on the host.
- * Published mappings are retained until process end (RC2 bound: the
- * cache holds 1024 entries), so no live IBTC slot can dangle. */
-/* ------------------------------------------------------------------ */
-/* Block cache + IBTC + RAS.                                          */
-/* ------------------------------------------------------------------ */
-
+/* Block publication lives in src/dbt/arena.c. Published chunks are
+ * retained up to DBT_ARENA_RETAIN_MAX per thread, then reclaimed only
+ * after dbt_flush_thread_caches clears the thread's block cache and
+ * IBTC so no live slot can dangle. */
 typedef struct {
     int used;
     uint64_t pc;
@@ -147,8 +142,8 @@ typedef struct {
     size_t site_count;
 } dbt_entry_t;
 
-/* Release an entry snapshot (evict/decline overwrite, code mappings
- * are intentionally retained per the RC2 1024-entry bound). */
+/* Release an entry snapshot and site table (code mappings live in the
+ * thread-local arena and are reclaimed together by dbt_arena_reset). */
 static void dbt_snap_drop(dbt_entry_t *e)
 {
     if (e != NULL && e->snap != NULL) {
@@ -414,21 +409,32 @@ static int compile_decline(mips64_ctx_t *ctx, uint64_t pc)
     return 1;
 }
 
+static int dbt_probe_insn(mips64_ctx_t *ctx, uint64_t pc, uint32_t *out)
+{
+    uint8_t b[4];
+    if (ctx == NULL || out == NULL || (pc & 3ULL) != 0ULL ||
+        !mips_mem_ok(ctx, pc, 4U, MIPS_PROT_READ | MIPS_PROT_EXEC))
+        return MIPS_FAULT;
+    memcpy(b, mips64_guest_ptr(ctx, pc), 4U);
+    *out = mips_is_be(ctx)
+        ? (((uint32_t)b[0] << 24) | ((uint32_t)b[1] << 16) |
+           ((uint32_t)b[2] << 8) | (uint32_t)b[3])
+        : ((uint32_t)b[0] | ((uint32_t)b[1] << 8) |
+           ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24));
+    return 0;
+}
+
 int dbt_compile(mips64_ctx_t *ctx, uint64_t pc)
 {
     static _Thread_local uint32_t staging[MIPS64_DBT_STAGING_WORDS];
     mips_dec_t insns[MIPS64_DBT_MAX_INSNS];
     dbt_entry_t *slot;
-    uint64_t start_page;
-    uint64_t cur;
-    uint64_t out_end = 0u;
+    uint64_t start_page, cur, out_end = 0u;
     size_t out_len = 0u;
     unsigned n = 0u;
     int rc;
 
-    if (ctx == NULL || (pc & 3ULL) != 0ULL)
-        return 1;
-    if (ensure_ibtc(ctx) != 0)
+    if (ctx == NULL || (pc & 3ULL) != 0ULL || ensure_ibtc(ctx) != 0)
         return 1;
     dbt_aot_ensure_loaded();
     slot = &block_cache[cache_index(pc)];
@@ -446,7 +452,7 @@ int dbt_compile(mips64_ctx_t *ctx, uint64_t pc)
 
         if (n > 0u && (cur & MIPS64_PAGE_MASK) != start_page)
             break; /* SPEC 2.2: blocks end at page boundaries. */
-        if (mips_fetch(ctx, cur, &word) != 0)
+        if (dbt_probe_insn(ctx, cur, &word) != 0)
             break;
         d = &insns[n];
         mips_decode(word, d);
@@ -458,7 +464,7 @@ int dbt_compile(mips64_ctx_t *ctx, uint64_t pc)
             mips_dec_t *s;
 
             if (n >= MIPS64_DBT_MAX_INSNS ||
-                mips_fetch(ctx, cur, &word) != 0) {
+                dbt_probe_insn(ctx, cur, &word) != 0) {
                 n--;
                 cur -= 4u;
                 break;
@@ -594,7 +600,7 @@ static int block_branch_likely(mips64_ctx_t *ctx, uint64_t end)
     uint32_t w = 0u;
     mips_dec_t d;
 
-    if (end < 8u || mips_fetch(ctx, end - 8u, &w) != 0)
+    if (end < 8u || dbt_probe_insn(ctx, end - 8u, &w) != 0)
         return 0;
     mips_decode(w, &d);
     if (d.op >= 0x14u && d.op <= 0x17u)
@@ -623,7 +629,7 @@ static void trace_block_exit(mips64_ctx_t *ctx, uint64_t start, uint64_t end,
     for (va = start; va < hi; va += 4u) {
         uint32_t word = 0u;
 
-        if (mips_fetch(ctx, va, &word) != 0)
+        if (dbt_probe_insn(ctx, va, &word) != 0)
             break;
         mips64_dbt_trace(ctx, va, word);
     }

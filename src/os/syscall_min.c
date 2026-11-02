@@ -137,6 +137,10 @@ extern int64_t mips_mem_remap(mips64_ctx_t *ctx, uint64_t old_va,
                               uint64_t flags, uint64_t new_va);
 extern uint64_t mips_mem_hole_after(const mips64_ctx_t *ctx, uint64_t cand,
                                     uint64_t size);
+extern void mips_threads_atfork_child(mips64_ctx_t *ctx);
+extern void mips_llsc_note_write(uint64_t addr, uint64_t size);
+extern void mips_llsc_write_lock(void);
+extern void mips_llsc_write_unlock(void);
 /* Phase 7 H1: DBT SMC hook (weak; strong def in src/dbt/dbt.c). */
 __attribute__((weak)) void dbt_invalidate_range(uint64_t va, uint64_t len);
 
@@ -296,9 +300,8 @@ static int64_t sc_mmap(mips64_ctx_t *ctx, uint64_t addr, uint64_t len,
     if (!anon && (offset & (MIPS64_PAGE_SIZE - 1U)) != 0U) {
         return sc_ret(ctx, -(int64_t)EINVAL);
     }
-    if ((flags & MIPS_MAP_FIXED) != 0U ||
-        ((flags & MIPS_MAP_FIXED_NOREPLACE) != 0U && addr != 0U)) {
-        if ((addr & (MIPS64_PAGE_SIZE - 1U)) != 0U ||
+    if ((flags & (MIPS_MAP_FIXED | MIPS_MAP_FIXED_NOREPLACE)) != 0U) {
+        if (addr == 0U || (addr & (MIPS64_PAGE_SIZE - 1U)) != 0U ||
             addr + size < addr || addr + size > ctx->task_size) {
             return sc_ret(ctx, -(int64_t)EINVAL);
         }
@@ -351,7 +354,7 @@ static int64_t sc_mmap(mips64_ctx_t *ctx, uint64_t addr, uint64_t len,
                                   "map");
             }
         }
-    } else if ((flags & MIPS_MAP_FIXED_NOREPLACE) != 0U && addr != 0U) {
+    } else if ((flags & MIPS_MAP_FIXED_NOREPLACE) != 0U) {
         va = addr;
         rc = mips_mem_map(ctx, va, size, (uint32_t)(prot & 7U), "map");
     } else {
@@ -395,6 +398,7 @@ static int64_t sc_uname(mips64_ctx_t *ctx, uint64_t va)
         return sc_ret(ctx, -(int64_t)errno);
     }
     dst = (uint8_t *)mips64_guest_ptr(ctx, va);
+    mips_llsc_write_lock();
     copy_uts_field(dst + 0U * MIPS_UTS_FIELD, un.sysname);
     copy_uts_field(dst + 1U * MIPS_UTS_FIELD, un.nodename);
     copy_uts_field(dst + 2U * MIPS_UTS_FIELD, un.release);
@@ -408,6 +412,8 @@ static int64_t sc_uname(mips64_ctx_t *ctx, uint64_t va)
 #else
     memset(dst + 5U * MIPS_UTS_FIELD, 0, MIPS_UTS_FIELD);
 #endif
+    mips_llsc_note_write(va, MIPS_UTS_SIZE);
+    mips_llsc_write_unlock();
     mips_vm_pages_clear(va, MIPS_UTS_SIZE, (unsigned)MIPS_VM_PAGE_COW_CLEAN);
     mips_vm_file_shared_sync(ctx, va, MIPS_UTS_SIZE);
     return sc_ret(ctx, 0);
@@ -434,6 +440,9 @@ static int64_t sc_fork(mips64_ctx_t *ctx)
         return sc_ret(ctx, -(int64_t)errno);
     }
     if (pid == 0) {
+        ctx->is_thread_clone = false;
+        ctx->host_tid = 0;
+        mips_threads_atfork_child(ctx);
         return sc_ret(ctx, 0); /* child */
     }
     return sc_ret(ctx, (int64_t)pid); /* parent */
@@ -467,6 +476,9 @@ static int64_t sc_wait4(mips64_ctx_t *ctx, uint64_t pid, uint64_t status_va,
         return sc_ret(ctx, -(int64_t)errno);
     }
     if (status_va != 0U) {
+        if (!mips_mem_ok(ctx, status_va, 4U, MIPS_PROT_WRITE)) {
+            return sc_ret(ctx, -(int64_t)EFAULT);
+        }
         /* The wait status is a plain int with the kernel layout on
          * every arch, but the bytes must follow guest endianness:
          * a BE LW over host-native bytes reads garbage. */

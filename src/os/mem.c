@@ -52,6 +52,21 @@ __attribute__((weak)) void mips_llsc_note_write(uint64_t va, uint64_t len)
     (void)len;
 }
 
+__attribute__((weak)) void mips_llsc_write_lock(void)
+{
+}
+
+__attribute__((weak)) void mips_llsc_write_unlock(void)
+{
+}
+
+__attribute__((weak)) void mips_trap_code(mips64_ctx_t *ctx, int signo,
+                                          int32_t code, uint64_t addr)
+{
+    (void)code;
+    mips_trap(ctx, signo, addr);
+}
+
 static void mem_note_guest_write(mips64_ctx_t *ctx, uint64_t va, uint64_t len)
 {
     mips_vm_pages_clear(va, len, (unsigned)MIPS_VM_PAGE_COW_CLEAN);
@@ -97,7 +112,8 @@ void mips_fault(mips64_ctx_t *ctx, uint64_t addr)
     }
 }
 
-void mips_insn_trap(mips64_ctx_t *ctx, int signo, uint64_t addr)
+void mips_insn_trap_code(mips64_ctx_t *ctx, int signo, int32_t code,
+                         uint64_t addr)
 {
     uint64_t before;
 
@@ -106,7 +122,7 @@ void mips_insn_trap(mips64_ctx_t *ctx, int signo, uint64_t addr)
     }
     ctx->llbit = 0U;
     before = ctx->pc;
-    mips_trap(ctx, signo, addr);
+    mips_trap_code(ctx, signo, code, addr);
     if (ctx->pc != before) {
         ctx->exit_reason = MIPS64_EXIT_NONE;
         ctx->exit_info = 0U;
@@ -114,6 +130,11 @@ void mips_insn_trap(mips64_ctx_t *ctx, int signo, uint64_t addr)
     }
     ctx->exit_reason = MIPS64_EXIT_FAULT;
     ctx->exit_info = (uint32_t)addr;
+}
+
+void mips_insn_trap(mips64_ctx_t *ctx, int signo, uint64_t addr)
+{
+    mips_insn_trap_code(ctx, signo, 0, addr);
 }
 
 /* U0 TIF_FIXADE gate: emulate one unaligned integer load/store
@@ -218,8 +239,10 @@ int guest_st8(mips64_ctx_t *ctx, uint64_t va, uint64_t val)
         return MIPS_FAULT;
     }
     b = (uint8_t)(val & 0xFFU);
+    mips_llsc_write_lock();
     memcpy(mips64_guest_ptr(ctx, va), &b, 1U);
     mem_note_guest_write(ctx, va, 1U);
+    mips_llsc_write_unlock();
     ctx->llbit = 0U; /* E05: any ordinary store clears the reservation */
     return 0;
 }
@@ -268,8 +291,10 @@ int guest_st16(mips64_ctx_t *ctx, uint64_t va, uint64_t val)
         b[0] = (uint8_t)(val & 0xFFU);
         b[1] = (uint8_t)((val >> 8) & 0xFFU);
     }
+    mips_llsc_write_lock();
     memcpy(mips64_guest_ptr(ctx, va), b, 2U);
     mem_note_guest_write(ctx, va, 2U);
+    mips_llsc_write_unlock();
     ctx->llbit = 0U; /* E05: any ordinary store clears the reservation */
     return 0;
 }
@@ -324,8 +349,10 @@ int guest_st32(mips64_ctx_t *ctx, uint64_t va, uint64_t val)
         b[2] = (uint8_t)((val >> 16) & 0xFFU);
         b[3] = (uint8_t)((val >> 24) & 0xFFU);
     }
+    mips_llsc_write_lock();
     memcpy(mips64_guest_ptr(ctx, va), b, 4U);
     mem_note_guest_write(ctx, va, 4U);
+    mips_llsc_write_unlock();
     ctx->llbit = 0U; /* E05: any ordinary store clears the reservation */
     return 0;
 }
@@ -392,8 +419,10 @@ int guest_st64(mips64_ctx_t *ctx, uint64_t va, uint64_t val)
         b[6] = (uint8_t)((val >> 48) & 0xFFU);
         b[7] = (uint8_t)((val >> 56) & 0xFFU);
     }
+    mips_llsc_write_lock();
     memcpy(mips64_guest_ptr(ctx, va), b, 8U);
     mem_note_guest_write(ctx, va, 8U);
+    mips_llsc_write_unlock();
     ctx->llbit = 0U; /* E05: any ordinary store clears the reservation */
     return 0;
 }

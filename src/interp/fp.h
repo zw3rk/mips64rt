@@ -61,12 +61,13 @@ long double fp_rne_q(long double q);
  * enabled IEEE exception trap (SIGFPE) when FCSR enable bit (7 + e) is set. */
 void fp_raise(mips64_ctx_t *ctx, unsigned e);
 void fp_clear_trap(void);
+int32_t fp_fcsr_sicode(uint32_t fcsr);
 int fp_finish_trap(mips64_ctx_t *ctx, uint64_t cur_pc, unsigned fd,
     uint64_t saved_fpr, uint32_t saved_cc, int rc);
+double fp_round_d(mips64_ctx_t *ctx, double r, int cmp, unsigned rm);
 
-/* Flag a finished finite result: O (+I) on overflow to infinity,
- * I when the final value differs from the exact one. U is never set
- * (RC3 limitation, same in both engines). */
+/* Flag a finished single-precision result: O (+I) on overflow,
+ * U (+I) on tiny inexact (or trapped tiny), I when inexact. */
 void fp_inexact(mips64_ctx_t *ctx, long double rf, long double q);
 
 /* MIPS CVT/round funct field values (destination selectors): */

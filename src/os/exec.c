@@ -559,6 +559,10 @@ static void decode_status(int status, uint32_t *cause, uint32_t *st)
     }
 }
 
+extern void mips_llsc_note_write(uint64_t addr, uint64_t size);
+extern void mips_llsc_write_lock(void);
+extern void mips_llsc_write_unlock(void);
+
 int64_t mips_sc_waitid(mips64_ctx_t *ctx, uint64_t which, uint64_t pid,
                        uint64_t infop_va, uint64_t options,
                        uint64_t rusage_va)
@@ -574,12 +578,18 @@ int64_t mips_sc_waitid(mips64_ctx_t *ctx, uint64_t which, uint64_t pid,
     uint32_t cause = 0;
     uint32_t st = 0;
     int rc;
+    int saved_err;
 
     if (ctx == NULL) {
         return -(int64_t)EFAULT;
     }
     if (rusage_va != 0U) {
         return exec_ret(ctx, -(int64_t)ENOSYS);
+    }
+    if (infop_va != 0U &&
+        (!ptr_ok(ctx, infop_va) ||
+         !mips_mem_ok(ctx, infop_va, 128U, MIPS_PROT_WRITE))) {
+        return exec_ret(ctx, -(int64_t)EFAULT);
     }
     opt = (uint32_t)options;
     if ((options >> 32) != 0U) {
@@ -627,9 +637,12 @@ int64_t mips_sc_waitid(mips64_ctx_t *ctx, uint64_t which, uint64_t pid,
     if (nowait) {
         wflags |= WNOWAIT;
     }
+    mips_qs_lease_exit(ctx);
     got = waitpid(want, &status, wflags);
+    saved_err = errno;
+    mips_qs_lease_enter(ctx);
     if (got < 0) {
-        return exec_ret(ctx, -(int64_t)errno);
+        return exec_ret(ctx, -(int64_t)saved_err);
     }
     if (got == 0) {
         /* WNOHANG with no state change: siginfo records si_pid 0. */
@@ -641,7 +654,10 @@ int64_t mips_sc_waitid(mips64_ctx_t *ctx, uint64_t which, uint64_t pid,
             {
                 uint8_t *p =
                     (uint8_t *)mips64_guest_ptr(ctx, infop_va);
+                mips_llsc_write_lock();
                 memset(p, 0, 128);
+                mips_llsc_note_write(infop_va, 128U);
+                mips_llsc_write_unlock();
                 /* Wave P SMC write gate (bypasses guest_st). */
                 mips_vm_pages_retire_code(infop_va, 128U);
             }
@@ -683,8 +699,11 @@ int64_t mips_sc_waitid(mips64_ctx_t *ctx, uint64_t which, uint64_t pid,
         }
         {
             uint8_t *p = (uint8_t *)mips64_guest_ptr(ctx, infop_va);
+            mips_llsc_write_lock();
             memset(p + base_off + 12U, 0,
                    (size_t)(128U - base_off - 12U));
+            mips_llsc_note_write(infop_va, 128U);
+            mips_llsc_write_unlock();
             /* Wave P SMC write gate (bypasses guest_st). */
             mips_vm_pages_retire_code(infop_va, 128U);
         }

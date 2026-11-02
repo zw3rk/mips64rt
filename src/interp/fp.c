@@ -46,19 +46,17 @@
 #include "interp/interp.h"
 
 extern void mips_insn_trap(mips64_ctx_t *ctx, int signo, uint64_t addr);
+extern void mips_insn_trap_code(mips64_ctx_t *ctx, int signo, int32_t code,
+                                uint64_t addr);
 
 /* FCSR: FCC0 at bit 23, FCC1..7 at bits 31:25 (matches the MOVCI mask in
  * interp.c). RM at bits 1:0. Cause/Flag fields are never written here. */
 #define FP_FCC0_BIT 23u
 #define FP_RM_MASK  3u
 
-/* Default quiet NaNs: see fp.h (shared with fp_cvt.c). */
-/* MIPS CVT/round funct field values: see fp.h (shared with fp_cvt.c). */
-
 uint64_t fp_d_bits(double x)
 {
     uint64_t u = 0u;
-
     memcpy(&u, &x, sizeof(u));
     return u;
 }
@@ -66,7 +64,6 @@ uint64_t fp_d_bits(double x)
 double fp_bits_d(uint64_t u)
 {
     double x = 0.0;
-
     memcpy(&x, &u, sizeof(x));
     return x;
 }
@@ -74,7 +71,6 @@ double fp_bits_d(uint64_t u)
 uint32_t fp_f_bits(float x)
 {
     uint32_t u = 0u;
-
     memcpy(&u, &x, sizeof(u));
     return u;
 }
@@ -82,7 +78,6 @@ uint32_t fp_f_bits(float x)
 float fp_bits_f(uint32_t u)
 {
     float x = 0.0f;
-
     memcpy(&x, &u, sizeof(x));
     return x;
 }
@@ -158,6 +153,28 @@ void fp_raise(mips64_ctx_t *ctx, unsigned e)
     }
 }
 
+int32_t fp_fcsr_sicode(uint32_t fcsr)
+{
+    uint32_t active = (fcsr >> 12u) & (fcsr >> 7u) & 0x1Fu;
+
+    if ((active & (1u << (unsigned)FP_EXC_V)) != 0u) {
+        return 7; /* FPE_FLTINV */
+    }
+    if ((active & (1u << (unsigned)FP_EXC_Z)) != 0u) {
+        return 3; /* FPE_FLTDIV */
+    }
+    if ((active & (1u << (unsigned)FP_EXC_O)) != 0u) {
+        return 4; /* FPE_FLTOVF */
+    }
+    if ((active & (1u << (unsigned)FP_EXC_U)) != 0u) {
+        return 5; /* FPE_FLTUND */
+    }
+    if ((active & (1u << (unsigned)FP_EXC_I)) != 0u) {
+        return 6; /* FPE_FLTRES */
+    }
+    return 7;
+}
+
 int fp_finish_trap(mips64_ctx_t *ctx, uint64_t cur_pc, unsigned fd,
                    uint64_t saved_fpr, uint32_t saved_cc, int rc)
 {
@@ -165,7 +182,7 @@ int fp_finish_trap(mips64_ctx_t *ctx, uint64_t cur_pc, unsigned fd,
         fp_trapped = 0;
         ctx->fpr[fd & 31u] = saved_fpr;
         ctx->fcsr = (ctx->fcsr & ~0xFE800000u) | (saved_cc & 0xFE800000u);
-        mips_insn_trap(ctx, 8, cur_pc);
+        mips_insn_trap_code(ctx, 8, fp_fcsr_sicode(ctx->fcsr), cur_pc);
         return (ctx->exit_reason == MIPS64_EXIT_NONE) ?
             FP_RC_BRANCH : MIPS_FAULT;
     }
@@ -173,18 +190,81 @@ int fp_finish_trap(mips64_ctx_t *ctx, uint64_t cur_pc, unsigned fd,
     return rc;
 }
 
-/* Flag a finished finite result rf against its exact value q: overflow
- * to infinity raises O (+I, matching the hardware FPSR pair the DBT
- * merges), any other mismatch raises I. U is never set (RC3 limitation,
- * identical in both engines). */
+/* Flag a finished single-precision result rf against its exact value q
+ * (exact in double/long double for all S operands): O (+I) on overflow,
+ * U (+I) on tiny inexact (or trapped tininess), and I on inexact. */
 void fp_inexact(mips64_ctx_t *ctx, long double rf, long double q)
 {
-    if ((isinf(rf) != 0) && (isinf(q) == 0)) {
+    if (((isinf(rf) != 0) || fabsl(q) > (long double)FLT_MAX) &&
+        (isinf(q) == 0)) {
         fp_raise(ctx, (unsigned)FP_EXC_O);
         fp_raise(ctx, (unsigned)FP_EXC_I);
-    } else if (rf != q) {
+        return;
+    }
+    if (q != 0.0L && fabsl(q) < (long double)FLT_MIN) {
+        if (rf != q ||
+            (ctx->fcsr & (1u << (7u + (unsigned)FP_EXC_U))) != 0u) {
+            fp_raise(ctx, (unsigned)FP_EXC_U);
+        }
+    }
+    if (rf != q) {
         fp_raise(ctx, (unsigned)FP_EXC_I);
     }
+}
+
+/* Host-independent binary64 directed rounding and O/U/I flag accounting
+ * from an RNE result r and exact residual sign cmp = sign(exact - r). */
+double fp_round_d(mips64_ctx_t *ctx, double r, int cmp, unsigned rm)
+{
+    double rf = r;
+    int is_tiny;
+
+    if (!isfinite(r)) {
+        if (rm == 1u) {
+            rf = (r > 0.0) ? DBL_MAX : -DBL_MAX;
+        } else if (rm == 2u) {
+            rf = (r > 0.0) ? INFINITY : -DBL_MAX;
+        } else if (rm == 3u) {
+            rf = (r > 0.0) ? DBL_MAX : -INFINITY;
+        }
+        fp_raise(ctx, (unsigned)FP_EXC_O);
+        fp_raise(ctx, (unsigned)FP_EXC_I);
+        return rf;
+    }
+    if (cmp != 0) {
+        if (rm == 1u) {
+            if ((r > 0.0 && cmp < 0) || (r < 0.0 && cmp > 0)) {
+                rf = nextafter(r, 0.0);
+            }
+        } else if (rm == 2u) {
+            if (cmp > 0) {
+                rf = nextafter(r, INFINITY);
+            }
+        } else if (rm == 3u) {
+            if (cmp < 0) {
+                rf = nextafter(r, -INFINITY);
+            }
+        }
+    }
+    if (!isfinite(rf) ||
+        (fabs(r) == DBL_MAX &&
+         ((r > 0.0 && cmp > 0) || (r < 0.0 && cmp < 0)))) {
+        fp_raise(ctx, (unsigned)FP_EXC_O);
+        fp_raise(ctx, (unsigned)FP_EXC_I);
+        return rf;
+    }
+    is_tiny = (fabs(r) < DBL_MIN && (r != 0.0 || cmp != 0)) ||
+              (fabs(r) == DBL_MIN &&
+               ((r > 0.0 && cmp < 0) || (r < 0.0 && cmp > 0)));
+    if (is_tiny &&
+        (cmp != 0 ||
+         (ctx->fcsr & (1u << (7u + (unsigned)FP_EXC_U))) != 0u)) {
+        fp_raise(ctx, (unsigned)FP_EXC_U);
+    }
+    if (cmp != 0) {
+        fp_raise(ctx, (unsigned)FP_EXC_I);
+    }
+    return rf;
 }
 
 /* S-format FPR write: low 32 bits replaced, upper lane preserved (FR=1,
@@ -262,21 +342,6 @@ static float fp_sqrt_adj_f(float r, float x, unsigned rm)
     return (sq > (long double)x) ? nextafterf(r, 0.0f) : r;
 }
 
-static double fp_sqrt_adj(double r, double x, unsigned rm)
-{
-    long double sq;
-
-    if (rm == 0u) {
-        return r;
-    }
-    sq = (long double)r * (long double)r;
-    if (rm == 2u) {
-        return (sq < (long double)x) ? nextafter(r, INFINITY) : r;
-    }
-    /* Toward zero / toward -inf coincide for non-negative results. */
-    return (sq > (long double)x) ? nextafter(r, 0.0) : r;
-}
-
 /* Round quad q to an integer, ties to even. The caller range-checks
  * first, so q - truncl(q) is exact and the halfway case is detectable. */
 long double fp_rne_q(long double q)
@@ -299,6 +364,11 @@ long double fp_rne_q(long double q)
     return lo + ((q > 0.0L) ? 1.0L : -1.0L);
 }
 
+static int fp_cmp_sign(double x)
+{
+    return (x > 0.0) ? 1 : ((x < 0.0) ? -1 : 0);
+}
+
 /* S/D ADD/SUB/MUL/DIV/SQRT/ABS/NEG/MOV. NaN operands and invalid
  * combinations yield the default quiet NaN; infinities follow the IEEE
  * sign rules. Returns 0, or MIPS_FAULT for an unknown funct (the caller
@@ -314,7 +384,6 @@ static int fp_arith(mips64_ctx_t *ctx, const mips_dec_t *d, unsigned is_s)
         double a = fp_bits_d(ctx->fpr[fs]);
         double b = fp_bits_d(ctx->fpr[ft]);
         double r;
-        long double q;
 
         switch (d->funct) {
         case 0x06u: /* MOV.D: full 64-bit lane copy (FR=1) */
@@ -339,14 +408,23 @@ static int fp_arith(mips64_ctx_t *ctx, const mips_dec_t *d, unsigned is_s)
                 fp_raise(ctx, (unsigned)FP_EXC_V);
                 return 0;
             }
+            if (a == 0.0 || isinf(a)) {
+                fp_put_d(ctx, fd, fp_d_bits(a));
+                return 0;
+            }
             r = sqrt(a);
             {
-                double rf = fp_sqrt_adj(r, a, rm);
+                int ea;
+                double ma;
+                double mr;
+                double rf;
 
+                (void)frexp(a, &ea);
+                ea &= ~1;
+                ma = ldexp(a, -ea);
+                mr = ldexp(r, -(ea / 2));
+                rf = fp_round_d(ctx, r, fp_cmp_sign(fma(-mr, mr, ma)), rm);
                 fp_put_d(ctx, fd, fp_d_bits(rf));
-                if ((long double)rf * (long double)rf != (long double)a) {
-                    fp_raise(ctx, (unsigned)FP_EXC_I);
-                }
                 return 0;
             }
         case 0x00u: /* ADD.D */
@@ -365,112 +443,103 @@ static int fp_arith(mips64_ctx_t *ctx, const mips_dec_t *d, unsigned is_s)
             }
             return 0;
         }
-        switch (d->funct) {
-        case 0x00u:
-            if (isinf(a) && isinf(b) &&
-                ((signbit(a) != 0) != (signbit(b) != 0))) {
+        if (d->funct == 0x00u || d->funct == 0x01u) {
+            double bb = (d->funct == 0x01u) ? -b : b;
+
+            if (isinf(a) && isinf(bb) &&
+                ((signbit(a) != 0) != (signbit(bb) != 0))) {
                 fp_put_d(ctx, fd, FP_DEFNAN_D);
                 fp_raise(ctx, (unsigned)FP_EXC_V);
                 return 0;
             }
-            r = a + b;
-            q = (long double)a + (long double)b;
-            break;
-        case 0x01u:
-            if (isinf(a) && isinf(b) &&
-                ((signbit(a) != 0) == (signbit(b) != 0))) {
-                fp_put_d(ctx, fd, FP_DEFNAN_D);
-                fp_raise(ctx, (unsigned)FP_EXC_V);
+            r = a + bb;
+            if (isinf(a) || isinf(bb)) {
+                fp_put_d(ctx, fd, fp_d_bits(r));
                 return 0;
             }
-            r = a - b;
-            q = (long double)a - (long double)b;
-            break;
-        case 0x02u:
+            if (r == 0.0) {
+                int cancel = (signbit(a) != 0) != (signbit(bb) != 0);
+
+                fp_put_d(ctx, fd, fp_d_bits((rm == 3u && cancel) ? -0.0 : r));
+                return 0;
+            }
+            if (!isfinite(r)) {
+                fp_put_d(ctx, fd, fp_d_bits(fp_round_d(ctx, r,
+                    (r > 0.0) ? -1 : 1, rm)));
+                return 0;
+            }
+            {
+                double a1 = r - bb;
+                double b1 = r - a1;
+                double err = (a - a1) + (bb - b1);
+
+                fp_put_d(ctx, fd, fp_d_bits(fp_round_d(ctx, r,
+                    fp_cmp_sign(err), rm)));
+                return 0;
+            }
+        }
+        if (d->funct == 0x02u) {
             if ((a == 0.0 && isinf(b)) || (isinf(a) && b == 0.0)) {
                 fp_put_d(ctx, fd, FP_DEFNAN_D);
                 fp_raise(ctx, (unsigned)FP_EXC_V);
                 return 0;
             }
             r = a * b;
-            q = (long double)a * (long double)b;
-            break;
-        default:
-            r = 0.0;
-            q = 0.0L;
-            break;
-        }
-        /* DIV.D only: the switch above falls through for funct 0x03. */
-        if (d->funct == 0x03u) {
-            if ((a == 0.0 && b == 0.0) || (isinf(a) && isinf(b))) {
-                fp_put_d(ctx, fd, FP_DEFNAN_D);
-                fp_raise(ctx, (unsigned)FP_EXC_V);
+            if (a == 0.0 || b == 0.0 || isinf(a) || isinf(b)) {
+                fp_put_d(ctx, fd, fp_d_bits(r));
                 return 0;
             }
-            if (b == 0.0) {
-                int sx = (signbit(a) != 0) != (signbit(b) != 0);
-
-                fp_put_d(ctx, fd, fp_d_bits(sx ? -INFINITY : INFINITY));
-                fp_raise(ctx, (unsigned)FP_EXC_Z);
+            if (!isfinite(r)) {
+                fp_put_d(ctx, fd, fp_d_bits(fp_round_d(ctx, r,
+                    (r > 0.0) ? -1 : 1, rm)));
                 return 0;
             }
-            r = a / b;
-            /* Exact-side multiply-back: r*b is exact in quad, so the
-             * comparison against a determines the true side exactly. */
             {
-                long double m = (long double)r * (long double)b;
-                long double la = (long double)a;
-                int err;
+                int ea;
+                int eb;
+                double ma = frexp(a, &ea);
+                double mb = frexp(b, &eb);
+                double mr = ldexp(r, -(ea + eb));
 
-                if (m == la) {
-                    fp_put_d(ctx, fd, fp_d_bits(r));
-                    return 0;
-                }
-                err = (m > la) ? 1 : -1;
-                if (b < 0.0) {
-                    err = -err;
-                }
-                {
-                    double rf = r;
-
-                    if (rm == 1u) {
-                        rf = (((r > 0.0) && err > 0) ||
-                            ((r < 0.0) && err < 0)) ?
-                            nextafter(r, 0.0) : r;
-                    } else if (rm == 2u) {
-                        rf = (err < 0) ? nextafter(r, INFINITY) : r;
-                    } else if (rm == 3u) {
-                        rf = (err > 0) ? nextafter(r, -INFINITY) : r;
-                    }
-                    fp_put_d(ctx, fd, fp_d_bits(rf));
-                    fp_inexact(ctx, (long double)rf,
-                        (long double)a / (long double)b);
-                    return 0;
-                }
-            }
-        }
-        /* Exact-zero cancellation in round-down mode yields -0 (IEEE:
-         * only the add/sub opposite-sign cancellation differs). */
-        if (q == 0.0L && rm == 3u) {
-            int cancel;
-
-            if (d->funct == 0x00u) {
-                cancel = (signbit(a) != 0) != (signbit(b) != 0);
-            } else if (d->funct == 0x01u) {
-                cancel = (signbit(a) != 0) == (signbit(b) != 0);
-            } else {
-                cancel = 0;
-            }
-            if (cancel) {
-                fp_put_d(ctx, fd, fp_d_bits(-0.0));
+                fp_put_d(ctx, fd, fp_d_bits(fp_round_d(ctx, r,
+                    fp_cmp_sign(fma(ma, mb, -mr)), rm)));
                 return 0;
             }
+        }
+        if ((a == 0.0 && b == 0.0) || (isinf(a) && isinf(b))) {
+            fp_put_d(ctx, fd, FP_DEFNAN_D);
+            fp_raise(ctx, (unsigned)FP_EXC_V);
+            return 0;
+        }
+        if (b == 0.0) {
+            int sx = (signbit(a) != 0) != (signbit(b) != 0);
+
+            fp_put_d(ctx, fd, fp_d_bits(sx ? -INFINITY : INFINITY));
+            fp_raise(ctx, (unsigned)FP_EXC_Z);
+            return 0;
+        }
+        r = a / b;
+        if (a == 0.0 || isinf(a) || isinf(b)) {
+            fp_put_d(ctx, fd, fp_d_bits(r));
+            return 0;
+        }
+        if (!isfinite(r)) {
+            fp_put_d(ctx, fd, fp_d_bits(fp_round_d(ctx, r,
+                (r > 0.0) ? -1 : 1, rm)));
+            return 0;
         }
         {
-            double rf = fp_adj_d(r, q, rm);
+            int ea;
+            int eb;
+            double ma = frexp(a, &ea);
+            double mb = frexp(b, &eb);
+            double mr = ldexp(r, eb - ea);
+            int cmp = fp_cmp_sign(fma(-mr, mb, ma));
 
-            fp_put_d(ctx, fd, fp_d_bits(rf));
-            fp_inexact(ctx, (long double)rf, q);
+            if (mb < 0.0) {
+                cmp = -cmp;
+            }
+            fp_put_d(ctx, fd, fp_d_bits(fp_round_d(ctx, r, cmp, rm)));
             return 0;
         }
     }

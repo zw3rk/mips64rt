@@ -12,10 +12,11 @@
  * I-cache. Because every cache (block cache, IBTC) is thread-local, a
  * thread never executes code from another thread's chunk while that
  * chunk's tail page is briefly RW for the next copy — strict W^X
- * holds even for multi-threaded guests. Exhausted chunks (and the
- * whole arena) are retained until process end: the RC2 1024-entry
- * bound keeps the working set small and no live IBTC slot can ever
- * dangle.
+ * holds even for multi-threaded guests. Up to DBT_ARENA_RETAIN_MAX
+ * chunks are retained per thread; when that bound is reached (or on
+ * thread teardown via dbt_thread_exit), dbt_flush_thread_caches clears
+ * the thread-local block cache and IBTC before dbt_arena_reset unmaps
+ * the thread's chunks so no live cache/IBTC entry can dangle.
  *
  * The chunk bookkeeping (base/used/cap) lives in thread-local
  * scalars, NEVER inside the JIT mapping: per-publish page-range
@@ -39,8 +40,8 @@
  * host page size itself). */
 #define DBT_ARENA_CHUNK (8u * 1024u * 1024u)
 
-/* Retained mappings (never unmapped: published code stays valid until
- * process end, so no live IBTC slot can dangle). */
+/* Maximum retained chunks per thread before dbt_flush_thread_caches
+ * flushes the thread-local caches and dbt_arena_reset reclaims them. */
 #define DBT_ARENA_RETAIN_MAX 64u
 
 typedef struct {

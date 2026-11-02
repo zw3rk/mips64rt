@@ -12,6 +12,7 @@
  * RC3 suite; DBT falls back to interp_step for every word here).
  */
 
+#include <float.h>
 #include <math.h>
 #include <stdint.h>
 
@@ -141,10 +142,17 @@ static uint32_t fp_ps_lane(unsigned op, uint32_t au, uint32_t bu,
         q = (long double)a * (long double)b;
         break;
     }
-    if ((isinf((double)r) != 0) && (isinf(q) == 0)) {
+    if (((isinf((double)r) != 0) || fabsl(q) > (long double)FLT_MAX) &&
+        (isinf(q) == 0)) {
         *exc |= (1u << (unsigned)FP_EXC_O) | (1u << (unsigned)FP_EXC_I);
-    } else if ((long double)r != q) {
-        *exc |= 1u << (unsigned)FP_EXC_I;
+    } else {
+        if (q != 0.0L && fabsl(q) < (long double)FLT_MIN &&
+            (long double)r != q) {
+            *exc |= 1u << (unsigned)FP_EXC_U;
+        }
+        if ((long double)r != q) {
+            *exc |= 1u << (unsigned)FP_EXC_I;
+        }
     }
     return fp_f_bits(r);
 }
@@ -325,7 +333,36 @@ int fp_cop1x(mips64_ctx_t *ctx, uint64_t cur_pc, const mips_dec_t *d)
             return fp_finish_trap(ctx, cur_pc, fd, saved_fpr, saved_cc, 0);
         }
         fp_put_d(ctx, fd, fp_d_bits(r));
-        fp_inexact(ctx, (long double)r, q);
+        if ((isinf(r) != 0) && !isinf(a) && !isinf(b) && !isinf(c)) {
+            fp_raise(ctx, (unsigned)FP_EXC_O);
+            fp_raise(ctx, (unsigned)FP_EXC_I);
+        } else if (isfinite(r) && isfinite(a) && isfinite(b) && isfinite(c)) {
+            double p_hi = (d->funct == 0x39u) ? (-b * c) : (b * c);
+            double p_lo = (d->funct == 0x39u) ? fma(-b, c, -p_hi)
+                                              : fma(b, c, -p_hi);
+            double aa = (d->funct == 0x29u) ? -a : a;
+            double rr = (d->funct == 0x31u) ? -r : r;
+            double s_hi = aa + p_hi;
+            int inex = 0;
+
+            if (isfinite(p_hi) && isfinite(s_hi)) {
+                double a1 = s_hi - p_hi;
+                double p1 = s_hi - a1;
+                double s_lo = (aa - a1) + (p_hi - p1);
+
+                inex = ((rr - s_hi) != (s_lo + p_lo));
+            } else {
+                inex = ((long double)r != q);
+            }
+            if (r != 0.0 && fabs(r) < DBL_MIN &&
+                (inex ||
+                 (ctx->fcsr & (1u << (7u + (unsigned)FP_EXC_U))) != 0u)) {
+                fp_raise(ctx, (unsigned)FP_EXC_U);
+            }
+            if (inex) {
+                fp_raise(ctx, (unsigned)FP_EXC_I);
+            }
+        }
         return fp_finish_trap(ctx, cur_pc, fd, saved_fpr, saved_cc, 0);
     }
 }

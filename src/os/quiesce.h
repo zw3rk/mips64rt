@@ -105,4 +105,8 @@ void mips_qs_unregister(mips64_ctx_t *ctx);
  * visible to preemption. Idempotent; NULL ctx is a no-op. */
 void mips_qs_register(mips64_ctx_t *ctx);
 
+/* Reset quiescence registry and mutex in a fork() child so only the
+ * surviving child thread remains registered. */
+void mips_qs_atfork_child(mips64_ctx_t *ctx);
+
 #endif /* MIPS64RT_OS_QUIESCE_H */
