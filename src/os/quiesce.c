@@ -49,7 +49,7 @@
 typedef struct {
     _Atomic(int) used;
     _Atomic(const mips64_ctx_t *) key;
-    pthread_t pthread;
+    _Atomic(pthread_t) pthread;
     _Atomic(long) tid;
     _Atomic(long) pid;
     _Atomic(int) state;
@@ -95,7 +95,8 @@ static qs_slot_t *qs_slot_for(const mips64_ctx_t *ctx, int create)
                 &qs_slots[i].used, &expect, QS_SLOT_INIT,
                 memory_order_acq_rel, memory_order_relaxed)) {
             atomic_store_explicit(&qs_slots[i].key, ctx, memory_order_relaxed);
-            qs_slots[i].pthread = pthread_self();
+            atomic_store_explicit(&qs_slots[i].pthread, pthread_self(),
+                                  memory_order_relaxed);
             qs_slots[i].depth = 0;
             qs_slots[i].saved_leases = 0;
             atomic_store_explicit(&qs_slots[i].leases, 0, memory_order_relaxed);
@@ -127,9 +128,10 @@ static qs_slot_t *qs_slot_for(const mips64_ctx_t *ctx, int create)
 static void qs_touch(qs_slot_t *s)
 {
     pthread_t self = pthread_self();
+    pthread_t cur = atomic_load_explicit(&s->pthread, memory_order_relaxed);
 
-    if (!pthread_equal(s->pthread, self)) {
-        s->pthread = self;
+    if (!pthread_equal(cur, self)) {
+        atomic_store_explicit(&s->pthread, self, memory_order_relaxed);
 #if defined(__linux__)
         atomic_store_explicit(&s->tid, syscall(SYS_gettid),
                               memory_order_relaxed);
@@ -178,7 +180,10 @@ static void qs_preempt_handler(int sig, siginfo_t *si, void *uc)
     for (i = 0u; i < QS_MAX_SLOTS; i++) {
         if (atomic_load_explicit(&qs_slots[i].used, memory_order_acquire) ==
                 QS_SLOT_LIVE &&
-            pthread_equal(qs_slots[i].pthread, self)) {
+            pthread_equal(
+                atomic_load_explicit(&qs_slots[i].pthread,
+                                     memory_order_relaxed),
+                self)) {
             uint64_t hpc;
             uint64_t seq = 0u;
 
@@ -219,7 +224,8 @@ static void qs_preempt_peer(qs_slot_t *s)
 
     (void)syscall(SYS_tgkill, pid, tid, QS_PREEMPT_SIG);
 #else
-    (void)pthread_kill(s->pthread, QS_PREEMPT_SIG);
+    (void)pthread_kill(atomic_load_explicit(&s->pthread, memory_order_relaxed),
+                       QS_PREEMPT_SIG);
 #endif
 }
 
@@ -336,7 +342,10 @@ void mips_qs_begin(mips64_ctx_t *ctx)
             if (atomic_load_explicit(&qs_slots[i].used,
                                      memory_order_acquire) != QS_SLOT_LIVE ||
                 &qs_slots[i] == s ||
-                pthread_equal(qs_slots[i].pthread, self)) {
+                pthread_equal(
+                    atomic_load_explicit(&qs_slots[i].pthread,
+                                         memory_order_relaxed),
+                    self)) {
                 continue;
             }
             st = atomic_load(&qs_slots[i].state);
@@ -352,7 +361,10 @@ void mips_qs_begin(mips64_ctx_t *ctx)
             if (atomic_load_explicit(&qs_slots[i].used,
                                      memory_order_acquire) == QS_SLOT_LIVE &&
                 &qs_slots[i] != s &&
-                !pthread_equal(qs_slots[i].pthread, self) &&
+                !pthread_equal(
+                    atomic_load_explicit(&qs_slots[i].pthread,
+                                         memory_order_relaxed),
+                    self) &&
                 atomic_load(&qs_slots[i].state) != MIPS_QS_PARKED &&
                 atomic_load(&qs_slots[i].leases) == 0) {
                 qs_preempt_peer(&qs_slots[i]);
@@ -478,7 +490,8 @@ void mips_qs_atfork_child(mips64_ctx_t *ctx)
         return;
     }
     atomic_store_explicit(&qs_slots[0].key, ctx, memory_order_relaxed);
-    qs_slots[0].pthread = pthread_self();
+    atomic_store_explicit(&qs_slots[0].pthread, pthread_self(),
+                          memory_order_relaxed);
 #if defined(__linux__)
     atomic_store_explicit(&qs_slots[0].tid, syscall(SYS_gettid),
                           memory_order_relaxed);

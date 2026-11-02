@@ -195,7 +195,7 @@ int fp_finish_trap(mips64_ctx_t *ctx, uint64_t cur_pc, unsigned fd,
  * U (+I) on tiny inexact (or trapped tininess), and I on inexact. */
 void fp_inexact(mips64_ctx_t *ctx, long double rf, long double q)
 {
-    if (((isinf(rf) != 0) || fabsl(q) > (long double)FLT_MAX) &&
+    if (((isinf(rf) != 0) || (isinf((float)q) != 0)) &&
         (isinf(q) == 0)) {
         fp_raise(ctx, (unsigned)FP_EXC_O);
         fp_raise(ctx, (unsigned)FP_EXC_I);
@@ -246,9 +246,7 @@ double fp_round_d(mips64_ctx_t *ctx, double r, int cmp, unsigned rm)
             }
         }
     }
-    if (!isfinite(rf) ||
-        (fabs(r) == DBL_MAX &&
-         ((r > 0.0 && cmp > 0) || (r < 0.0 && cmp < 0)))) {
+    if (!isfinite(rf)) {
         fp_raise(ctx, (unsigned)FP_EXC_O);
         fp_raise(ctx, (unsigned)FP_EXC_I);
         return rf;

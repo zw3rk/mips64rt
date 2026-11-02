@@ -142,8 +142,7 @@ static uint32_t fp_ps_lane(unsigned op, uint32_t au, uint32_t bu,
         q = (long double)a * (long double)b;
         break;
     }
-    if (((isinf((double)r) != 0) || fabsl(q) > (long double)FLT_MAX) &&
-        (isinf(q) == 0)) {
+    if ((isinf((double)r) != 0) && (isinf(q) == 0)) {
         *exc |= (1u << (unsigned)FP_EXC_O) | (1u << (unsigned)FP_EXC_I);
     } else {
         if (q != 0.0L && fabsl(q) < (long double)FLT_MIN &&

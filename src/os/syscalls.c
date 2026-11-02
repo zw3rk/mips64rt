@@ -463,6 +463,7 @@ int64_t mips_sc_pipe2(mips64_ctx_t *ctx, uint64_t fds_va, uint64_t flags)
 #endif
     putn(p, (uint64_t)(uint32_t)fds[0], 4, ctx->is_be != 0U);
     putn(p + 4, (uint64_t)(uint32_t)fds[1], 4, ctx->is_be != 0U);
+    mips_llsc_note_write(fds_va, 8U);
     return l2a_ret(ctx, 0);
 }
 
@@ -529,6 +530,7 @@ int64_t mips_sc_readlinkat(mips64_ctx_t *ctx, uint64_t dirfd,
     if (n < 0) {
         return l2a_ret(ctx, -(int64_t)errno);
     }
+    mips_llsc_note_write(buf_va, size);
     return l2a_ret(ctx, (int64_t)n);
 }
 
@@ -652,6 +654,7 @@ int64_t mips_sc_getrandom(mips64_ctx_t *ctx, uint64_t buf_va, uint64_t len,
             s ^= s << 17;
             p[i] = (uint8_t)s;
         }
+        mips_llsc_note_write(buf_va, len);
         return l2a_ret(ctx, (int64_t)len);
     }
 #if defined(__linux__)
@@ -659,9 +662,15 @@ int64_t mips_sc_getrandom(mips64_ctx_t *ctx, uint64_t buf_va, uint64_t len,
     if (n < 0) {
         return l2a_ret(ctx, -(int64_t)errno);
     }
+    mips_llsc_note_write(buf_va, len);
     return l2a_ret(ctx, (int64_t)n);
 #else
-    return l2a_ret(ctx, l2a_getentropy_fill(p, (size_t)len));
+    {
+        int64_t gn = l2a_getentropy_fill(p, (size_t)len);
+
+        mips_llsc_note_write(buf_va, len);
+        return l2a_ret(ctx, gn);
+    }
 #endif
 }
 
@@ -699,25 +708,14 @@ int64_t mips_sc_getdents64(mips64_ctx_t *ctx, uint64_t fd, uint64_t dirp_va,
             off += (int64_t)reclen;
         }
     }
+    mips_llsc_note_write(dirp_va, count);
     return l2a_ret(ctx, (int64_t)n);
 }
 
-/* Lane H2: additive libc-test/LTP helpers (no reshaping of the L2a
- * paths above). Each entry follows the same conventions (l2a_ret,
- * guest_str, sysroot join, endian-aware putn/getn). The dispatch arms
- * in src/os/syscall_min.c are outside this lane's exclusive files, so
- * the RC-H coordinator wires these numbers to the entries below:
- *   unlink 5085/6085 -> mips_sc_unlink,
- *   truncate 5074/6074 -> mips_sc_truncate,
- *   ftruncate 5075/6075 -> mips_sc_ftruncate,
- *   symlinkat 5256/6260 -> mips_sc_symlinkat,
- *   clock_getres 5223/6227 -> mips_sc_clock_getres,
- *   clock_nanosleep 5224/6228 (+ N32 time64 6407) ->
- *     mips_sc_clock_nanosleep (true 4-arg ABI; see below).
- * Until then the suites observe -ENOSYS (89) on these numbers. The
- * N32 fcntl64 path glibc's fcntl() lowers to is NOT covered here: it
- * needs a new src/os/syscall_nr.h number (frozen) plus dispatch, so
- * it stays -ENOSYS and is reported back (escalation rule). */
+/* Lane H2 helpers (unlink/truncate/ftruncate/symlinkat/clock_getres/
+ * clock_nanosleep): same l2a_ret/guest_str/sysroot/putn conventions.
+ * Dispatch arms live in syscall_min.c (RC-H wires them). N32 fcntl64
+ * stays -ENOSYS (needs a frozen syscall_nr.h number). */
 
 /* Legacy unlink(2) (N64 5085 / N32 6085): unlinkat(AT_FDCWD).
  * glibc unlink() still emits the legacy number (qemu-observed). */
@@ -818,6 +816,7 @@ int64_t mips_sc_clock_getres(mips64_ctx_t *ctx, uint64_t clk,
         putn(p, (uint64_t)(uint32_t)(int32_t)ts.tv_sec, 4, be);
         putn(p + 4, (uint64_t)(uint32_t)(int32_t)ts.tv_nsec, 4, be);
     }
+    mips_llsc_note_write(ts_va, is64 ? 16U : 8U);
     return l2a_ret(ctx, 0);
 }
 
@@ -886,6 +885,7 @@ int64_t mips_sc_clock_nanosleep(mips64_ctx_t *ctx, uint64_t clk,
                          (uint64_t)(uint32_t)(int32_t)remp->tv_nsec,
                          4, be);
                 }
+                mips_llsc_note_write(rem_va, is64 ? 16U : 8U);
             }
         }
         return l2a_ret(ctx, rc);

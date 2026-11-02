@@ -24,12 +24,16 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 
 #include "core/cpu.h"
 #include "interp/interp.h"
 #include "os/backend.h"
 #include "os/quiesce.h"
 #include "vm/vm_pages.h"
+
+extern void mips_vm_file_shared_sync(mips64_ctx_t *ctx, uint64_t va,
+                                     uint64_t len);
 
 /* Byte position p (0 = LSB) of a 32/64-bit value. */
 static uint32_t get_pos32(uint32_t v, unsigned p)
@@ -478,7 +482,6 @@ int do_ll(mips64_ctx_t *ctx, uint64_t addr, unsigned rt)
 int do_sc(mips64_ctx_t *ctx, uint64_t addr, unsigned rt)
 {
     uint64_t v = 0u;
-    uint64_t cur = 0u;
     int sc_ok = 0;
 
     if ((addr & 3u) != 0u) {
@@ -498,21 +501,73 @@ int do_sc(mips64_ctx_t *ctx, uint64_t addr, unsigned rt)
         if (s != NULL) {
             s->active = 0;
         }
-        if (guest_ld32(ctx, addr, &cur) != 0) {
-            sc_lock_release();
-            return MIPS_FAULT;
-        }
-        if (epoch_ok && cur == ctx->llval) {
-            /* Hold sc_lock across guest_st32 (which updates the epoch
-             * and invalidates peer reservations via mips_llsc_note_write)
-             * so the check+store is atomic against ordinary stores. */
-            if (guest_st32(ctx, addr, ctx->gpr[rt] & 0xFFFFFFFFu) != 0) {
+        if (epoch_ok == 0) {
+            /* Dead reservation still faults on a bad address (load
+             * side effect preserved). */
+            uint64_t dummy = 0u;
+
+            if (guest_ld32(ctx, addr, &dummy) != 0) {
                 sc_lock_release();
                 return MIPS_FAULT;
             }
-            sc_ok = 1;
+            sc_lock_release();
+        } else {
+            uint32_t want;
+            uint32_t expect;
+            uint8_t eb[4];
+            uint8_t db[4];
+            uint32_t exp_h;
+            uint32_t des_h;
+            uint32_t *hp;
+            uint32_t cur_h;
+
+            if (!mips_mem_ok(ctx, addr, 4u,
+                             (uint32_t)MIPS_PROT_WRITE)) {
+                sc_lock_release();
+                mips_fault(ctx, addr);
+                return MIPS_FAULT;
+            }
+            want = (uint32_t)(ctx->gpr[rt] & 0xFFFFFFFFu);
+            expect = (uint32_t)(ctx->llval & 0xFFFFFFFFu);
+            if (mips_is_be(ctx) != 0) {
+                eb[0] = (uint8_t)((expect >> 24) & 0xFFu);
+                eb[1] = (uint8_t)((expect >> 16) & 0xFFu);
+                eb[2] = (uint8_t)((expect >> 8) & 0xFFu);
+                eb[3] = (uint8_t)(expect & 0xFFu);
+                db[0] = (uint8_t)((want >> 24) & 0xFFu);
+                db[1] = (uint8_t)((want >> 16) & 0xFFu);
+                db[2] = (uint8_t)((want >> 8) & 0xFFu);
+                db[3] = (uint8_t)(want & 0xFFu);
+            } else {
+                eb[0] = (uint8_t)(expect & 0xFFu);
+                eb[1] = (uint8_t)((expect >> 8) & 0xFFu);
+                eb[2] = (uint8_t)((expect >> 16) & 0xFFu);
+                eb[3] = (uint8_t)((expect >> 24) & 0xFFu);
+                db[0] = (uint8_t)(want & 0xFFu);
+                db[1] = (uint8_t)((want >> 8) & 0xFFu);
+                db[2] = (uint8_t)((want >> 16) & 0xFFu);
+                db[3] = (uint8_t)((want >> 24) & 0xFFu);
+            }
+            (void)memcpy(&exp_h, eb, 4u);
+            (void)memcpy(&des_h, db, 4u);
+            hp = (uint32_t *)mips64_guest_ptr(ctx, addr);
+            cur_h = exp_h;
+            /* Host CAS under sc_lock: the value check and the store
+             * are indivisible against DBT inline stores, which emit
+             * plain host stores without taking sc_lock. Locked
+             * writers are already serialized by sc_lock + epoch. */
+            if (__atomic_compare_exchange_n(hp, &cur_h, des_h, 0,
+                                            __ATOMIC_ACQ_REL,
+                                            __ATOMIC_ACQUIRE) != 0) {
+                llsc_note_write_locked(addr, 4u);
+                mips_vm_pages_clear(addr, 4u,
+                    (unsigned)MIPS_VM_PAGE_COW_CLEAN);
+                mips_vm_pages_retire_code(addr, 4u);
+                mips_vm_file_shared_sync(ctx, addr, 4u);
+                sc_ok = 1;
+            }
+            sc_lock_release();
         }
-        sc_lock_release();
     } else if (guest_ld32(ctx, addr, &v) != 0) {
         return MIPS_FAULT;
     }
@@ -557,7 +612,6 @@ int do_lld(mips64_ctx_t *ctx, uint64_t addr, unsigned rt)
 int do_scd(mips64_ctx_t *ctx, uint64_t addr, unsigned rt)
 {
     uint64_t v = 0u;
-    uint64_t cur = 0u;
     int sc_ok = 0;
 
     if ((addr & 7u) != 0u) {
@@ -580,18 +634,62 @@ int do_scd(mips64_ctx_t *ctx, uint64_t addr, unsigned rt)
         if (s != NULL) {
             s->active = 0;
         }
-        if (guest_ld64(ctx, addr, &cur) != 0) {
-            sc_lock_release();
-            return MIPS_FAULT;
-        }
-        if (epoch_ok && cur == ctx->llval) {
-            if (guest_st64(ctx, addr, ctx->gpr[rt]) != 0) {
+        if (epoch_ok == 0) {
+            uint64_t dummy = 0u;
+
+            if (guest_ld64(ctx, addr, &dummy) != 0) {
                 sc_lock_release();
                 return MIPS_FAULT;
             }
-            sc_ok = 1;
+            sc_lock_release();
+        } else {
+            uint64_t want = ctx->gpr[rt];
+            uint64_t expect = ctx->llval;
+            uint8_t eb[8];
+            uint8_t db[8];
+            uint64_t exp_h = 0u;
+            uint64_t des_h = 0u;
+            uint64_t *hp;
+            uint64_t cur_h;
+            unsigned i;
+
+            if (!mips_mem_ok(ctx, addr, 8u,
+                             (uint32_t)MIPS_PROT_WRITE)) {
+                sc_lock_release();
+                mips_fault(ctx, addr);
+                return MIPS_FAULT;
+            }
+            if (mips_is_be(ctx) != 0) {
+                for (i = 0u; i < 8u; i++) {
+                    eb[i] = (uint8_t)((expect >> (8u * (7u - i))) &
+                        0xFFu);
+                    db[i] = (uint8_t)((want >> (8u * (7u - i))) &
+                        0xFFu);
+                }
+            } else {
+                for (i = 0u; i < 8u; i++) {
+                    eb[i] = (uint8_t)((expect >> (8u * i)) & 0xFFu);
+                    db[i] = (uint8_t)((want >> (8u * i)) & 0xFFu);
+                }
+            }
+            (void)memcpy(&exp_h, eb, 8u);
+            (void)memcpy(&des_h, db, 8u);
+            hp = (uint64_t *)mips64_guest_ptr(ctx, addr);
+            cur_h = exp_h;
+            /* Host CAS under sc_lock: indivisible against DBT
+             * inline doubleword stores (see do_sc). */
+            if (__atomic_compare_exchange_n(hp, &cur_h, des_h, 0,
+                                            __ATOMIC_ACQ_REL,
+                                            __ATOMIC_ACQUIRE) != 0) {
+                llsc_note_write_locked(addr, 8u);
+                mips_vm_pages_clear(addr, 8u,
+                    (unsigned)MIPS_VM_PAGE_COW_CLEAN);
+                mips_vm_pages_retire_code(addr, 8u);
+                mips_vm_file_shared_sync(ctx, addr, 8u);
+                sc_ok = 1;
+            }
+            sc_lock_release();
         }
-        sc_lock_release();
     } else if (guest_ld64(ctx, addr, &v) != 0) {
         return MIPS_FAULT;
     }
