@@ -40,6 +40,8 @@ extern uint64_t getn(const uint8_t *p, unsigned n, int be);
 extern uint8_t *guest_range(mips64_ctx_t *ctx, uint64_t va, uint64_t len,
                             int write);
 extern int64_t guest_str(mips64_ctx_t *ctx, uint64_t va, char *out);
+extern int64_t mips_sc_copyout(mips64_ctx_t *ctx, uint64_t va,
+                               const void *src, uint64_t len);
 
 /* sys/stat.h maps st_atime -> st_atim.tv_sec (and st_mtime/st_ctime
  * likewise); undo it so the MIPS UAPI member names below resolve to
@@ -113,22 +115,21 @@ static int64_t emit_stat(mips64_ctx_t *ctx, const struct stat *hs,
         (uint64_t)hs->st_blksize, (uint64_t)hs->st_blocks,
     };
     uint8_t img[104];
-    uint8_t *dst = guest_range(ctx, buf_va, sizeof img, 1);
     size_t i;
     int be;
 
     _Static_assert(sizeof l2a_stat_fields / sizeof l2a_stat_fields[0] ==
                    sizeof v / sizeof v[0], "stat field/value count");
-    if (dst == NULL) {
-        return -(int64_t)EFAULT;
-    }
     be = ctx->is_be != 0U;
     memset(img, 0, sizeof img);
     for (i = 0U; i < sizeof v / sizeof v[0]; i++) {
         putn(img + l2a_stat_fields[i].off, v[i], l2a_stat_fields[i].sz,
              be);
     }
-    memcpy(dst, img, sizeof img);
+    /* Stage in host memory, commit under sc_lock (R3-1). */
+    if (mips_sc_copyout(ctx, buf_va, img, sizeof img) != 0) {
+        return -(int64_t)EFAULT;
+    }
     return 0;
 }
 
@@ -243,15 +244,11 @@ static int64_t emit_statx(mips64_ctx_t *ctx, const struct statx *hs,
     };
     const uint8_t *hp = (const uint8_t *)hs;
     uint8_t img[256];
-    uint8_t *dst = guest_range(ctx, buf_va, sizeof img, 1);
     size_t i;
     int be;
 
     _Static_assert(sizeof l2a_statx_fields / sizeof l2a_statx_fields[0] ==
                    sizeof v / sizeof v[0], "statx field/value count");
-    if (dst == NULL) {
-        return -(int64_t)EFAULT;
-    }
     be = ctx->is_be != 0U;
     memset(img, 0, sizeof img);
     for (i = 0U; i < sizeof v / sizeof v[0]; i++) {
@@ -269,7 +266,10 @@ static int64_t emit_statx(mips64_ctx_t *ctx, const struct statx *hs,
         putn(img + 152, getn(hp + 152, 4, 0), 4, be);
         putn(img + 156, getn(hp + 156, 4, 0), 4, be);
     }
-    memcpy(dst, img, sizeof img);
+    /* Stage in host memory, commit under sc_lock (R3-1). */
+    if (mips_sc_copyout(ctx, buf_va, img, sizeof img) != 0) {
+        return -(int64_t)EFAULT;
+    }
     return 0;
 }
 #endif /* statx fill is Linux-only; see below. */

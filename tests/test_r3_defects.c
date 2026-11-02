@@ -10,7 +10,8 @@
  * - R3-1: a same-value mips_sc_copyout clears the LL reservation, so
  *   a following SC fails (copyout + invalidation commit together).
  * - R3-2: ADD.S/SUB.S with an absorbed small operand (1.0f +/- 2^-126)
- *   round exactly under all four FCSR modes and always set Inexact.
+ *   round exactly under all four FCSR modes and always set Inexact;
+ *   single-infinite operands stay +-Inf with no flags in all modes.
  * - R3-3: a 65-entry writev issues one host call (one datagram on a
  *   SOCK_DGRAM socketpair, not two).
  * - R3-4: l2a_vec_copyout reports bytes already committed when a
@@ -128,7 +129,8 @@ static void r3_setup(void)
     }
 }
 
-/* R3-2: absorbed-operand ADD.S/SUB.S under RM 0..3. */
+/* R3-2: absorbed-operand ADD.S/SUB.S under RM 0..3, plus
+ * single-infinite operands (no flags, result stays +-Inf). */
 static void t_fp_swallow(void)
 {
     static const struct {
@@ -151,6 +153,22 @@ static void t_fp_swallow(void)
         { 0xBF800000u, 0x80800000u, 0x00u, 1u, 0xBF800000u, 0x1005u },
         { 0xBF800000u, 0x80800000u, 0x00u, 2u, 0xBF800000u, 0x1006u },
         { 0xBF800000u, 0x80800000u, 0x00u, 3u, 0xBF800001u, 0x1007u },
+        { 0x7F800000u, 0xBF800000u, 0x00u, 0u, 0x7F800000u, 0x0000u },
+        { 0x7F800000u, 0xBF800000u, 0x00u, 1u, 0x7F800000u, 0x0001u },
+        { 0x7F800000u, 0xBF800000u, 0x00u, 2u, 0x7F800000u, 0x0002u },
+        { 0x7F800000u, 0xBF800000u, 0x00u, 3u, 0x7F800000u, 0x0003u },
+        { 0xFF800000u, 0x3F800000u, 0x00u, 0u, 0xFF800000u, 0x0000u },
+        { 0xFF800000u, 0x3F800000u, 0x00u, 1u, 0xFF800000u, 0x0001u },
+        { 0xFF800000u, 0x3F800000u, 0x00u, 2u, 0xFF800000u, 0x0002u },
+        { 0xFF800000u, 0x3F800000u, 0x00u, 3u, 0xFF800000u, 0x0003u },
+        { 0x7F800000u, 0xBF800000u, 0x01u, 0u, 0x7F800000u, 0x0000u },
+        { 0x7F800000u, 0xBF800000u, 0x01u, 1u, 0x7F800000u, 0x0001u },
+        { 0x7F800000u, 0xBF800000u, 0x01u, 2u, 0x7F800000u, 0x0002u },
+        { 0x7F800000u, 0xBF800000u, 0x01u, 3u, 0x7F800000u, 0x0003u },
+        { 0xFF800000u, 0x3F800000u, 0x01u, 0u, 0xFF800000u, 0x0000u },
+        { 0xFF800000u, 0x3F800000u, 0x01u, 1u, 0xFF800000u, 0x0001u },
+        { 0xFF800000u, 0x3F800000u, 0x01u, 2u, 0xFF800000u, 0x0002u },
+        { 0xFF800000u, 0x3F800000u, 0x01u, 3u, 0xFF800000u, 0x0003u },
     };
     size_t i;
     char name[64];

@@ -57,6 +57,8 @@ extern void putn(uint8_t *p, uint64_t v, unsigned n, int be);
 extern uint64_t getn(const uint8_t *p, unsigned n, int be);
 extern uint8_t *guest_range(mips64_ctx_t *ctx, uint64_t va, uint64_t len,
                             int write);
+extern int64_t mips_sc_copyout(mips64_ctx_t *ctx, uint64_t va,
+                               const void *src, uint64_t len);
 /* Lane-internal table reset owned by src/os/sigact.c (lane L4a). */
 extern void mips_l4a_action_reset(mips64_ctx_t *ctx, int signo);
 
@@ -78,6 +80,11 @@ extern void mips_l4a_action_reset(mips64_ctx_t *ctx, int signo);
 
 #define L4B_UNBLOCKABLE \
     ((UINT64_C(1) << (9 - 1)) | (UINT64_C(1) << (23 - 1)))
+
+/* Largest rt_sigframe (N64 808 bytes; N32 792). The delivery path
+ * stages the whole frame in host memory and commits it through
+ * mips_sc_copyout (R3-1). Fixed size, never a VLA. */
+#define L4B_FRAME_MAX 808U
 
 /* SI_KERNEL: code for translator-synthesized and bad-frame signals. */
 #define L4B_SI_KERNEL 128
@@ -244,7 +251,8 @@ int mips_raise_guest(mips64_ctx_t *ctx, int signo, uint64_t fault_addr)
     uint64_t size;
     uint64_t sp;
     uint64_t frame;
-    uint8_t *f;
+    uint8_t stage[L4B_FRAME_MAX];
+    uint8_t *f = stage;
     uint64_t sc_pc;
     uint32_t i;
 
@@ -298,15 +306,7 @@ int mips_raise_guest(mips64_ctx_t *ctx, int signo, uint64_t fault_addr)
         l4b_force_bad_frame(ctx, frame);
         return 1;
     }
-    f = guest_range(ctx, frame, size, 1);
-    if (f == NULL) {
-        if (signo == L4B_SIGSEGV) {
-            return 1;
-        }
-        l4b_force_bad_frame(ctx, frame);
-        return 1;
-    }
-    memset(f, 0, (size_t)size);
+    memset(f, 0, sizeof stage);
     /* siginfo: signo@0 code@4 errno@8, then addr at +16 (8 bytes
      * N64) or +12 (4 bytes N32: 4-byte pointers need no pad). */
     putn(f + 24, (uint64_t)(uint32_t)signo, 4, be);
@@ -383,6 +383,15 @@ int mips_raise_guest(mips64_ctx_t *ctx, int signo, uint64_t fault_addr)
             putn(s, ctx->sig_blocked[0], 8, be);
             putn(s + 8, ctx->sig_blocked[1], 8, be);
         }
+    }
+    /* Commit the staged frame under sc_lock (R3-1); a revalidation
+     * failure mirrors the old unreadable-frame path. */
+    if (mips_sc_copyout(ctx, frame, f, size) != 0) {
+        if (signo == L4B_SIGSEGV) {
+            return 1;
+        }
+        l4b_force_bad_frame(ctx, frame);
+        return 1;
     }
     /* One-shot actions revert to SIG_DFL on delivery. */
     if ((act.flags & L4B_SA_RESETHAND) != 0U) {

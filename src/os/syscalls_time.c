@@ -28,26 +28,33 @@ extern void mips_qs_lease_enter(mips64_ctx_t *ctx);
 extern void mips_qs_lease_exit(mips64_ctx_t *ctx);
 
 /* Shared helpers owned by src/os/syscalls.c. */
+extern int mips_mem_ok(const mips64_ctx_t *ctx, uint64_t va, uint64_t len,
+                       uint32_t need);
 extern int64_t l2a_ret(mips64_ctx_t *ctx, int64_t raw);
 extern void putn(uint8_t *p, uint64_t v, unsigned n, int be);
 extern uint64_t getn(const uint8_t *p, unsigned n, int be);
 extern uint8_t *guest_range(mips64_ctx_t *ctx, uint64_t va, uint64_t len,
                             int write);
+extern int64_t mips_sc_copyout(mips64_ctx_t *ctx, uint64_t va,
+                               const void *src, uint64_t len);
 
 #define L2A_NSEC_PER_SEC 1000000000L
 
-/* Guest timespec transfer in either layout. */
+/* Guest timespec transfer in either layout. Reads use the direct
+ * guest window; writes stage in host memory and commit through
+ * mips_sc_copyout (R3-1) so bytes and LL/SC invalidation land
+ * together under sc_lock. */
 static int64_t xfer_ts(mips64_ctx_t *ctx, uint64_t va, int is64,
                        struct timespec *ts, int write)
 {
-    uint8_t *p = guest_range(ctx, va, is64 ? 16U : 8U, write);
-    int be;
+    int be = ctx->is_be != 0U;
 
-    if (p == NULL) {
-        return -(int64_t)EFAULT;
-    }
-    be = ctx->is_be != 0U;
     if (!write) {
+        const uint8_t *p = guest_range(ctx, va, is64 ? 16U : 8U, 0);
+
+        if (p == NULL) {
+            return -(int64_t)EFAULT;
+        }
         if (is64) {
             ts->tv_sec = (time_t)getn(p, 8, be);
             ts->tv_nsec = (long)getn(p + 8, 8, be);
@@ -57,12 +64,20 @@ static int64_t xfer_ts(mips64_ctx_t *ctx, uint64_t va, int is64,
         }
         return 0;
     }
-    if (is64) {
-        putn(p, (uint64_t)(int64_t)ts->tv_sec, 8, be);
-        putn(p + 8, (uint64_t)(int64_t)ts->tv_nsec, 8, be);
-    } else {
-        putn(p, (uint64_t)(uint32_t)(int32_t)ts->tv_sec, 4, be);
-        putn(p + 4, (uint64_t)(uint32_t)(int32_t)ts->tv_nsec, 4, be);
+    {
+        uint8_t img[16];
+
+        if (is64) {
+            putn(img, (uint64_t)(int64_t)ts->tv_sec, 8, be);
+            putn(img + 8, (uint64_t)(int64_t)ts->tv_nsec, 8, be);
+        } else {
+            putn(img, (uint64_t)(uint32_t)(int32_t)ts->tv_sec, 4, be);
+            putn(img + 4, (uint64_t)(uint32_t)(int32_t)ts->tv_nsec,
+                 4, be);
+        }
+        if (mips_sc_copyout(ctx, va, img, is64 ? 16U : 8U) != 0) {
+            return -(int64_t)EFAULT;
+        }
     }
     return 0;
 }
@@ -98,7 +113,8 @@ int64_t mips_sc_nanosleep(mips64_ctx_t *ctx, uint64_t clk, uint64_t req_va,
         return l2a_ret(ctx, -(int64_t)EFAULT);
     }
     if (rem_va != 0U) {
-        if (guest_range(ctx, rem_va, is64 ? 16U : 8U, 1) == NULL) {
+        if (!mips_mem_ok(ctx, rem_va, is64 ? 16U : 8U,
+                         (uint32_t)MIPS_PROT_WRITE)) {
             return l2a_ret(ctx, -(int64_t)EFAULT);
         }
         remp = &rm;

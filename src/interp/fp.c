@@ -675,7 +675,7 @@ static int fp_arith(mips64_ctx_t *ctx, const mips_dec_t *d, unsigned is_s)
             double sb = (d->funct == 0x01u) ? -(double)b : (double)b;
             double qd = (double)a + sb;
 
-            q = (qd == (double)a && sb != 0.0) ?
+            q = (isfinite(qd) && qd == (double)a && sb != 0.0) ?
                 nextafterl((long double)r,
                            sb > 0.0 ? INFINITY : -INFINITY) :
                 (long double)qd;

@@ -50,6 +50,8 @@ extern void putn(uint8_t *p, uint64_t v, unsigned n, int be);
 extern uint64_t getn(const uint8_t *p, unsigned n, int be);
 extern uint8_t *guest_range(mips64_ctx_t *ctx, uint64_t va, uint64_t len,
                             int write);
+extern int64_t mips_sc_copyout(mips64_ctx_t *ctx, uint64_t va,
+                               const void *src, uint64_t len);
 /* Lane H2 file-mutation bodies owned by src/os/syscalls.c. */
 extern int64_t mips_sc_truncate(mips64_ctx_t *ctx, uint64_t path_va,
                                 uint64_t len);
@@ -154,12 +156,13 @@ int64_t mips_sc_rt_sigprocmask(mips64_ctx_t *ctx, uint64_t how,
         }
     }
     if (oldset_va != 0U) {
-        p = guest_range(ctx, oldset_va, 16U, 1);
-        if (p == NULL) {
+        uint8_t img[16];
+
+        putn(img, l2a_sigmask[0], 8, be);
+        putn(img + 8, l2a_sigmask[1], 8, be);
+        if (mips_sc_copyout(ctx, oldset_va, img, sizeof img) != 0) {
             return l2a_ret(ctx, -(int64_t)EFAULT);
         }
-        putn(p, l2a_sigmask[0], 8, be);
-        putn(p + 8, l2a_sigmask[1], 8, be);
     }
     return l2a_ret(ctx, 0);
 }
@@ -170,8 +173,6 @@ int64_t mips_sc_robust(mips64_ctx_t *ctx, int set, uint64_t a0, uint64_t a1,
                        uint64_t a2)
 {
     unsigned ws = ctx->is_n32 != 0U ? 4U : 8U;
-    uint8_t *hp;
-    uint8_t *lp;
     int be = ctx->is_be != 0U;
 
     if (set) {
@@ -186,13 +187,17 @@ int64_t mips_sc_robust(mips64_ctx_t *ctx, int set, uint64_t a0, uint64_t a1,
     if (a0 != 0U) {
         return l2a_ret(ctx, -(int64_t)EPERM);
     }
-    hp = guest_range(ctx, a1, (uint64_t)ws, 1);
-    lp = guest_range(ctx, a2, (uint64_t)ws, 1);
-    if (hp == NULL || lp == NULL) {
-        return l2a_ret(ctx, -(int64_t)EFAULT);
+    {
+        uint8_t hb[8];
+        uint8_t lb[8];
+
+        putn(hb, ctx->robust_list_head, ws, be);
+        putn(lb, ctx->robust_list_len, ws, be);
+        if (mips_sc_copyout(ctx, a1, hb, (uint64_t)ws) != 0 ||
+            mips_sc_copyout(ctx, a2, lb, (uint64_t)ws) != 0) {
+            return l2a_ret(ctx, -(int64_t)EFAULT);
+        }
     }
-    putn(hp, ctx->robust_list_head, ws, be);
-    putn(lp, ctx->robust_list_len, ws, be);
     return l2a_ret(ctx, 0);
 }
 

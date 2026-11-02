@@ -9,8 +9,9 @@
  * spans are endian-specific: on LE, LDL takes mem[pa..pa+k] into the
  * HIGH bytes of rt and LDR takes mem[pa+k..pa+7] into the LOW bytes;
  * on BE the spans swap (LDL takes mem[pa+k..pa+7] into HIGH, LDR
- * takes mem[pa..pa+k] into LOW). The LE canonical pair does not
- * compose a full doubleword (architectural, matches qemu-LE).
+ * takes mem[pa..pa+k] into LOW). The composing pair is LDL at
+ * addr+7 with LDR at addr+0 on LE, and LDL at addr+0 with LDR at
+ * addr+7 on BE (architectural, matches qemu for each endian).
  * LL/SC/LLD/SCD follow E05 (exact-address reservation in
  * llbit/lladdr/llval).
  *
@@ -186,8 +187,9 @@ int do_swr(mips64_ctx_t *ctx, uint64_t addr, uint64_t rtval)
 /* LDL/LDR merge rules (R4000/MIPS IV pseudocode, qemu-verified per endian):
  * endian swaps the span, placement is fixed: LDL takes mem[pa..pa+k]
  * on LE (mem[pa+k..pa+7] on BE) into HIGH rt, LDR takes mem[pa+k..pa+7]
- * on LE (mem[pa..pa+k] on BE) into LOW rt; the LE canonical pair does
- * not compose a full doubleword (architectural, matches qemu-LE). */
+ * on LE (mem[pa..pa+k] on BE) into LOW rt; the composing pair is LDL
+ * at addr+7 with LDR at addr+0 on LE, and LDL at addr+0 with LDR at
+ * addr+7 on BE (architectural, matches qemu for each endian). */
 int do_ldl(mips64_ctx_t *ctx, uint64_t addr, unsigned rt)
 {
     uint64_t pa = addr & ~UINT64_C(7);

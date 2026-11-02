@@ -55,6 +55,8 @@ extern void putn(uint8_t *p, uint64_t v, unsigned n, int be);
 extern uint64_t getn(const uint8_t *p, unsigned n, int be);
 extern uint8_t *guest_range(mips64_ctx_t *ctx, uint64_t va, uint64_t len,
                             int write);
+extern int64_t mips_sc_copyout(mips64_ctx_t *ctx, uint64_t va,
+                               const void *src, uint64_t len);
 extern int mips_thread_kill(mips64_ctx_t *caller, long tid, int signo,
                             int32_t code);
 
@@ -269,26 +271,27 @@ int64_t mips_sc_rt_sigaction(mips64_ctx_t *ctx, uint64_t sp)
         }
     }
     if (old_va != 0U) {
-        uint8_t *p = guest_range(ctx, old_va, n32 ? 24U : 32U, 1);
+        uint8_t img[32];
 
-        if (p == NULL) {
-            return l2a_ret(ctx, -(int64_t)EFAULT);
-        }
         if (n32) {
-            putn(p, old.flags & UINT64_C(0xffffffff), 4, be);
-            putn(p + 4, old.handler & UINT64_C(0xffffffff), 4, be);
-            putn(p + 8, old.mask[0] & UINT64_C(0xffffffff), 4, be);
-            putn(p + 12, (old.mask[0] >> 32) & UINT64_C(0xffffffff),
+            putn(img, old.flags & UINT64_C(0xffffffff), 4, be);
+            putn(img + 4, old.handler & UINT64_C(0xffffffff), 4, be);
+            putn(img + 8, old.mask[0] & UINT64_C(0xffffffff), 4, be);
+            putn(img + 12, (old.mask[0] >> 32) & UINT64_C(0xffffffff),
                  4, be);
-            putn(p + 16, old.mask[1] & UINT64_C(0xffffffff), 4, be);
-            putn(p + 20, (old.mask[1] >> 32) & UINT64_C(0xffffffff),
+            putn(img + 16, old.mask[1] & UINT64_C(0xffffffff), 4, be);
+            putn(img + 20, (old.mask[1] >> 32) & UINT64_C(0xffffffff),
                  4, be);
         } else {
-            putn(p, old.flags & UINT64_C(0xffffffff), 4, be);
-            putn(p + 4, 0U, 4, be);
-            putn(p + 8, old.handler, 8, be);
-            putn(p + 16, old.mask[0], 8, be);
-            putn(p + 24, old.mask[1], 8, be);
+            putn(img, old.flags & UINT64_C(0xffffffff), 4, be);
+            putn(img + 4, 0U, 4, be);
+            putn(img + 8, old.handler, 8, be);
+            putn(img + 16, old.mask[0], 8, be);
+            putn(img + 24, old.mask[1], 8, be);
+        }
+        /* Stage in host memory, commit under sc_lock (R3-1). */
+        if (mips_sc_copyout(ctx, old_va, img, n32 ? 24U : 32U) != 0) {
+            return l2a_ret(ctx, -(int64_t)EFAULT);
         }
     }
     return l2a_ret(ctx, 0);
@@ -346,13 +349,14 @@ int64_t mips_l4a_rt_sigprocmask(mips64_ctx_t *ctx, uint64_t sp)
         }
     }
     if (old_va != 0U) {
-        uint8_t *p = guest_range(ctx, old_va, 16U, 1);
+        uint8_t img[16];
 
-        if (p == NULL) {
+        putn(img, cur0, 8, be);
+        putn(img + 8, cur1, 8, be);
+        /* Stage in host memory, commit under sc_lock (R3-1). */
+        if (mips_sc_copyout(ctx, old_va, img, sizeof img) != 0) {
             return l2a_ret(ctx, -(int64_t)EFAULT);
         }
-        putn(p, cur0, 8, be);
-        putn(p + 8, cur1, 8, be);
     }
     return l2a_ret(ctx, 0);
 }
@@ -423,21 +427,22 @@ int64_t mips_sc_sigaltstack(mips64_ctx_t *ctx, uint64_t sp)
         }
     }
     if (oss_va != 0U) {
-        uint8_t *p = guest_range(ctx, oss_va, n32 ? 12U : 24U, 1);
+        uint8_t img[24];
 
-        if (p == NULL) {
-            return l2a_ret(ctx, -(int64_t)EFAULT);
-        }
         if (n32) {
-            putn(p, ctx->sigalt_sp & UINT64_C(0xffffffff), 4, be);
-            putn(p + 4, ctx->sigalt_size & UINT64_C(0xffffffff), 4,
+            putn(img, ctx->sigalt_sp & UINT64_C(0xffffffff), 4, be);
+            putn(img + 4, ctx->sigalt_size & UINT64_C(0xffffffff), 4,
                  be);
-            putn(p + 8, reported, 4, be);
+            putn(img + 8, reported, 4, be);
         } else {
-            putn(p, ctx->sigalt_sp, 8, be);
-            putn(p + 8, ctx->sigalt_size, 8, be);
-            putn(p + 16, reported, 4, be);
-            putn(p + 20, 0U, 4, be);
+            putn(img, ctx->sigalt_sp, 8, be);
+            putn(img + 8, ctx->sigalt_size, 8, be);
+            putn(img + 16, reported, 4, be);
+            putn(img + 20, 0U, 4, be);
+        }
+        /* Stage in host memory, commit under sc_lock (R3-1). */
+        if (mips_sc_copyout(ctx, oss_va, img, n32 ? 12U : 24U) != 0) {
+            return l2a_ret(ctx, -(int64_t)EFAULT);
         }
     }
     return l2a_ret(ctx, 0);
@@ -526,9 +531,9 @@ static int64_t l4a_pending(mips64_ctx_t *ctx, uint64_t set_va,
         return l2a_ret(ctx, -(int64_t)EINVAL);
     }
     if (setsize != 0U) {
-        uint8_t *p;
         uint64_t w0;
         uint64_t w1;
+        uint8_t img[16];
 
         for (i = 0U; i < ctx->pend_count; i++) {
             uint32_t slot = (ctx->pend_head + i) % 16U;
@@ -544,18 +549,12 @@ static int64_t l4a_pending(mips64_ctx_t *ctx, uint64_t set_va,
             return l2a_ret(ctx, 0);
         }
         be = ctx->is_be != 0U;
-        p = guest_range(ctx, l4a_va(ctx, set_va), setsize, 1);
-        if (p == NULL) {
+        putn(img, w0, 8, be);
+        putn(img + 8, w1, 8, be);
+        /* Stage in host memory, commit under sc_lock (R3-1). */
+        if (mips_sc_copyout(ctx, l4a_va(ctx, set_va), img,
+                            setsize) != 0) {
             return l2a_ret(ctx, -(int64_t)EFAULT);
-        }
-        if (setsize > 8U) {
-            putn(p, w0, 8, be);
-            putn(p + 8, w1, setsize - 8U, be);
-        } else {
-            uint8_t full[8];
-
-            putn(full, w0, 8, be);
-            memcpy(p, full, (size_t)setsize);
         }
     }
     return l2a_ret(ctx, 0);
