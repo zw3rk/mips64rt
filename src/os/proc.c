@@ -63,6 +63,9 @@
  *       cmp golden.txt trans.txt'
  */
 
+#define _GNU_SOURCE
+
+#include "os/proc.h"
 #include "core/cpu.h"
 
 #include <errno.h>

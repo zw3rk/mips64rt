@@ -82,6 +82,11 @@ int mips_fixade_ctl(mips64_ctx_t *ctx, unsigned long cmd, unsigned long arg);
  * callers route here (not to mips_fault) when fixade is disabled. */
 void mips_bus_fault(mips64_ctx_t *ctx, uint64_t addr);
 
+/* Synchronous instruction trap (SIGILL, SIGFPE, SIGTRAP): delivers
+ * through mips_trap; sets EXIT_FAULT only when no guest handler
+ * caught and redirected pc. */
+void mips_insn_trap(mips64_ctx_t *ctx, int signo, uint64_t addr);
+
 /* ---- §5 delay-slot dynamic-NPC target ---- */
 
 /* NPC select mode for resuming after a delay-slot fault. STATIC is
@@ -205,5 +210,8 @@ void mips_jit_free(void *p, size_t size);
 /* Reset all U0 gate state for ctx: fixade back to default (1),
  * delay target dropped, TLB invalidated. NULL is a no-op. */
 void mips_backend_state_reset(mips64_ctx_t *ctx);
+
+/* Release the U0 slot bound to ctx when a thread exits. */
+void mips_backend_state_release(const mips64_ctx_t *ctx);
 
 #endif /* MIPS64RT_OS_BACKEND_H */

@@ -206,8 +206,9 @@ int fp_cop1x(mips64_ctx_t *ctx, uint64_t cur_pc, const mips_dec_t *d)
     unsigned fs = d->rd & 31u;
     unsigned fd = d->sa & 31u;
     unsigned is_d = 0u;
+    uint64_t saved_fpr;
+    uint32_t saved_cc;
 
-    (void)cur_pc;
     if (d->op != 0x13u) {
         return MIPS_FAULT;
     }
@@ -238,6 +239,9 @@ int fp_cop1x(mips64_ctx_t *ctx, uint64_t cur_pc, const mips_dec_t *d)
     if (fr >= 32u || ft >= 32u || fs >= 32u || fd >= 32u) {
         return MIPS_FAULT;
     }
+    saved_fpr = ctx->fpr[fd];
+    saved_cc = ctx->fcsr & 0xFE800000u;
+    fp_clear_trap();
     if (is_d == 0u) {
         float a = fp_bits_f((uint32_t)ctx->fpr[fr]);
         float b = fp_bits_f((uint32_t)ctx->fpr[fs]);
@@ -252,12 +256,12 @@ int fp_cop1x(mips64_ctx_t *ctx, uint64_t cur_pc, const mips_dec_t *d)
                 fp_issn_s((uint32_t)ctx->fpr[ft]) != 0) {
                 fp_raise(ctx, (unsigned)FP_EXC_V);
             }
-            return 0;
+            return fp_finish_trap(ctx, cur_pc, fd, saved_fpr, saved_cc, 0);
         }
         if ((isinf(b) && c == 0.0f) || (b == 0.0f && isinf(c))) {
             fp_put_s(ctx, fd, FP_DEFNAN_S);
             fp_raise(ctx, (unsigned)FP_EXC_V);
-            return 0;
+            return fp_finish_trap(ctx, cur_pc, fd, saved_fpr, saved_cc, 0);
         }
         if (d->funct == 0x20u) { /* MADD.S: fr + fs*ft */
             r = fmaf(b, c, a);
@@ -275,11 +279,11 @@ int fp_cop1x(mips64_ctx_t *ctx, uint64_t cur_pc, const mips_dec_t *d)
         if (isnan(r)) {
             fp_put_s(ctx, fd, FP_DEFNAN_S);
             fp_raise(ctx, (unsigned)FP_EXC_V);
-            return 0;
+            return fp_finish_trap(ctx, cur_pc, fd, saved_fpr, saved_cc, 0);
         }
         fp_put_s(ctx, fd, fp_f_bits(r));
         fp_inexact(ctx, (long double)r, q);
-        return 0;
+        return fp_finish_trap(ctx, cur_pc, fd, saved_fpr, saved_cc, 0);
     }
     {
         double a = fp_bits_d(ctx->fpr[fr]);
@@ -295,12 +299,12 @@ int fp_cop1x(mips64_ctx_t *ctx, uint64_t cur_pc, const mips_dec_t *d)
                 fp_issn_d(ctx->fpr[ft]) != 0) {
                 fp_raise(ctx, (unsigned)FP_EXC_V);
             }
-            return 0;
+            return fp_finish_trap(ctx, cur_pc, fd, saved_fpr, saved_cc, 0);
         }
         if ((isinf(b) && c == 0.0) || (b == 0.0 && isinf(c))) {
             fp_put_d(ctx, fd, FP_DEFNAN_D);
             fp_raise(ctx, (unsigned)FP_EXC_V);
-            return 0;
+            return fp_finish_trap(ctx, cur_pc, fd, saved_fpr, saved_cc, 0);
         }
         if (d->funct == 0x21u) { /* MADD.D: fr + fs*ft */
             r = fma(b, c, a);
@@ -318,10 +322,10 @@ int fp_cop1x(mips64_ctx_t *ctx, uint64_t cur_pc, const mips_dec_t *d)
         if (isnan(r)) {
             fp_put_d(ctx, fd, FP_DEFNAN_D);
             fp_raise(ctx, (unsigned)FP_EXC_V);
-            return 0;
+            return fp_finish_trap(ctx, cur_pc, fd, saved_fpr, saved_cc, 0);
         }
         fp_put_d(ctx, fd, fp_d_bits(r));
         fp_inexact(ctx, (long double)r, q);
-        return 0;
+        return fp_finish_trap(ctx, cur_pc, fd, saved_fpr, saved_cc, 0);
     }
 }

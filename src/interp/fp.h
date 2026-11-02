@@ -57,10 +57,12 @@ double fp_adj_d(double r, long double q, unsigned rm);
 float fp_adj_f(float r, long double q, unsigned rm);
 long double fp_rne_q(long double q);
 
-/* Set FCSR cause + sticky flag for exception e (FP_EXC_*). Traps are
- * out of scope until Phase 4 signals: bits are set unconditionally,
- * never delivered. */
+/* Set FCSR cause + sticky flag for exception e (FP_EXC_*), or arm an
+ * enabled IEEE exception trap (SIGFPE) when FCSR enable bit (7 + e) is set. */
 void fp_raise(mips64_ctx_t *ctx, unsigned e);
+void fp_clear_trap(void);
+int fp_finish_trap(mips64_ctx_t *ctx, uint64_t cur_pc, unsigned fd,
+    uint64_t saved_fpr, uint32_t saved_cc, int rc);
 
 /* Flag a finished finite result: O (+I) on overflow to infinity,
  * I when the final value differs from the exact one. U is never set

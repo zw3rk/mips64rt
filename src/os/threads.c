@@ -35,6 +35,7 @@
 #include "core/cpu.h"
 
 #include "dbt/dbt.h"
+#include "os/backend.h"
 #include "os/quiesce.h"
 #include "os/signal_core.h"
 
@@ -87,6 +88,10 @@ extern int64_t l2a_ret(mips64_ctx_t *ctx, int64_t raw);
 extern int mips_mem_ok(const mips64_ctx_t *ctx, uint64_t va, uint64_t len,
                        uint32_t need);
 extern int guest_st32(mips64_ctx_t *ctx, uint64_t va, uint64_t val);
+extern int mips_sig_enqueue(mips64_ctx_t *ctx, int signo, int32_t code,
+                            uint64_t addr);
+extern void mips_llsc_release(const mips64_ctx_t *ctx);
+extern void dbt_thread_exit(mips64_ctx_t *ctx);
 
 /* N32 carries 32-bit pointers: truncate the register to the low word
  * (the frozen N32 pointer rule; N64 VAs use the full 64 bits). */
@@ -105,7 +110,9 @@ static long l4b_gettid(void)
 #if defined(__linux__) && defined(SYS_gettid)
     return (long)syscall((long)SYS_gettid);
 #else
-    return (long)getpid();
+    static _Atomic uint32_t seq;
+    uint32_t n = atomic_fetch_add_explicit(&seq, 1U, memory_order_relaxed) + 1U;
+    return (long)getpid() + (long)(n & 0xFFFFU);
 #endif
 }
 
@@ -147,6 +154,49 @@ typedef struct {
 static pthread_mutex_t l4b_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t l4b_cv = PTHREAD_COND_INITIALIZER;
 static l4b_slot_t l4b_slots[L4B_THREAD_MAX];
+static mips64_ctx_t *l4b_leader_ctx;
+
+int mips_thread_kill(mips64_ctx_t *caller, long tid, int signo, int32_t code)
+{
+    mips64_ctx_t *target = NULL;
+    size_t i;
+    int rc;
+
+    (void)pthread_mutex_lock(&l4b_mu);
+    if (caller != NULL && !caller->is_thread_clone) {
+        l4b_leader_ctx = caller;
+    }
+    if (caller != NULL) {
+        long self_tid = caller->host_tid > 0 ? (long)caller->host_tid :
+                        (!caller->is_thread_clone ? (long)getpid() : -1L);
+        if (tid == self_tid) {
+            target = caller;
+        }
+    }
+    if (target == NULL && tid == (long)getpid()) {
+        target = l4b_leader_ctx;
+    }
+    if (target == NULL) {
+        for (i = 0U; i < L4B_THREAD_MAX; i++) {
+            if (l4b_slots[i].used != 0 && l4b_slots[i].host_tid == tid &&
+                l4b_slots[i].child != NULL) {
+                target = l4b_slots[i].child;
+                break;
+            }
+        }
+    }
+    if (target == NULL) {
+        (void)pthread_mutex_unlock(&l4b_mu);
+        return -(int)ESRCH;
+    }
+    if (signo == 0) {
+        (void)pthread_mutex_unlock(&l4b_mu);
+        return 0;
+    }
+    rc = mips_sig_enqueue(target, signo, code, 0U);
+    (void)pthread_mutex_unlock(&l4b_mu);
+    return rc;
+}
 
 /* Endian-aware 32-bit tid store. Pre-validated by the caller; records
  * a guest fault on the racing failure instead of crashing the host. */
@@ -201,7 +251,11 @@ static void *l4b_entry(void *arg)
     /* Claim the quiescence slot up front so a pure-compute worker
      * that never syscalls is still visible to preemption. */
     mips_qs_register(child);
-    (void)interp_run(child);
+    if (child->engine == MIPS64_ENGINE_DBT && mips64_dbt_available()) {
+        (void)dbt_run(child);
+    } else {
+        (void)interp_run(child);
+    }
     mips_thread_exit(child, 0);
     return NULL;
 }
@@ -260,6 +314,12 @@ static int64_t l4b_clone_thread(mips64_ctx_t *ctx, uint64_t flags,
     }
     child->is_thread_clone = true;
     child->host_tid = 0;
+    child->ibtc_ptr = 0U;
+    child->pend_head = 0U;
+    child->pend_count = 0U;
+    child->sigalt_sp = 0U;
+    child->sigalt_size = 0U;
+    child->sigalt_flags = 0U;
     /* Robust list recorded (inherited copy); never installed on host. */
     if ((flags & L4B_CLONE_CHILD_CLEARTID) != 0U) {
         child->clear_child_tid = child_tid_va;
@@ -267,6 +327,9 @@ static int64_t l4b_clone_thread(mips64_ctx_t *ctx, uint64_t flags,
         child->clear_child_tid = 0U;
     }
     (void)pthread_mutex_lock(&l4b_mu);
+    if (!ctx->is_thread_clone) {
+        l4b_leader_ctx = ctx;
+    }
     for (i = 0U; i < L4B_THREAD_MAX; i++) {
         if (l4b_slots[i].used == 0) {
             slot = &l4b_slots[i];
@@ -344,11 +407,12 @@ static int64_t l4b_clone_fork(mips64_ctx_t *ctx, uint64_t flags,
 
         mips64_ctx_clear_ll(ctx);
         ctx->is_thread_clone = false;
+        ctx->host_tid = 0;
         if ((flags & L4B_CLONE_CHILD_CLEARTID) != 0U) {
             ctx->clear_child_tid = child_tid_va;
         }
         if ((flags & L4B_CLONE_CHILD_SETTID) != 0U) {
-            tid = (int32_t)l4b_gettid();
+            tid = (int32_t)getpid();
             l4b_store_tid(ctx, child_tid_va, (uint32_t)tid);
         }
         return l2a_ret(ctx, 0);
@@ -433,6 +497,9 @@ void mips_thread_exit(mips64_ctx_t *ctx, int status)
     /* Drop the quiescence slot (releases any lease the exiting thread
      * still held, so a dead worker never blocks a future drain). */
     mips_qs_unregister(ctx);
+    mips_backend_state_release(ctx);
+    mips_llsc_release(ctx);
+    dbt_thread_exit(ctx);
     free(ctx);
     pthread_exit(NULL);
 }

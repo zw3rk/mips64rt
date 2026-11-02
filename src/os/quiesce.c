@@ -41,7 +41,7 @@
 #define SYS_gettid 178
 #endif
 
-#define QS_MAX_SLOTS 16u
+#define QS_MAX_SLOTS 160u
 
 typedef struct {
     _Atomic(int) used;

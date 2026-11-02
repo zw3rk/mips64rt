@@ -46,6 +46,12 @@ __attribute__((weak)) void mips_vm_file_shared_sync(mips64_ctx_t *ctx,
     (void)len;
 }
 
+__attribute__((weak)) void mips_llsc_note_write(uint64_t va, uint64_t len)
+{
+    (void)va;
+    (void)len;
+}
+
 static void mem_note_guest_write(mips64_ctx_t *ctx, uint64_t va, uint64_t len)
 {
     mips_vm_pages_clear(va, len, (unsigned)MIPS_VM_PAGE_COW_CLEAN);
@@ -54,6 +60,7 @@ static void mem_note_guest_write(mips64_ctx_t *ctx, uint64_t va, uint64_t len)
      * stale bytes (the no-code fast path is one locked page scan). */
     mips_vm_pages_retire_code(va, len);
     mips_vm_file_shared_sync(ctx, va, len);
+    mips_llsc_note_write(va, len);
 }
 
 /* Synchronous fault: records EXIT_FAULT, after an RC4 signal-delivery
@@ -88,6 +95,25 @@ void mips_fault(mips64_ctx_t *ctx, uint64_t addr)
                       (unsigned long long)ctx->pc,
                       (unsigned long long)addr);
     }
+}
+
+void mips_insn_trap(mips64_ctx_t *ctx, int signo, uint64_t addr)
+{
+    uint64_t before;
+
+    if (ctx == NULL) {
+        return;
+    }
+    ctx->llbit = 0U;
+    before = ctx->pc;
+    mips_trap(ctx, signo, addr);
+    if (ctx->pc != before) {
+        ctx->exit_reason = MIPS64_EXIT_NONE;
+        ctx->exit_info = 0U;
+        return;
+    }
+    ctx->exit_reason = MIPS64_EXIT_FAULT;
+    ctx->exit_info = (uint32_t)addr;
 }
 
 /* U0 TIF_FIXADE gate: emulate one unaligned integer load/store

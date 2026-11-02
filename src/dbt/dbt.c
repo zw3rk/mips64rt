@@ -672,6 +672,43 @@ void dbt_visit_blocks(dbt_block_visit_t visit, void *arg)
     }
 }
 
+static void dbt_flush_thread_caches(mips64_ctx_t *ctx)
+{
+    size_t i;
+
+    for (i = 0u; i < MIPS64_DBT_CACHE_ENTRIES; i++) {
+        dbt_snap_drop(&block_cache[i]);
+        memset(&block_cache[i], 0, sizeof block_cache[i]);
+    }
+    ras_top = 0u;
+    ibtc_epoch = 0u;
+    if (ctx != NULL && ctx->ibtc_ptr != 0u) {
+        memset((void *)(uintptr_t)ctx->ibtc_ptr, 0,
+               MIPS64_IBTC_SIZE * sizeof(mips64_ibtc_slot_t));
+    }
+    dbt_arena_reset();
+}
+
+void dbt_thread_exit(mips64_ctx_t *ctx)
+{
+    size_t i;
+
+    dbt_flush_thread_caches(ctx);
+    for (i = 0u; i < DBT_AOT_PRELOAD_MAX; i++) {
+        if (aot_preload[i].sites != NULL) {
+            free(aot_preload[i].sites);
+            aot_preload[i].sites = NULL;
+        }
+        aot_preload[i].used = 0;
+        aot_preload[i].count = 0u;
+    }
+    aot_preload_path[0] = '\0';
+    if (ctx != NULL && ctx->ibtc_ptr != 0u) {
+        free((void *)(uintptr_t)ctx->ibtc_ptr);
+        ctx->ibtc_ptr = 0u;
+    }
+}
+
 static const dbt_mem_site_t *dbt_find_site(const dbt_entry_t *e,
                                            uint64_t delta)
 {
@@ -714,6 +751,8 @@ int dbt_run(mips64_ctx_t *ctx)
 
         if (ctx->exit_reason != MIPS64_EXIT_NONE)
             return 1;
+        if (dbt_arena_needs_reclaim() != 0)
+            dbt_flush_thread_caches(ctx);
         dbt_npc_resume(ctx);
         pc = ctx->pc;
         /* Single probe: the epoch gate retires stale entries without
@@ -796,10 +835,13 @@ int dbt_run(mips64_ctx_t *ctx)
                 return rc;
             dbt_difftest_step(ctx);
             continue;
-        case MIPS64_DBT_EXIT_FAULT: {
+        case MIPS64_DBT_EXIT_FAULT:
+        case MIPS64_DBT_EXIT_TRAP: {
+            uint32_t idx = ctx->exit_info;
             uint64_t fpc = ctx->pc;
-            dbt_entry_t *te = (fpc >= start && fpc < end) ? e :
-                              lookup_entry(ctx, fpc);
+            dbt_entry_t *te = (ex == MIPS64_DBT_EXIT_TRAP) ?
+                ((fpc == start) ? e : lookup_entry(ctx, fpc)) :
+                ((fpc >= start && fpc < end) ? e : lookup_entry(ctx, fpc));
             uint64_t bstart = te != NULL ? te->blk.guest_pc : fpc;
             const dbt_mem_site_t *site = NULL;
             int mrc;
@@ -807,7 +849,12 @@ int dbt_run(mips64_ctx_t *ctx)
             ctx->exit_reason = MIPS64_EXIT_NONE;
             ctx->exit_info = 0u;
             ctx->pad150 = 0u;
-            if (te != NULL && te->sites != NULL && fpc >= bstart) {
+            if (ex == MIPS64_DBT_EXIT_TRAP) {
+                if (te != NULL && te->sites != NULL && idx < te->site_count) {
+                    site = &te->sites[idx];
+                    fpc = bstart + (uint64_t)site->guest_pc_delta;
+                }
+            } else if (te != NULL && te->sites != NULL && fpc >= bstart) {
                 site = dbt_find_site(te, fpc - bstart);
             }
             mrc = dbt_mem_recover(ctx, site, bstart, fpc);
@@ -820,45 +867,8 @@ int dbt_run(mips64_ctx_t *ctx)
             if (mrc == 2 && ctx->trace_enabled) {
                 uint32_t word = 0u;
 
-                if (mips_fetch(ctx, ctx->pc, &word) == 0) {
+                if (mips_fetch(ctx, ctx->pc, &word) == 0)
                     mips64_dbt_trace(ctx, ctx->pc, word);
-                }
-            }
-            if (ctx->exit_reason == MIPS64_EXIT_NONE) {
-                ctx->exit_info = 0u;
-                dbt_difftest_step(ctx);
-                continue;
-            }
-            return (int)MIPS_FAULT;
-        }
-        case MIPS64_DBT_EXIT_TRAP: {
-            uint32_t idx = ctx->exit_info;
-            uint64_t fpc = ctx->pc;
-            dbt_entry_t *te = (fpc == start) ? e : lookup_entry(ctx, fpc);
-            uint64_t bstart = te != NULL ? te->blk.guest_pc : fpc;
-            const dbt_mem_site_t *site = NULL;
-            int mrc;
-
-            ctx->exit_reason = MIPS64_EXIT_NONE;
-            ctx->exit_info = 0u;
-            ctx->pad150 = 0u;
-            if (te != NULL && te->sites != NULL && idx < te->site_count) {
-                site = &te->sites[idx];
-                fpc = bstart + (uint64_t)site->guest_pc_delta;
-            }
-            mrc = dbt_mem_recover(ctx, site, bstart, fpc);
-            if (mrc == 0) {
-                ctx->exit_reason = MIPS64_EXIT_NONE;
-                ctx->exit_info = 0u;
-                dbt_difftest_step(ctx);
-                continue;
-            }
-            if (mrc == 2 && ctx->trace_enabled) {
-                uint32_t word = 0u;
-
-                if (mips_fetch(ctx, ctx->pc, &word) == 0) {
-                    mips64_dbt_trace(ctx, ctx->pc, word);
-                }
             }
             if (ctx->exit_reason == MIPS64_EXIT_NONE) {
                 ctx->exit_info = 0u;

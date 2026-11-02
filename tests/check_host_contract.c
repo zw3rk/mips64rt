@@ -29,18 +29,16 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 #include "core/cpu.h"
-
-#include "os/host_args.c"
-#include "os/mem.c"
-#include "os/mem_table.c"
-#include "dbt/aot/sha256.c"
-#include "dbt/aot/identity.c"
-#include "os/family_broker.c"
-#include "os/page_rules.c"
+#include "dbt/aot/identity.h"
+#include "dbt/aot/sha256.h"
+#include "os/family_broker.h"
+#include "os/host_args.h"
+#include "os/page_rules.h"
 
 static int failures = 0;
 static int checks = 0;

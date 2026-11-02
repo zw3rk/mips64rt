@@ -379,14 +379,7 @@ int ei_special(a64_emit_t *e, const mips_dec_t *d, uint64_t pc,
         }
         ei_gst(e, EI_C, d->rd);
         return 0;
-    case 0x3Fu: /* DSRA32, or all-zero SDBBP breakpoint */
-        if (d->rs == 0u && d->rt == 0u && d->rd == 0u && d->sa == 0u) {
-            if (slot != 0) {
-                return 1;
-            }
-            ei_exit_fault_pc(e, pc);
-            return 2;
-        }
+    case 0x3Fu: /* DSRA32 */
         ei_gld(e, EI_B, d->rt);
         ei_asr(e, 0, EI_C, EI_B, 32u + (d->sa & 31u));
         ei_gst(e, EI_C, d->rd);

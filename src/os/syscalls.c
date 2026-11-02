@@ -29,11 +29,7 @@
 #include <time.h>
 #include <unistd.h>
 
-/* Lane L5a: fold the /proc/self TU in the same way (its feature-test
- * macros precede every system header here as well). The Makefile is
- * frozen, so src/os/proc.c cannot become its own TU; the public
- * mips_proc_* entry points live here instead. */
-#include "os/proc.c"
+#include "os/proc.h"
 
 /* Non-Linux host fallbacks (dup3/pipe2/close_range/getrandom/
  * clock_nanosleep shapes); Linux keeps the direct syscalls. */
@@ -597,7 +593,13 @@ int64_t mips_sc_getid(mips64_ctx_t *ctx, int which)
         v = (int64_t)getegid();
         break;
     case L2A_ID_TID:
-        v = ctx->difftest_enabled ? (int64_t)getppid() : l2a_host_tid();
+        if (ctx->difftest_enabled) {
+            v = (int64_t)getppid();
+        } else if (ctx->host_tid > 0) {
+            v = (int64_t)ctx->host_tid;
+        } else {
+            v = l2a_host_tid();
+        }
         break;
     default:
         return l2a_ret(ctx, -(int64_t)EINVAL);

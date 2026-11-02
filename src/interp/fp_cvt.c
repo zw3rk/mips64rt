@@ -30,6 +30,15 @@ int fp_to_int(mips64_ctx_t *ctx, unsigned fd, long double q,
     long double t;
     unsigned mode = fp_rm(ctx);
 
+    if (isnan(q) || isinf(q)) {
+        if (is64) {
+            fp_put_d(ctx, fd, UINT64_C(0x7FFFFFFFFFFFFFFF));
+        } else {
+            fp_put_s(ctx, fd, 0x7FFFFFFFu);
+        }
+        fp_raise(ctx, (unsigned)FP_EXC_V);
+        return 0;
+    }
     switch (funct) {
     case FP_FN_ROUND_W:
     case FP_FN_ROUND_L:
@@ -65,7 +74,7 @@ int fp_to_int(mips64_ctx_t *ctx, unsigned fd, long double q,
         break;
     }
     if (is64) {
-        if (isnan(q) || q >= 0x1p63L || q < -0x1p63L) {
+        if (t >= 0x1p63L || t < -0x1p63L) {
             fp_put_d(ctx, fd, UINT64_C(0x7FFFFFFFFFFFFFFF));
             fp_raise(ctx, (unsigned)FP_EXC_V);
             return 0;
@@ -76,7 +85,7 @@ int fp_to_int(mips64_ctx_t *ctx, unsigned fd, long double q,
         }
         return 0;
     }
-    if (isnan(q) || q >= 0x1p31L || q < -0x1p31L) {
+    if (t >= 0x1p31L || t < -0x1p31L) {
         fp_put_s(ctx, fd, 0x7FFFFFFFu);
         fp_raise(ctx, (unsigned)FP_EXC_V);
         return 0;
@@ -167,40 +176,81 @@ int fp_cvt_sd(mips64_ctx_t *ctx, const mips_dec_t *d, unsigned is_s)
     return MIPS_FAULT;
 }
 
+/* Exact signed-integer-to-FP conversion with host-independent 64-bit
+ * mantissa rounding (prec = 24 for S, 53 for D) and FCSR Inexact (I)
+ * accounting. */
+static double fp_int_to_fp(mips64_ctx_t *ctx, int64_t v, unsigned prec,
+                           unsigned rm)
+{
+    int neg = (v < 0);
+    uint64_t mag = neg ? (UINT64_C(0) - (uint64_t)v) : (uint64_t)v;
+    unsigned bw = 0u;
+    uint64_t tmp = mag;
+    double res;
+
+    if (mag == 0u) {
+        return 0.0;
+    }
+    while (tmp != 0u) {
+        bw++;
+        tmp >>= 1u;
+    }
+    if (bw <= prec) {
+        res = (double)mag;
+        return neg ? -res : res;
+    }
+    {
+        unsigned shift = bw - prec;
+        uint64_t sig = mag >> shift;
+        uint64_t rem = mag & ((UINT64_C(1) << shift) - 1u);
+        uint64_t half = UINT64_C(1) << (shift - 1u);
+        uint64_t inc = 0u;
+
+        if (rem != 0u) {
+            fp_raise(ctx, (unsigned)FP_EXC_I);
+            switch (rm) {
+            case 0u:
+                if (rem > half || (rem == half && (sig & 1u) != 0u)) {
+                    inc = 1u;
+                }
+                break;
+            case 2u:
+                if (!neg) {
+                    inc = 1u;
+                }
+                break;
+            case 3u:
+                if (neg) {
+                    inc = 1u;
+                }
+                break;
+            default:
+                break;
+            }
+        }
+        res = ldexp((double)(sig + inc), (int)shift);
+        return neg ? -res : res;
+    }
+}
+
 /* CVT.S/D destination from a W/L integer source lane. */
 int fp_cvt_wl(mips64_ctx_t *ctx, const mips_dec_t *d, unsigned is_l)
 {
     unsigned fd = d->sa;
     unsigned fs = d->rd;
     unsigned rm = fp_rm(ctx);
+    int64_t v = is_l ? (int64_t)ctx->fpr[fs] : (int64_t)(int32_t)ctx->fpr[fs];
 
     if (d->funct == FP_FN_CVT_S) {
-        float r;
+        float rf = (float)fp_int_to_fp(ctx, v, 24u, rm);
 
-        if (is_l) {
-            int64_t v = (int64_t)ctx->fpr[fs];
-
-            r = (float)v;
-            fp_put_s(ctx, fd, fp_f_bits(fp_adj_f(r, (long double)v, rm)));
-            return 0;
-        }
-        {
-            int32_t v = (int32_t)ctx->fpr[fs];
-
-            r = (float)v;
-            fp_put_s(ctx, fd, fp_f_bits(fp_adj_f(r, (long double)v, rm)));
-            return 0;
-        }
+        fp_put_s(ctx, fd, fp_f_bits(rf));
+        return 0;
     }
     if (d->funct == FP_FN_CVT_D) {
-        if (is_l) {
-            int64_t v = (int64_t)ctx->fpr[fs];
-            double r = (double)v;
+        double rf = fp_int_to_fp(ctx, v, 53u, rm);
 
-            fp_put_d(ctx, fd, fp_d_bits(fp_adj_d(r, (long double)v, rm)));
-            return 0;
-        }
-        fp_put_d(ctx, fd, fp_d_bits((double)(int32_t)ctx->fpr[fs]));
+        fp_put_d(ctx, fd, fp_d_bits(rf));
         return 0;
     }
     return MIPS_FAULT;

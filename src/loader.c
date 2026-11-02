@@ -425,21 +425,34 @@ static int map_segments(mips64_ctx_t *ctx, int fd, const ehdr_t *eh,
         if (ph.type != MIPS_PT_LOAD) {
             continue;
         }
-        if (ph.memsz < ph.filesz || ph.memsz == 0U) {
+        if (ph.memsz < ph.filesz || ph.memsz == 0U ||
+            ph.offset > UINT64_MAX - ph.filesz ||
+            ph.vaddr > ctx->task_size ||
+            bias > ctx->task_size - ph.vaddr) {
             errno = ENOEXEC;
             return -1;
         }
         va = bias + ph.vaddr;
+        if (ph.memsz > ctx->task_size - va) {
+            errno = ENOEXEC;
+            return -1;
+        }
         /* ELF congruence (p_offset == p_vaddr mod p_align) lets a
          * toolchain pack a segment at an unaligned va; the host map
          * is page granular, so map from the page floor and fill at
          * the page offset. */
         page_off = va & (MIPS64_PAGE_SIZE - 1U);
         map_va = va - page_off;
+        if (ph.memsz >
+            UINT64_MAX - page_off - (MIPS64_PAGE_SIZE - 1U)) {
+            errno = ENOEXEC;
+            return -1;
+        }
         map_len = (ph.memsz + page_off + (MIPS64_PAGE_SIZE - 1U)) &
                   MIPS64_PAGE_MASK;
-        if (map_len == 0U || map_va + map_len < map_va ||
-            map_va + map_len > ctx->task_size) {
+        if (map_len == 0U || map_va > ctx->task_size ||
+            map_len > ctx->task_size - map_va ||
+            page_off + ph.memsz > map_len) {
             errno = ENOEXEC;
             return -1;
         }

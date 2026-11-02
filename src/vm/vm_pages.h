@@ -23,6 +23,7 @@
 
 #define MIPS_VM_PAGE_COW_CLEAN 0x01u
 #define MIPS_VM_PAGE_HAS_CODE 0x02u
+#define MIPS_VM_PAGE_LL_ACTIVE 0x04u
 
 /* Mark/clear flags for every 4 KiB page in [va, va+len). */
 void mips_vm_pages_mark(uint64_t va, uint64_t len, unsigned flags);

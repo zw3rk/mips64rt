@@ -43,17 +43,39 @@
  * process end, so no live IBTC slot can dangle). */
 #define DBT_ARENA_RETAIN_MAX 64u
 
+typedef struct {
+    void *base;
+    size_t cap;
+} dbt_arena_map_t;
+
 static _Thread_local uint8_t *arena_base;
 static _Thread_local size_t arena_used;
 static _Thread_local size_t arena_cap;
-static _Thread_local void *arena_maps[DBT_ARENA_RETAIN_MAX];
+static _Thread_local dbt_arena_map_t arena_maps[DBT_ARENA_RETAIN_MAX];
 static _Thread_local unsigned arena_nmaps;
+static _Thread_local int arena_reclaim_pending;
 
-static void arena_retain(void *p)
+void dbt_arena_reset(void)
 {
-    if (p != NULL && arena_nmaps < DBT_ARENA_RETAIN_MAX) {
-        arena_maps[arena_nmaps++] = p;
+    unsigned i;
+
+    for (i = 0u; i < arena_nmaps; i++) {
+        if (arena_maps[i].base != NULL && arena_maps[i].cap != 0u) {
+            mips_jit_free(arena_maps[i].base, arena_maps[i].cap);
+        }
+        arena_maps[i].base = NULL;
+        arena_maps[i].cap = 0u;
     }
+    arena_nmaps = 0u;
+    arena_base = NULL;
+    arena_used = 0u;
+    arena_cap = 0u;
+    arena_reclaim_pending = 0;
+}
+
+int dbt_arena_needs_reclaim(void)
+{
+    return arena_reclaim_pending;
 }
 
 void *dbt_arena_alloc(size_t len)
@@ -66,12 +88,19 @@ void *dbt_arena_alloc(size_t len)
     }
     if (arena_base == NULL || arena_used + len > arena_cap) {
         size_t cap = len > DBT_ARENA_CHUNK ? len : DBT_ARENA_CHUNK;
-        uint8_t *mem = (uint8_t *)mips_jit_alloc(cap);
+        uint8_t *mem;
 
+        if (arena_nmaps >= DBT_ARENA_RETAIN_MAX) {
+            arena_reclaim_pending = 1;
+            return NULL;
+        }
+        mem = (uint8_t *)mips_jit_alloc(cap);
         if (mem == NULL) {
             return NULL;
         }
-        arena_retain(mem);
+        arena_maps[arena_nmaps].base = mem;
+        arena_maps[arena_nmaps].cap = cap;
+        arena_nmaps++;
         arena_base = mem;
         arena_used = 0u;
         arena_cap = cap;

@@ -61,6 +61,8 @@ BOOT_COMMON := src/main.c \
 	src/interp/fp_ps.c \
 	src/os/mem.c \
 	src/os/mem_table.c \
+	src/os/backend_state.c \
+	src/os/proc.c \
 	src/os/syscall_min.c \
 	src/os/syscalls.c \
 	src/os/syscalls_stat.c \
@@ -121,6 +123,7 @@ build-cross:
 U0_SRCS := tests/test_u0_delay_tlb.c \
 	src/os/mem.c \
 	src/os/mem_table.c \
+	src/os/backend_state.c \
 	src/os/quiesce.c \
 	src/os/signal_core.c \
 	$(HOST_BACKEND) \
@@ -209,12 +212,12 @@ check: build check-line-limits
 	fi
 	@if [ -f tests/check_abi_invariants.c ]; then $(MAKE) check-abi-invariants; fi
 	@if [ -f tests/test_decode.c ]; then \
-		$(HOST_CC) -std=c11 -Werror=vla -pedantic -Wall -Wextra -Werror -pthread -Isrc tests/test_decode.c src/interp/decode.c src/os/mem.c src/os/mem_table.c src/vm/vm_pages.c $(HOST_BACKEND) tests/stubs_signal.c -o $(BUILD)/test_decode && $(BUILD)/test_decode; \
+		$(HOST_CC) -std=c11 -Werror=vla -pedantic -Wall -Wextra -Werror -pthread -Isrc tests/test_decode.c src/interp/decode.c src/os/mem.c src/os/mem_table.c src/os/backend_state.c src/vm/vm_pages.c $(HOST_BACKEND) tests/stubs_signal.c -o $(BUILD)/test_decode && $(BUILD)/test_decode; \
 	fi
 
 check-line-limits:
 	@fail=0; \
-	for f in $$(find src -name '*.c' -o -name '*.h' -o -name '*.S'); do \
+	for f in $$(find src tests -name '*.c' -o -name '*.h' -o -name '*.S'); do \
 		n=$$(wc -l < "$$f"); \
 		if [ "$$n" -gt 900 ]; then echo "OVER LIMIT ($$n): $$f"; fail=1; fi; \
 	done; \

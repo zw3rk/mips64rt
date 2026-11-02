@@ -18,11 +18,18 @@
  * 900-line limit; no behavior difference vs a static executor).
  */
 
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 
 #include "core/cpu.h"
 #include "interp/interp.h"
+#include "os/backend.h"
+#include "os/quiesce.h"
+#include "vm/vm_pages.h"
 
 /* Byte position p (0 = LSB) of a 32/64-bit value. */
 static uint32_t get_pos32(uint32_t v, unsigned p)
@@ -264,42 +271,172 @@ int do_sdr(mips64_ctx_t *ctx, uint64_t addr, uint64_t rtval)
 }
 
 /* LL/SC (E05): aligned word load arms the reservation; SC commits only
- * on a live exact-address reservation. A dead reservation still faults
- * on a bad address (load side effect preserved). */
+ * on a live exact-address reservation whose per-word generation epoch
+ * has not been bumped by an intervening store (defeating A->B->A ABA
+ * and cross-thread DBT stores). A dead reservation still faults on a
+ * bad address (load side effect preserved). */
+#define LLSC_SLOTS 160u
+#define LLSC_BUCKETS 4096u
+
+typedef struct {
+    const mips64_ctx_t *ctx;
+    uint64_t addr;
+    uint32_t width;
+    int active;
+    uint64_t epoch0;
+    uint64_t epoch1;
+} llsc_slot_t;
+
+static unsigned char sc_lock;
+static _Thread_local int g_sc_held;
+static _Thread_local sigset_t g_sc_preempt_saved;
+static llsc_slot_t g_llsc_slots[LLSC_SLOTS];
+static uint64_t g_llsc_epoch[LLSC_BUCKETS];
+
+static void sc_lock_acquire(void)
+{
+    mips_qs_block_preempt(&g_sc_preempt_saved);
+    while (__atomic_test_and_set(&sc_lock, __ATOMIC_ACQUIRE) != 0) {
+    }
+    g_sc_held = 1;
+}
+
+static void sc_lock_release(void)
+{
+    g_sc_held = 0;
+    __atomic_clear(&sc_lock, __ATOMIC_RELEASE);
+    mips_qs_unblock_preempt(&g_sc_preempt_saved);
+}
+
+static llsc_slot_t *llsc_slot_locked(const mips64_ctx_t *ctx, int create)
+{
+    size_t i;
+
+    if (ctx == NULL) {
+        return NULL;
+    }
+    for (i = 0u; i < LLSC_SLOTS; i++) {
+        if (g_llsc_slots[i].ctx == ctx) {
+            return &g_llsc_slots[i];
+        }
+    }
+    if (create == 0) {
+        return NULL;
+    }
+    for (i = 0u; i < LLSC_SLOTS; i++) {
+        if (g_llsc_slots[i].ctx == NULL) {
+            g_llsc_slots[i].ctx = ctx;
+            g_llsc_slots[i].addr = 0u;
+            g_llsc_slots[i].width = 0u;
+            g_llsc_slots[i].active = 0;
+            g_llsc_slots[i].epoch0 = 0u;
+            g_llsc_slots[i].epoch1 = 0u;
+            return &g_llsc_slots[i];
+        }
+    }
+    return NULL;
+}
+
+static void llsc_note_write_locked(uint64_t va, uint64_t len)
+{
+    uint64_t w;
+    uint64_t end_w;
+    size_t i;
+
+    w = va & ~(uint64_t)3u;
+    end_w = (va + len - 1u) & ~(uint64_t)3u;
+    if (end_w < w || (end_w - w) > 64u) {
+        for (i = 0u; i < LLSC_BUCKETS; i++) {
+            g_llsc_epoch[i]++;
+        }
+    } else {
+        for (; w <= end_w; w += 4u) {
+            g_llsc_epoch[(w >> 2) & (LLSC_BUCKETS - 1u)]++;
+            if (w + 4u < w) {
+                break;
+            }
+        }
+    }
+    for (i = 0u; i < LLSC_SLOTS; i++) {
+        llsc_slot_t *s = &g_llsc_slots[i];
+
+        if (s->ctx != NULL && s->active != 0 &&
+            va < s->addr + (uint64_t)s->width && s->addr < va + len) {
+            s->active = 0;
+        }
+    }
+}
+
+void mips_llsc_note_write(uint64_t va, uint64_t len)
+{
+    if (len == 0u || g_sc_held != 0) {
+        return;
+    }
+    sc_lock_acquire();
+    llsc_note_write_locked(va, len);
+    sc_lock_release();
+}
+
+void mips_llsc_release(const mips64_ctx_t *ctx)
+{
+    llsc_slot_t *s;
+
+    if (ctx == NULL) {
+        return;
+    }
+    sc_lock_acquire();
+    s = llsc_slot_locked(ctx, 0);
+    if (s != NULL) {
+        s->ctx = NULL;
+        s->addr = 0u;
+        s->width = 0u;
+        s->active = 0;
+        s->epoch0 = 0u;
+        s->epoch1 = 0u;
+    }
+    sc_lock_release();
+}
+
+static void llsc_gate_page_locked(mips64_ctx_t *ctx, uint64_t addr)
+{
+    uint64_t page = addr & ~(uint64_t)4095U;
+
+    if ((mips_vm_page_flags(page >> 12) &
+         (unsigned)MIPS_VM_PAGE_LL_ACTIVE) == 0u) {
+        mips_vm_pages_mark(page, 4096U, (unsigned)MIPS_VM_PAGE_LL_ACTIVE);
+        mips_soft_tlb_evict_write(ctx, page, 4096U);
+    }
+}
+
 int do_ll(mips64_ctx_t *ctx, uint64_t addr, unsigned rt)
 {
     uint64_t v = 0u;
+    llsc_slot_t *s;
 
     if ((addr & 3u) != 0u) {
         mips_fault(ctx, addr);
         return MIPS_FAULT;
     }
+    sc_lock_acquire();
+    llsc_gate_page_locked(ctx, addr);
     if (guest_ld32(ctx, addr, &v) != 0) {
+        sc_lock_release();
         return MIPS_FAULT;
+    }
+    s = llsc_slot_locked(ctx, 1);
+    if (s != NULL) {
+        s->addr = addr;
+        s->width = 4u;
+        s->epoch0 = g_llsc_epoch[(addr >> 2) & (LLSC_BUCKETS - 1u)];
+        s->epoch1 = s->epoch0;
+        s->active = 1;
     }
     ctx->llbit = 1;
     ctx->lladdr = addr;
     ctx->llval = (uint64_t)(uint32_t)v;
+    sc_lock_release();
     interp_set_reg(ctx, rt, interp_sext32((uint32_t)v));
     return 0;
-}
-
-/* Serialises the SC check-and-store across host threads sharing the
- * guest reservation: without it two threads can both pass the
- * llval compare between one thread's load and store and lose an
- * increment. __atomic builtins need no init and stay out of the
- * signal-delivery path (mips_fault never blocks on this lock). */
-static unsigned char sc_lock;
-
-static void sc_lock_acquire(void)
-{
-    while (__atomic_test_and_set(&sc_lock, __ATOMIC_ACQUIRE) != 0) {
-    }
-}
-
-static void sc_lock_release(void)
-{
-    __atomic_clear(&sc_lock, __ATOMIC_RELEASE);
 }
 
 int do_sc(mips64_ctx_t *ctx, uint64_t addr, unsigned rt)
@@ -313,16 +450,26 @@ int do_sc(mips64_ctx_t *ctx, uint64_t addr, unsigned rt)
         return MIPS_FAULT;
     }
     if (ctx->llbit != 0u && ctx->lladdr == addr) {
-        /* Cross-thread atomicity without a global reservation table:
-         * the store commits only when the word still holds the
-         * LL-observed value (same-thread stores already cleared
-         * llbit; a foreign same-value write is benign). */
+        llsc_slot_t *s;
+        int epoch_ok;
+
         sc_lock_acquire();
+        s = llsc_slot_locked(ctx, 0);
+        epoch_ok = (s != NULL && s->active != 0 &&
+                    s->addr == addr && s->width == 4u &&
+                    s->epoch0 ==
+                        g_llsc_epoch[(addr >> 2) & (LLSC_BUCKETS - 1u)]);
+        if (s != NULL) {
+            s->active = 0;
+        }
         if (guest_ld32(ctx, addr, &cur) != 0) {
             sc_lock_release();
             return MIPS_FAULT;
         }
-        if (cur == ctx->llval) {
+        if (epoch_ok && cur == ctx->llval) {
+            /* Bump epoch and invalidate peer reservations before
+             * releasing sc_lock so the check+store is atomic. */
+            llsc_note_write_locked(addr, 4u);
             if (guest_st32(ctx, addr, ctx->gpr[rt] & 0xFFFFFFFFu) != 0) {
                 sc_lock_release();
                 return MIPS_FAULT;
@@ -342,17 +489,31 @@ int do_sc(mips64_ctx_t *ctx, uint64_t addr, unsigned rt)
 int do_lld(mips64_ctx_t *ctx, uint64_t addr, unsigned rt)
 {
     uint64_t v = 0u;
+    llsc_slot_t *s;
 
     if ((addr & 7u) != 0u) {
         mips_fault(ctx, addr);
         return MIPS_FAULT;
     }
+    sc_lock_acquire();
+    llsc_gate_page_locked(ctx, addr);
     if (guest_ld64(ctx, addr, &v) != 0) {
+        sc_lock_release();
         return MIPS_FAULT;
+    }
+    s = llsc_slot_locked(ctx, 1);
+    if (s != NULL) {
+        s->addr = addr;
+        s->width = 8u;
+        s->epoch0 = g_llsc_epoch[(addr >> 2) & (LLSC_BUCKETS - 1u)];
+        s->epoch1 =
+            g_llsc_epoch[((addr + 4u) >> 2) & (LLSC_BUCKETS - 1u)];
+        s->active = 1;
     }
     ctx->llbit = 1;
     ctx->lladdr = addr;
     ctx->llval = v;
+    sc_lock_release();
     interp_set_reg(ctx, rt, v);
     return 0;
 }
@@ -368,13 +529,27 @@ int do_scd(mips64_ctx_t *ctx, uint64_t addr, unsigned rt)
         return MIPS_FAULT;
     }
     if (ctx->llbit != 0u && ctx->lladdr == addr) {
-        /* Same cross-thread value check as do_sc (64-bit lanes). */
+        llsc_slot_t *s;
+        int epoch_ok;
+
         sc_lock_acquire();
+        s = llsc_slot_locked(ctx, 0);
+        epoch_ok =
+            (s != NULL && s->active != 0 &&
+             s->addr == addr && s->width == 8u &&
+             s->epoch0 ==
+                 g_llsc_epoch[(addr >> 2) & (LLSC_BUCKETS - 1u)] &&
+             s->epoch1 ==
+                 g_llsc_epoch[((addr + 4u) >> 2) & (LLSC_BUCKETS - 1u)]);
+        if (s != NULL) {
+            s->active = 0;
+        }
         if (guest_ld64(ctx, addr, &cur) != 0) {
             sc_lock_release();
             return MIPS_FAULT;
         }
-        if (cur == ctx->llval) {
+        if (epoch_ok && cur == ctx->llval) {
+            llsc_note_write_locked(addr, 8u);
             if (guest_st64(ctx, addr, ctx->gpr[rt]) != 0) {
                 sc_lock_release();
                 return MIPS_FAULT;
@@ -399,7 +574,7 @@ static int mem_fault_at(mips64_ctx_t *ctx, uint64_t addr)
                       (unsigned long long)ctx->pc,
                       (unsigned long long)addr);
     }
-    mips_fault(ctx, addr);
+    mips_insn_trap(ctx, 4, addr);
     return MIPS_FAULT;
 }
 

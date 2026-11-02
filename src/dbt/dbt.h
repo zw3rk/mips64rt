@@ -181,6 +181,9 @@ long mips64_dbt_enter(mips64_ctx_t *ctx, uint64_t base, void *code,
  * exhaustion); publish one block through the backend JIT hooks. */
 void *dbt_arena_alloc(size_t len);
 void *dbt_code_publish(const uint8_t *buf, size_t len);
+void dbt_arena_reset(void);
+int dbt_arena_needs_reclaim(void);
+void dbt_thread_exit(mips64_ctx_t *ctx);
 
 /* Run guest code until a syscall `exit`/`exit_group` ends the
  * process (via `_Exit` inside the syscall layer) or a fault stops

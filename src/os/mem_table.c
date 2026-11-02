@@ -93,25 +93,14 @@ __attribute__((weak)) int mips_qs_has_peers(void) { return 0; }
 __attribute__((weak)) void mips_vm_file_unmap_hook(uint64_t va, uint64_t len) { (void)va; (void)len; }
 __attribute__((weak)) void mips_vm_file_protect_hook(uint64_t va, uint64_t len, uint32_t prot) { (void)va; (void)len; (void)prot; }
 __attribute__((weak)) int mips_vm_file_read_page(mips64_ctx_t *ctx,
-                                                 uint64_t page_va,
-                                                 uint8_t *out_page)
-{
-    (void)ctx; (void)page_va; (void)out_page; return 0;
-}
+    uint64_t page_va, uint8_t *out_page)
+{ (void)ctx; (void)page_va; (void)out_page; return 0; }
 __attribute__((weak)) void mips_vm_file_restore(mips64_ctx_t *ctx,
-                                                uint64_t va1, uint64_t len1,
-                                                uint64_t va2, uint64_t len2)
-{
-    (void)ctx; (void)va1; (void)len1; (void)va2; (void)len2;
-}
+    uint64_t va1, uint64_t len1, uint64_t va2, uint64_t len2)
+{ (void)ctx; (void)va1; (void)len1; (void)va2; (void)len2; }
 __attribute__((weak)) void mips_vm_file_remap_hook(mips64_ctx_t *ctx,
-                                                   uint64_t old_va,
-                                                   uint64_t old_size,
-                                                   uint64_t dst_va,
-                                                   uint64_t new_size)
-{
-    (void)ctx; (void)old_va; (void)old_size; (void)dst_va; (void)new_size;
-}
+    uint64_t old_va, uint64_t old_size, uint64_t dst_va, uint64_t new_size)
+{ (void)ctx; (void)old_va; (void)old_size; (void)dst_va; (void)new_size; }
 
 static int split_at(uint64_t task_size, uint64_t va)
 {
@@ -230,20 +219,14 @@ int mips_mem_map(mips64_ctx_t *ctx, uint64_t va, uint64_t len, uint32_t prot,
     size_t i;
     int rc = 0;
 
-    if (ctx == NULL || ctx->guest_base == 0U) {
+    if (ctx == NULL || ctx->guest_base == 0U || len == 0U ||
+        (va & (MIPS64_PAGE_SIZE - 1U)) != 0U ||
+        (prot & ~(MIPS_PROT_READ | MIPS_PROT_WRITE | MIPS_PROT_EXEC)) != 0U)
         return -EINVAL;
-    }
-    if (len == 0U || (va & (MIPS64_PAGE_SIZE - 1U)) != 0U) {
-        return -EINVAL;
-    }
-    if ((prot & ~(MIPS_PROT_READ | MIPS_PROT_WRITE | MIPS_PROT_EXEC)) != 0U) {
-        return -EINVAL;
-    }
     len = page_up(len);
     if (len < MIPS64_PAGE_SIZE || len > ctx->task_size ||
-        va > ctx->task_size - len) {
+        va > ctx->task_size - len)
         return -EINVAL;
-    }
     /* Quiescence step 1: park peers and drain leases before the
      * host mapping lands (steps 2-3 inside). */
     mips_qs_begin(ctx);
@@ -336,7 +319,8 @@ int mips_mem_unmap(mips64_ctx_t *ctx, uint64_t va, uint64_t len)
     dbt_invalidate_range(va, len);
     mips_vm_pages_clear(va, len,
                         (unsigned)(MIPS_VM_PAGE_COW_CLEAN |
-                                   MIPS_VM_PAGE_HAS_CODE));
+                                   MIPS_VM_PAGE_HAS_CODE |
+                                   MIPS_VM_PAGE_LL_ACTIVE));
     mips_vm_file_unmap_hook(va, len);
     mem_unlock();
     mips_qs_commit(ctx);
@@ -397,7 +381,8 @@ int mips_mem_map_replace(mips64_ctx_t *ctx, uint64_t va, uint64_t len,
     dbt_invalidate_range(va, len);
     mips_vm_pages_clear(va, len,
                         (unsigned)(MIPS_VM_PAGE_COW_CLEAN |
-                                   MIPS_VM_PAGE_HAS_CODE));
+                                   MIPS_VM_PAGE_HAS_CODE |
+                                   MIPS_VM_PAGE_LL_ACTIVE));
     mips_vm_file_unmap_hook(va, len);
     mem_unlock();
     mips_qs_commit(ctx);

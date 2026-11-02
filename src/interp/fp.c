@@ -45,6 +45,8 @@
 #include "interp/fp.h"
 #include "interp/interp.h"
 
+extern void mips_insn_trap(mips64_ctx_t *ctx, int signo, uint64_t addr);
+
 /* FCSR: FCC0 at bit 23, FCC1..7 at bits 31:25 (matches the MOVCI mask in
  * interp.c). RM at bits 1:0. Cause/Flag fields are never written here. */
 #define FP_FCC0_BIT 23u
@@ -132,15 +134,43 @@ int fp_issn_d(uint64_t u)
         ((u & UINT64_C(0x0008000000000000)) != 0u);
 }
 
-/* Set FCSR cause + sticky flag for exception e (FP_EXC_*). Traps are
- * out of scope until Phase 4 signals: bits are set unconditionally,
- * never delivered. */
+static _Thread_local int fp_trapped;
+
+void fp_clear_trap(void)
+{
+    fp_trapped = 0;
+}
+
+/* Set FCSR cause + sticky flag for exception e (FP_EXC_*). When the
+ * corresponding FCSR enable bit (7 + e) is set, record an enabled trap
+ * (suppressing sticky flag and destination writeback) so fp_finish_trap
+ * delivers SIGFPE synchronously. */
 void fp_raise(mips64_ctx_t *ctx, unsigned e)
 {
     if (e > (unsigned)FP_EXC_V) {
         return;
     }
-    ctx->fcsr |= (1u << (12u + e)) | (1u << (2u + e));
+    ctx->fcsr |= (1u << (12u + e));
+    if ((ctx->fcsr & (1u << (7u + e))) != 0u) {
+        fp_trapped = 1;
+    } else {
+        ctx->fcsr |= (1u << (2u + e));
+    }
+}
+
+int fp_finish_trap(mips64_ctx_t *ctx, uint64_t cur_pc, unsigned fd,
+                   uint64_t saved_fpr, uint32_t saved_cc, int rc)
+{
+    if (rc == 0 && fp_trapped != 0) {
+        fp_trapped = 0;
+        ctx->fpr[fd & 31u] = saved_fpr;
+        ctx->fcsr = (ctx->fcsr & ~0xFE800000u) | (saved_cc & 0xFE800000u);
+        mips_insn_trap(ctx, 8, cur_pc);
+        return (ctx->exit_reason == MIPS64_EXIT_NONE) ?
+            FP_RC_BRANCH : MIPS_FAULT;
+    }
+    fp_trapped = 0;
+    return rc;
 }
 
 /* Flag a finished finite result rf against its exact value q: overflow
@@ -760,9 +790,19 @@ static int fp_branch(mips64_ctx_t *ctx, uint64_t cur_pc, const mips_dec_t *d)
 
 int fp_cop1(mips64_ctx_t *ctx, uint64_t cur_pc, const mips_dec_t *d)
 {
+    uint64_t saved_fpr;
+    uint32_t saved_cc;
+    int rc = MIPS_FAULT;
+
     if (ctx == NULL || d == NULL) {
         return MIPS_FAULT;
     }
+    if (d->rs == 0x08u) { /* BC1F/BC1FL/BC1T/BC1TL */
+        return fp_branch(ctx, cur_pc, d);
+    }
+    saved_fpr = ctx->fpr[d->sa & 31u];
+    saved_cc = ctx->fcsr & 0xFE800000u;
+    fp_clear_trap();
     switch (d->rs) {
     case 0x01u: /* DMFC1: full 64-bit lane to GPR ($0 stays 0) */
         interp_set_reg(ctx, d->rt, ctx->fpr[d->rd]);
@@ -770,18 +810,19 @@ int fp_cop1(mips64_ctx_t *ctx, uint64_t cur_pc, const mips_dec_t *d)
     case 0x05u: /* DMTC1: full 64-bit lane from GPR */
         ctx->fpr[d->rd] = ctx->gpr[d->rt];
         return 0;
-    case 0x08u: /* BC1F/BC1FL/BC1T/BC1TL */
-        return fp_branch(ctx, cur_pc, d);
     case 0x16u: /* PS: paired-single lanes */
-        return fp_ps_cop1(ctx, cur_pc, d);
+        rc = fp_ps_cop1(ctx, cur_pc, d);
+        break;
     case 0x10u: /* S */
     case 0x11u: /* D */
-        return fp_fmt_sd(ctx, d);
+        rc = fp_fmt_sd(ctx, d);
+        break;
     case 0x14u: /* W (CVT.S.W / CVT.D.W source) */
     case 0x15u: /* L (CVT.S.L / CVT.D.L source) */
-        return fp_fmt_wl(ctx, d);
+        rc = fp_fmt_wl(ctx, d);
+        break;
     default:
         break;
     }
-    return MIPS_FAULT;
+    return fp_finish_trap(ctx, cur_pc, d->sa & 31u, saved_fpr, saved_cc, rc);
 }

@@ -23,6 +23,7 @@
 
 #include "dbt/dbt.h"
 #include "os/backend.h"
+#include "os/quiesce.h"
 #include "vm/vm_pages.h"
 
 #ifndef MAP_NORESERVE
@@ -108,8 +109,14 @@ static void vm_shm_unlock(void)
         __atomic_store_n(&vm_shm_ptr->lock, 0u, __ATOMIC_RELEASE);
 }
 
+static _Thread_local int vm_preempt_depth;
+static _Thread_local sigset_t vm_preempt_saved;
+
 static void vm_lock(void)
 {
+    if (vm_preempt_depth == 0)
+        mips_qs_block_preempt(&vm_preempt_saved);
+    vm_preempt_depth++;
     (void)pthread_mutex_lock(&vm_inode_mu);
     (void)vm_inode_table();
     vm_shm_lock();
@@ -120,6 +127,9 @@ static void vm_unlock(void)
 {
     vm_shm_unlock();
     (void)pthread_mutex_unlock(&vm_inode_mu);
+    vm_preempt_depth--;
+    if (vm_preempt_depth == 0)
+        mips_qs_unblock_preempt(&vm_preempt_saved);
 }
 
 static void vm_inode_compact_locked(vm_inode_t *in, pid_t self)

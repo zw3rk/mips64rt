@@ -54,6 +54,8 @@ extern void putn(uint8_t *p, uint64_t v, unsigned n, int be);
 extern uint64_t getn(const uint8_t *p, unsigned n, int be);
 extern uint8_t *guest_range(mips64_ctx_t *ctx, uint64_t va, uint64_t len,
                             int write);
+extern int mips_thread_kill(mips64_ctx_t *caller, long tid, int signo,
+                            int32_t code);
 
 /* MIPS SA_* bits (asm/signal.h). SA_KNOWN is the storable subset,
  * matching the reference implementation. */
@@ -503,13 +505,13 @@ void mips64_signals_reset_for_exec(mips64_ctx_t *ctx)
  * check. Mirrors the reference admission rule: a signal that is
  * neither blocked nor handled-to-be-delivered, and whose disposition
  * is ignore, is dropped without queueing. */
-static int l4a_raise_self(mips64_ctx_t *ctx, int signo, int32_t code,
-                          uint64_t addr)
+int mips_sig_enqueue(mips64_ctx_t *ctx, int signo, int32_t code,
+                     uint64_t addr)
 {
     uint64_t handler;
 
-    if (!l4a_signo_valid(signo)) {
-        return -(int64_t)EINVAL;
+    if (ctx == NULL || !l4a_signo_valid(signo)) {
+        return -(int)EINVAL;
     }
     handler = ctx->sigactions[signo].handler;
     if (!l4a_is_blocked(ctx, signo) && l4a_is_ignored(ctx, signo)) {
@@ -520,6 +522,12 @@ static int l4a_raise_self(mips64_ctx_t *ctx, int signo, int32_t code,
     }
     l4a_pend_enqueue(ctx, (uint32_t)signo, code, 0, addr);
     return 0;
+}
+
+static int l4a_raise_self(mips64_ctx_t *ctx, int signo, int32_t code,
+                          uint64_t addr)
+{
+    return mips_sig_enqueue(ctx, signo, code, addr);
 }
 
 /* rt_sigpending: (set=a0, sigsetsize=a1). Reports the queued-but-
@@ -676,27 +684,24 @@ static int64_t l4a_kill(mips64_ctx_t *ctx, uint64_t pid, uint64_t signo)
 static int64_t l4a_tkill(mips64_ctx_t *ctx, uint64_t tid, uint64_t signo,
                          int group, uint64_t tgid)
 {
-    if (tid == 0U || tid > (uint64_t)INT32_MAX) {
+    int32_t stid = (int32_t)(uint32_t)tid;
+    int32_t stgid = (int32_t)(uint32_t)tgid;
+
+    if (stid <= 0) {
         return l2a_ret(ctx, -(int64_t)EINVAL);
     }
-    if (group && (tgid == 0U || tgid > (uint64_t)INT32_MAX)) {
+    if (group && stgid <= 0) {
         return l2a_ret(ctx, -(int64_t)EINVAL);
     }
     if (signo > (uint64_t)MIPS64RT_NSIG) {
         return l2a_ret(ctx, -(int64_t)EINVAL);
     }
-    if (group && tgid != (uint64_t)getpid()) {
+    if (group && (pid_t)stgid != getpid()) {
         return l2a_ret(ctx, -(int64_t)ESRCH);
-    }
-    if (tid != (uint64_t)getpid()) {
-        return l2a_ret(ctx, -(int64_t)ESRCH);
-    }
-    if (signo == 0U) {
-        return l2a_ret(ctx, 0);
     }
     return l2a_ret(ctx,
-                   (int64_t)l4a_raise_self(ctx, (int)signo, L4A_SI_USER,
-                                           0U));
+                   (int64_t)mips_thread_kill(ctx, (long)stid, (int)signo,
+                                             L4A_SI_USER));
 }
 
 /* Dispatch seam for the signal syscalls not covered by the frozen

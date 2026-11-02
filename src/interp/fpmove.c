@@ -21,6 +21,8 @@
 #include "interp/fp.h"
 #include "interp/interp.h"
 
+extern void mips_insn_trap(mips64_ctx_t *ctx, int signo, uint64_t addr);
+
 /* Best-effort MIPS64R2 FIR for CFC1 $0 (read-only ID register); revisit
  * against qemu-mips64el/qemu-mips64 in Phase 3 (E03). Only CFC1 $0/$31
  * observability matters for Phase 1. */
@@ -187,6 +189,12 @@ int fpmove_cop1(mips64_ctx_t *ctx, const mips_dec_t *d)
     case 0x06u: /* CTC1: $31 = FCSR, $0 = FIR (writes ignored). */
         if (fs == 31u) {
             ctx->fcsr = (uint32_t)ctx->gpr[rt];
+            if ((((ctx->fcsr >> 12u) & (ctx->fcsr >> 7u) & 0x1Fu) != 0u) ||
+                ((ctx->fcsr & (1u << 17u)) != 0u)) {
+                mips_insn_trap(ctx, 8, ctx->pc);
+                return (ctx->exit_reason == MIPS64_EXIT_NONE) ?
+                    FP_RC_BRANCH : MIPS_FAULT;
+            }
             return 0;
         }
         if (fs == 0u) {

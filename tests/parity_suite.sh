@@ -131,10 +131,10 @@ run_unit() {
 }
 
 if [ -x _build/test_mem_sites ] || "$CC_HOST" -std=c11 -Werror=vla -pedantic -Wall -Wextra -Werror \
-    -pthread -Isrc tests/test_mem_sites.c src/dbt/emit_mem.c src/dbt/aot/sites.c \
+    -pthread -Isrc tests/test_mem_sites.c src/dbt/emit_mem.c src/dbt/emit_fpmem.c src/dbt/aot/sites.c \
     src/dbt/emit_enc.c src/dbt/a64_emit.c src/dbt/emit_int.c src/dbt/emit_alu.c \
     src/dbt/emit_fp.c src/interp/decode.c src/os/mem.c src/os/mem_table.c \
-    src/vm/vm_pages.c "$OS_BACKEND" tests/stubs_signal.c \
+    src/os/backend_state.c src/vm/vm_pages.c "$OS_BACKEND" tests/stubs_signal.c \
     -o _build/test_mem_sites >/dev/null 2>&1; then
     run_unit "test_mem_sites" ./_build/test_mem_sites
 else
@@ -144,7 +144,10 @@ fi
 
 if [ -x _build/check_host_contract ] || "$CC_HOST" -std=c11 -Werror=vla -pedantic -Wall -Wextra -Werror \
     -pthread -Isrc -o _build/check_host_contract \
-    tests/check_host_contract.c "$OS_BACKEND" src/vm/vm_pages.c >/dev/null 2>&1; then
+    tests/check_host_contract.c src/os/host_args.c src/os/mem.c \
+    src/os/mem_table.c src/os/backend_state.c src/dbt/aot/sha256.c \
+    src/dbt/aot/identity.c src/os/family_broker.c src/os/page_rules.c \
+    "$OS_BACKEND" src/vm/vm_pages.c >/dev/null 2>&1; then
     run_unit "check_host_contract" ./_build/check_host_contract
 else
     _t0=$(parity_now_ms)
@@ -162,7 +165,8 @@ fi
 
 if [ -x _build/test_decode ] || "$CC_HOST" -std=c11 -Werror=vla -pedantic -Wall -Wextra -Werror \
     -pthread -Isrc tests/test_decode.c src/interp/decode.c src/os/mem.c \
-    src/os/mem_table.c src/vm/vm_pages.c "$OS_BACKEND" tests/stubs_signal.c \
+    src/os/mem_table.c src/os/backend_state.c src/vm/vm_pages.c \
+    "$OS_BACKEND" tests/stubs_signal.c \
     -o _build/test_decode >/dev/null 2>&1; then
     run_unit "test_decode" ./_build/test_decode
 else

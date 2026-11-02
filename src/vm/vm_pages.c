@@ -201,7 +201,8 @@ unsigned mips_vm_page_flags(uint64_t vpn)
     }
     if (vm_page_overflow != 0) {
         out |= (unsigned)(MIPS_VM_PAGE_COW_CLEAN |
-                          MIPS_VM_PAGE_HAS_CODE);
+                          MIPS_VM_PAGE_HAS_CODE |
+                          MIPS_VM_PAGE_LL_ACTIVE);
     }
     (void)vm_page_unlock();
     return out;
@@ -296,13 +297,15 @@ void mips_vm_pages_remap(uint64_t old_va, uint64_t old_size,
         if (new_size < old_size) {
             mips_vm_pages_clear(old_va + new_size, old_size - new_size,
                                 (unsigned)(MIPS_VM_PAGE_COW_CLEAN |
-                                           MIPS_VM_PAGE_HAS_CODE));
+                                           MIPS_VM_PAGE_HAS_CODE |
+                                           MIPS_VM_PAGE_LL_ACTIVE));
         }
         return;
     }
     mips_vm_pages_clear(dst_va, new_size,
                         (unsigned)(MIPS_VM_PAGE_COW_CLEAN |
-                                   MIPS_VM_PAGE_HAS_CODE));
+                                   MIPS_VM_PAGE_HAS_CODE |
+                                   MIPS_VM_PAGE_LL_ACTIVE));
     for (off = 0u; off < kept; off += 4096u) {
         unsigned fl = mips_vm_page_flags((old_va + off) >> 12) &
                       (unsigned)MIPS_VM_PAGE_COW_CLEAN;
@@ -312,5 +315,6 @@ void mips_vm_pages_remap(uint64_t old_va, uint64_t old_size,
     }
     mips_vm_pages_clear(old_va, old_size,
                         (unsigned)(MIPS_VM_PAGE_COW_CLEAN |
-                                   MIPS_VM_PAGE_HAS_CODE));
+                                   MIPS_VM_PAGE_HAS_CODE |
+                                   MIPS_VM_PAGE_LL_ACTIVE));
 }

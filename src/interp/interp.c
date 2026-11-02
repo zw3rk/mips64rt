@@ -17,6 +17,7 @@
 #include "core/cpu.h"
 #include "interp/fp.h"
 #include "interp/interp.h"
+#include "os/backend.h"
 
 static int exec_branch(mips64_ctx_t *ctx, uint64_t pc, const mips_dec_t *d);
 static int fault_at(mips64_ctx_t *ctx, uint64_t addr)
@@ -27,8 +28,26 @@ static int fault_at(mips64_ctx_t *ctx, uint64_t addr)
                       (unsigned long long)addr);
     }
     mips_fault(ctx, addr);
-    /* RC4: a delivered signal leaves pc at the handler (return 2). */
     return (ctx->exit_reason == MIPS64_EXIT_NONE) ? 2 : MIPS_FAULT;
+}
+
+static int trap_at(mips64_ctx_t *ctx, int signo, uint64_t addr)
+{
+    if (ctx->trace_enabled) {
+        (void)fprintf(stderr, "F %llx at %llx\n",
+                      (unsigned long long)ctx->pc,
+                      (unsigned long long)addr);
+    }
+    mips_insn_trap(ctx, signo, addr);
+    return (ctx->exit_reason == MIPS64_EXIT_NONE) ? 2 : MIPS_FAULT;
+}
+
+static int trap_code(mips64_ctx_t *ctx, uint64_t addr, const mips_dec_t *d)
+{
+    unsigned bcode = ((unsigned)d->uimm >> 6u) & 0x3FFu;
+    int signo = (bcode == 6u || bcode == 7u) ? 8 : 5;
+
+    return trap_at(ctx, signo, addr);
 }
 
 /* Shared COP1/COP1X result mapping: 1/2 = BC1 run-stop/pc-final. */
@@ -37,7 +56,10 @@ static int cop_rc(mips64_ctx_t *ctx, uint64_t cur_pc, int rc)
     if (rc == 1 || rc == 2) {
         return rc;
     }
-    return (rc != 0) ? fault_at(ctx, cur_pc) : 0;
+    if (rc != 0 && ctx->exit_reason != MIPS64_EXIT_NONE) {
+        return MIPS_FAULT;
+    }
+    return (rc != 0) ? trap_at(ctx, 4, cur_pc) : 0;
 }
 
 /* Fetch and decode the word at pc; fault when the fetcher did not. */
@@ -185,29 +207,16 @@ static int exec_special(mips64_ctx_t *ctx, uint64_t cur_pc, const mips_dec_t *d)
         return 0;
     case 0x0Cu: /* SYSCALL */
         return exec_syscall(ctx);
-    case 0x0Du: /* BREAK */ return fault_at(ctx, cur_pc);
+    case 0x0Du: /* BREAK */ return trap_code(ctx, cur_pc, d);
     case 0x0Fu: /* SYNC */ return 0;
-    case 0x10u: /* MFHI */
-        interp_set_reg(ctx, d->rd, ctx->hi);
-        return 0;
-    case 0x11u: /* MTHI */
-        ctx->hi = rs;
-        return 0;
-    case 0x12u: /* MFLO */
-        interp_set_reg(ctx, d->rd, ctx->lo);
-        return 0;
-    case 0x13u: /* MTLO */
-        ctx->lo = rs;
-        return 0;
-    case 0x14u: /* DSLLV */
-        interp_set_reg(ctx, d->rd, rt << (rs & 63u));
-        return 0;
+    case 0x10u: interp_set_reg(ctx, d->rd, ctx->hi); return 0; /* MFHI */
+    case 0x11u: ctx->hi = rs; return 0; /* MTHI */
+    case 0x12u: interp_set_reg(ctx, d->rd, ctx->lo); return 0; /* MFLO */
+    case 0x13u: ctx->lo = rs; return 0; /* MTLO */
+    case 0x14u: interp_set_reg(ctx, d->rd, rt << (rs & 63u)); return 0; /* DSLLV */
     case 0x16u: /* DSRLV / DROTRV (sa == 1 selects DROTRV) */
-        if (d->sa == 1u) {
-            interp_set_reg(ctx, d->rd, interp_rotr64(rt, rs));
-        } else {
-            interp_set_reg(ctx, d->rd, rt >> (rs & 63u));
-        }
+        interp_set_reg(ctx, d->rd, d->sa == 1u ? interp_rotr64(rt, rs) :
+                       (rt >> (rs & 63u)));
         return 0;
     case 0x17u: /* DSRAV */
         interp_set_reg(ctx, d->rd, (uint64_t)((int64_t)rt >> (rs & 63u)));
@@ -282,7 +291,7 @@ static int exec_special(mips64_ctx_t *ctx, uint64_t cur_pc, const mips_dec_t *d)
     case 0x20u: /* ADD (trapping) */
         out = (uint64_t)(rs32 + rt32);
         if (interp_add32_ov(rs32, rt32, (uint32_t)out)) {
-            return fault_at(ctx, cur_pc);
+            return trap_at(ctx, 8, cur_pc);
         }
         interp_set_reg(ctx, d->rd, interp_sext32((uint32_t)out));
         return 0;
@@ -292,7 +301,7 @@ static int exec_special(mips64_ctx_t *ctx, uint64_t cur_pc, const mips_dec_t *d)
     case 0x22u: /* SUB (trapping) */
         out = (uint64_t)(rs32 - rt32);
         if (interp_sub32_ov(rs32, rt32, (uint32_t)out)) {
-            return fault_at(ctx, cur_pc);
+            return trap_at(ctx, 8, cur_pc);
         }
         interp_set_reg(ctx, d->rd, interp_sext32((uint32_t)out));
         return 0;
@@ -320,7 +329,7 @@ static int exec_special(mips64_ctx_t *ctx, uint64_t cur_pc, const mips_dec_t *d)
     case 0x2Cu: /* DADD (trapping) */
         out = rs + rt;
         if (interp_add64_ov(rs, rt, out)) {
-            return fault_at(ctx, cur_pc);
+            return trap_at(ctx, 8, cur_pc);
         }
         interp_set_reg(ctx, d->rd, out);
         return 0;
@@ -330,7 +339,7 @@ static int exec_special(mips64_ctx_t *ctx, uint64_t cur_pc, const mips_dec_t *d)
     case 0x2Eu: /* DSUB (trapping) */
         out = rs - rt;
         if (interp_sub64_ov(rs, rt, out)) {
-            return fault_at(ctx, cur_pc);
+            return trap_at(ctx, 8, cur_pc);
         }
         interp_set_reg(ctx, d->rd, out);
         return 0;
@@ -338,17 +347,17 @@ static int exec_special(mips64_ctx_t *ctx, uint64_t cur_pc, const mips_dec_t *d)
         interp_set_reg(ctx, d->rd, rs - rt);
         return 0;
     case 0x30u: /* TGE */
-        return (int64_t)rs >= (int64_t)rt ? fault_at(ctx, cur_pc) : 0;
+        return (int64_t)rs >= (int64_t)rt ? trap_code(ctx, cur_pc, d) : 0;
     case 0x31u: /* TGEU */
-        return rs >= rt ? fault_at(ctx, cur_pc) : 0;
+        return rs >= rt ? trap_code(ctx, cur_pc, d) : 0;
     case 0x32u: /* TLT */
-        return (int64_t)rs < (int64_t)rt ? fault_at(ctx, cur_pc) : 0;
+        return (int64_t)rs < (int64_t)rt ? trap_code(ctx, cur_pc, d) : 0;
     case 0x33u: /* TLTU */
-        return rs < rt ? fault_at(ctx, cur_pc) : 0;
+        return rs < rt ? trap_code(ctx, cur_pc, d) : 0;
     case 0x34u: /* TEQ */
-        return rs == rt ? fault_at(ctx, cur_pc) : 0;
+        return rs == rt ? trap_code(ctx, cur_pc, d) : 0;
     case 0x36u: /* TNE */
-        return rs != rt ? fault_at(ctx, cur_pc) : 0;
+        return rs != rt ? trap_code(ctx, cur_pc, d) : 0;
     case 0x38u: /* DSLL */
         interp_set_reg(ctx, d->rd, rt << sh);
         return 0;
@@ -372,18 +381,15 @@ static int exec_special(mips64_ctx_t *ctx, uint64_t cur_pc, const mips_dec_t *d)
             interp_set_reg(ctx, d->rd, rt >> (32u + sh));
         }
         return 0;
-    case 0x3Fu: /* DSRA32 / SDBBP: all-zero code word is the breakpoint */
-        if (d->rs == 0u && d->rt == 0u && d->rd == 0u && d->sa == 0u) {
-            return fault_at(ctx, cur_pc);
-        }
+    case 0x3Fu: /* DSRA32 */
         interp_set_reg(ctx, d->rd, (uint64_t)((int64_t)rt >> (32u + sh)));
         return 0;
     default:
-        return fault_at(ctx, cur_pc);
+        return trap_at(ctx, 4, cur_pc);
     }
 }
 
-/* SPECIAL2 (major opcode 0x1C): MUL/MADD family, CLZ/CLO, DCLZ/DCLO. */
+/* SPECIAL2 (major opcode 0x1C): MUL/MADD family, CLZ/CLO, DCLZ/DCLO, SDBBP. */
 static int exec_special2(mips64_ctx_t *ctx, uint64_t cur_pc,
                          const mips_dec_t *d)
 {
@@ -391,43 +397,33 @@ static int exec_special2(mips64_ctx_t *ctx, uint64_t cur_pc,
     uint64_t rt = ctx->gpr[d->rt];
     uint32_t rs32 = (uint32_t)rs;
     uint32_t rt32 = (uint32_t)rt;
+    uint64_t acc = ((uint64_t)(uint32_t)ctx->hi << 32) |
+                   (uint64_t)(uint32_t)ctx->lo;
 
     switch (d->funct) {
-    case 0x00u: { /* MADD: signed 32-bit accumulate into hi:lo */
-        int64_t acc = (int64_t)(((uint64_t)ctx->hi << 32) | ctx->lo);
-
-        acc += (int64_t)(int32_t)rs32 * (int64_t)(int32_t)rt32;
-        ctx->lo = interp_sext32((uint32_t)(uint64_t)acc);
-        ctx->hi = interp_sext32((uint32_t)((uint64_t)acc >> 32));
+    case 0x00u: /* MADD: signed 32-bit accumulate into hi:lo */
+        acc += (uint64_t)((int64_t)(int32_t)rs32 * (int64_t)(int32_t)rt32);
+        ctx->lo = interp_sext32((uint32_t)acc);
+        ctx->hi = interp_sext32((uint32_t)(acc >> 32));
         return 0;
-    }
-    case 0x01u: { /* MADDU: unsigned 32-bit accumulate into hi:lo */
-        uint64_t acc = ((uint64_t)ctx->hi << 32) | ctx->lo;
-
+    case 0x01u: /* MADDU: unsigned 32-bit accumulate into hi:lo */
         acc += (uint64_t)rs32 * (uint64_t)rt32;
         ctx->lo = interp_sext32((uint32_t)acc);
         ctx->hi = interp_sext32((uint32_t)(acc >> 32));
         return 0;
-    }
     case 0x02u: /* MUL: low 32 bits of the product, sign-extended */
         interp_set_reg(ctx, d->rd, interp_sext32(rs32 * rt32));
         return 0;
-    case 0x04u: { /* MSUB: signed 32-bit subtract from hi:lo */
-        int64_t acc = (int64_t)(((uint64_t)ctx->hi << 32) | ctx->lo);
-
-        acc -= (int64_t)(int32_t)rs32 * (int64_t)(int32_t)rt32;
-        ctx->lo = interp_sext32((uint32_t)(uint64_t)acc);
-        ctx->hi = interp_sext32((uint32_t)((uint64_t)acc >> 32));
+    case 0x04u: /* MSUB: signed 32-bit subtract from hi:lo */
+        acc -= (uint64_t)((int64_t)(int32_t)rs32 * (int64_t)(int32_t)rt32);
+        ctx->lo = interp_sext32((uint32_t)acc);
+        ctx->hi = interp_sext32((uint32_t)(acc >> 32));
         return 0;
-    }
-    case 0x05u: { /* MSUBU: unsigned 32-bit subtract from hi:lo */
-        uint64_t acc = ((uint64_t)ctx->hi << 32) | ctx->lo;
-
+    case 0x05u: /* MSUBU: unsigned 32-bit subtract from hi:lo */
         acc -= (uint64_t)rs32 * (uint64_t)rt32;
         ctx->lo = interp_sext32((uint32_t)acc);
         ctx->hi = interp_sext32((uint32_t)(acc >> 32));
         return 0;
-    }
     case 0x20u: /* CLZ (32-bit) */
         interp_set_reg(ctx, d->rd, interp_sext32(interp_clz32(rs32)));
         return 0;
@@ -440,8 +436,10 @@ static int exec_special2(mips64_ctx_t *ctx, uint64_t cur_pc,
     case 0x25u: /* DCLO (64-bit) */
         interp_set_reg(ctx, d->rd, interp_clz64(~rs));
         return 0;
+    case 0x3Fu: /* SDBBP */
+        return trap_at(ctx, 5, cur_pc);
     default:
-        return fault_at(ctx, cur_pc);
+        return trap_at(ctx, 4, cur_pc);
     }
 }
 
@@ -487,7 +485,7 @@ static int exec_special3(mips64_ctx_t *ctx, uint64_t cur_pc,
         unsigned msb = d->rd & 31u;
 
         if (msb < pos) {
-            return fault_at(ctx, cur_pc);
+            return trap_at(ctx, 4, cur_pc);
         } else {
             unsigned size = msb - pos + 1u;
             uint64_t mask = (size >= 32u) ? UINT64_C(0xFFFFFFFF) :
@@ -506,7 +504,7 @@ static int exec_special3(mips64_ctx_t *ctx, uint64_t cur_pc,
         unsigned msb = (d->rd & 31u) + ((d->funct == 0x07u) ? 0u : 32u);
 
         if (msb < pos) {
-            return fault_at(ctx, cur_pc);
+            return trap_at(ctx, 4, cur_pc);
         } else {
             unsigned size = msb - pos + 1u;
             uint64_t mask = (size >= 64u) ? UINT64_MAX :
@@ -533,7 +531,7 @@ static int exec_special3(mips64_ctx_t *ctx, uint64_t cur_pc,
                            (uint64_t)(int64_t)(int16_t)(rt & 0xFFFFu));
             return 0;
         default:
-            return fault_at(ctx, cur_pc);
+            return trap_at(ctx, 4, cur_pc);
         }
     case 0x24u: /* DSBH/DSHD: source is rt (rs is unused, always $0). */
         switch (d->sa) {
@@ -559,16 +557,16 @@ static int exec_special3(mips64_ctx_t *ctx, uint64_t cur_pc,
                                ((rt >> 48) & UINT64_C(0xFFFF)));
             return 0;
         default:
-            return fault_at(ctx, cur_pc);
+            return trap_at(ctx, 4, cur_pc);
         }
     case 0x3Bu: /* RDHWR rt, rd: rd selects, rt receives (MIPS64R2). */
         if (d->rd != MIPS64_RDHWR_ULR) {
-            return fault_at(ctx, cur_pc);
+            return trap_at(ctx, 4, cur_pc);
         }
         interp_set_reg(ctx, d->rt, ctx->ulr);
         return 0;
     default:
-        return fault_at(ctx, cur_pc);
+        return trap_at(ctx, 4, cur_pc);
     }
 }
 
@@ -601,9 +599,9 @@ static int exec_regimm_trap(mips64_ctx_t *ctx, uint64_t cur_pc,
     case 0x1Fu: /* SYNCI: no translated code exists in Phase 1 -> NOP */
         return 0;
     default:
-        return fault_at(ctx, cur_pc);
+        return trap_at(ctx, 4, cur_pc);
     }
-    return fire ? fault_at(ctx, cur_pc) : 0;
+    return fire ? trap_at(ctx, 5, cur_pc) : 0;
 }
 
 static int exec_simple(mips64_ctx_t *ctx, uint64_t cur_pc, const mips_dec_t *d)
@@ -619,7 +617,7 @@ static int exec_simple(mips64_ctx_t *ctx, uint64_t cur_pc, const mips_dec_t *d)
             uint32_t out = rs + (uint32_t)d->simm;
 
             if (interp_add32_ov(rs, (uint32_t)d->simm, out)) {
-                return fault_at(ctx, cur_pc);
+                return trap_at(ctx, 8, cur_pc);
             }
             interp_set_reg(ctx, d->rt, interp_sext32(out));
             return 0;
@@ -651,7 +649,7 @@ static int exec_simple(mips64_ctx_t *ctx, uint64_t cur_pc, const mips_dec_t *d)
         return 0;
     case 0x10u: /* COP0: ulr-alias moves via fpmove.c, rest faults */
         if (fpmove_cop0(ctx, d) != 0) {
-            return fault_at(ctx, cur_pc);
+            return trap_at(ctx, 4, cur_pc);
         }
         return 0;
     case 0x18u: /* DADDI (trapping) */
@@ -660,7 +658,7 @@ static int exec_simple(mips64_ctx_t *ctx, uint64_t cur_pc, const mips_dec_t *d)
 
             if (interp_add64_ov(ctx->gpr[d->rs], (uint64_t)(int64_t)d->simm,
                                 out)) {
-                return fault_at(ctx, cur_pc);
+                return trap_at(ctx, 8, cur_pc);
             }
             interp_set_reg(ctx, d->rt, out);
             return 0;
@@ -711,7 +709,7 @@ static int exec_simple(mips64_ctx_t *ctx, uint64_t cur_pc, const mips_dec_t *d)
     case 0x33u: /* PREF */
         return 0;
     default: /* COP2, MIPS64-only, reserved (COP1X handled above) */
-        return fault_at(ctx, cur_pc);
+        return trap_at(ctx, 4, cur_pc);
     }
 }
 
@@ -764,40 +762,16 @@ static int exec_branch(mips64_ctx_t *ctx, uint64_t pc, const mips_dec_t *d)
     case 0x01u: /* REGIMM */
         target = pc + 4u + off;
         switch (d->rt) {
-        case 0x00u: /* BLTZ */
-            taken = (int64_t)rs < 0;
-            break;
-        case 0x01u: /* BGEZ */
-            taken = (int64_t)rs >= 0;
-            break;
-        case 0x02u: /* BLTZL */
-            likely = 1;
-            taken = (int64_t)rs < 0;
-            break;
-        case 0x03u: /* BGEZL */
-            likely = 1;
-            taken = (int64_t)rs >= 0;
-            break;
-        case 0x10u: /* BLTZAL */
-            link = 1;
-            taken = (int64_t)rs < 0;
-            break;
-        case 0x11u: /* BGEZAL (BAL) */
-            link = 1;
-            taken = (int64_t)rs >= 0;
-            break;
-        case 0x12u: /* BLTZALL */
-            link = 1;
-            likely = 1;
-            taken = (int64_t)rs < 0;
-            break;
-        case 0x13u: /* BGEZALL */
-            link = 1;
-            likely = 1;
-            taken = (int64_t)rs >= 0;
-            break;
+        case 0x00u: taken = (int64_t)rs < 0; break;  /* BLTZ */
+        case 0x01u: taken = (int64_t)rs >= 0; break; /* BGEZ */
+        case 0x02u: likely = 1; taken = (int64_t)rs < 0; break;  /* BLTZL */
+        case 0x03u: likely = 1; taken = (int64_t)rs >= 0; break; /* BGEZL */
+        case 0x10u: link = 1; taken = (int64_t)rs < 0; break;    /* BLTZAL */
+        case 0x11u: link = 1; taken = (int64_t)rs >= 0; break;   /* BGEZAL */
+        case 0x12u: link = 1; likely = 1; taken = (int64_t)rs < 0; break;
+        case 0x13u: link = 1; likely = 1; taken = (int64_t)rs >= 0; break;
         default:
-            return fault_at(ctx, pc);
+            return trap_at(ctx, 4, pc);
         }
         break;
     case 0x00u: /* JR / JALR */
@@ -810,11 +784,11 @@ static int exec_branch(mips64_ctx_t *ctx, uint64_t pc, const mips_dec_t *d)
             link = 1;
             link_rd = d->rd;
         } else if (d->funct != 0x08u) {
-            return fault_at(ctx, pc);
+            return trap_at(ctx, 4, pc);
         }
         break;
     default:
-        return fault_at(ctx, pc);
+        return trap_at(ctx, 4, pc);
     }
 
     if (link) {
