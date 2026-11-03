@@ -178,13 +178,16 @@ int mips_vm_file_read_page(mips64_ctx_t *ctx, uint64_t page_va,
     return done;
 }
 
-/* LL/SC shared-backing identity (R7-2): resolve va to the shared
- * file mapping covering it (any pid: the (dev, ino) identity is
- * per-file) with the inode's current LL/SC generation. */
+/* LL/SC shared-backing identity (R7-2): resolve va to this
+ * process's shared file mapping covering it (pid-filtered like every
+ * other VA-keyed scan: a sibling's coincident mapping of another file
+ * must not supply the reservation identity) with the inode's current
+ * LL/SC generation. */
 int mips_vm_file_backing_seq(uint64_t va, uint64_t *devp, uint64_t *inop,
                              uint64_t *seqp)
 {
     vm_inode_t *tab;
+    pid_t cur_pid = getpid();
     size_t k;
 
     if (devp == NULL || inop == NULL || seqp == NULL ||
@@ -200,7 +203,7 @@ int mips_vm_file_backing_seq(uint64_t va, uint64_t *devp, uint64_t *inop,
         for (i = 0; in->used != 0 && i < in->nmaps; i++) {
             vm_inode_map_t *m = &in->maps[i];
 
-            if (m->shared == 0) {
+            if (m->pid != cur_pid || m->shared == 0) {
                 continue;
             }
             if (va >= m->va && va - m->va < m->len) {
@@ -244,6 +247,7 @@ int mips_vm_file_llsc_seq_ok(uint64_t dev, uint64_t ino, uint64_t seq)
 void mips_vm_file_bump_llsc(uint64_t va, uint64_t len)
 {
     vm_inode_t *tab;
+    pid_t cur_pid = getpid();
     size_t k;
 
     if (len == 0u || !vm_inode_table_tried || vm_inode_table_ptr == NULL) {
@@ -264,7 +268,7 @@ void mips_vm_file_bump_llsc(uint64_t va, uint64_t len)
             uint64_t mhi = m->va + m->len;
             uint64_t end = va + len;
 
-            if (m->shared == 0) {
+            if (m->pid != cur_pid || m->shared == 0) {
                 continue;
             }
             if (end < va) {
@@ -279,7 +283,10 @@ void mips_vm_file_bump_llsc(uint64_t va, uint64_t len)
             }
         }
         if (hit != 0) {
-            in->llsc_seq++;
+            /* Cross-process visible: bump atomically so a racing
+             * increment is never lost (a lost bump could hide an
+             * ABA from an LL armed on the old generation). */
+            __atomic_add_fetch(&in->llsc_seq, 1u, __ATOMIC_SEQ_CST);
         }
     }
     vm_unlock();

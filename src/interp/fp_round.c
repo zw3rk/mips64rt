@@ -7,8 +7,8 @@
  * Split from fp.c so every TU stays <= 900 lines: single-precision
  * O/U/I bits, directed binary64 rounding, FPR lane writeback, the RNE
  * quad helper, and the FS flush-to-zero control (FCSR bit 24). With
- * FS set, a subnormal result flushes to signed zero: the operation is
- * still inexact (I), but no underflow (U) is reported.
+ * FS set, a subnormal result flushes to signed zero: the operation
+ * reports underflow and inexact (R7-15: U and I).
  */
 
 #include <float.h>
@@ -26,8 +26,8 @@ unsigned fp_inexact_exc(mips64_ctx_t *ctx, long double rf, long double q)
     if (ctx != NULL && (ctx->fcsr & (1u << FP_FS_BIT)) != 0u &&
         rf == 0.0L && q != 0.0L && fabsl(q) < (long double)FLT_MIN) {
         /* FS-flushed tiny result (fp_adj_f zeroed it): the operation
-         * is inexact, but flushing suppresses underflow. */
-        return 1u << (unsigned)FP_EXC_I;
+         * is inexact and underflow is reported (R7-15: U and I). */
+        return (1u << (unsigned)FP_EXC_U) | (1u << (unsigned)FP_EXC_I);
     }
     if (((isinf(rf) != 0) || (isinf((float)q) != 0)) &&
         (isinf(q) == 0)) {
@@ -99,8 +99,9 @@ double fp_round_d(mips64_ctx_t *ctx, double r, int cmp, unsigned rm)
     if (ctx != NULL && (ctx->fcsr & (1u << FP_FS_BIT)) != 0u &&
         rf != 0.0 && isfinite(rf) != 0 && isnormal(rf) == 0) {
         /* FS flush (R7-15): subnormal result becomes signed zero;
-         * inexact, but no underflow is reported. */
+         * inexact, and underflow is reported (U and I). */
         rf = signbit(rf) != 0 ? -0.0 : 0.0;
+        fp_raise(ctx, (unsigned)FP_EXC_U);
         fp_raise(ctx, (unsigned)FP_EXC_I);
         return rf;
     }

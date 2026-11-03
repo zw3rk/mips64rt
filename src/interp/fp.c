@@ -779,16 +779,20 @@ int fp_cop1(mips64_ctx_t *ctx, uint64_t cur_pc, const mips_dec_t *d)
     if (d->rs == 0x08u) { /* BC1F/BC1FL/BC1T/BC1TL */
         return fp_branch(ctx, cur_pc, d);
     }
+    /* DMFC1/DMTC1 are register moves, not arithmetic (Issue 4): they
+     * must not clear FCSR Cause, so they run before fp_begin_op. */
+    if (d->rs == 0x01u) { /* DMFC1: full 64-bit lane to GPR ($0 stays 0) */
+        interp_set_reg(ctx, d->rt, ctx->fpr[d->rd]);
+        return 0;
+    }
+    if (d->rs == 0x05u) { /* DMTC1: full 64-bit lane from GPR */
+        ctx->fpr[d->rd] = ctx->gpr[d->rt];
+        return 0;
+    }
     saved_fpr = ctx->fpr[d->sa & 31u];
     saved_cc = ctx->fcsr & 0xFE800000u;
     fp_begin_op(ctx);
     switch (d->rs) {
-    case 0x01u: /* DMFC1: full 64-bit lane to GPR ($0 stays 0) */
-        interp_set_reg(ctx, d->rt, ctx->fpr[d->rd]);
-        return 0;
-    case 0x05u: /* DMTC1: full 64-bit lane from GPR */
-        ctx->fpr[d->rd] = ctx->gpr[d->rt];
-        return 0;
     case 0x16u: /* PS: paired-single lanes */
         rc = fp_ps_cop1(ctx, cur_pc, d);
         break;

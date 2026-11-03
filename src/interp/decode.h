@@ -211,8 +211,8 @@
 
 /* COP0/COP1 branch sub-opcodes share the BC numbering. */
 #define MIPS64_BC_F  0x00U
-#define MIPS64_BC_FL 0x01U
-#define MIPS64_BC_T  0x02U
+#define MIPS64_BC_T  0x01U
+#define MIPS64_BC_FL 0x02U
 #define MIPS64_BC_TL 0x03U
 
 /*

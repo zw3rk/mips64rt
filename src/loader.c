@@ -326,15 +326,15 @@ static int parse_ehdr(int fd, ehdr_t *eh)
 }
 
 /* Returns 1 for N64, 2 for N32, 0 to reject. R7-1: the decoder
- * implements MIPS64r2 only, so R6 (arch 0x9/0xA) and any other
- * non-R2 arch revision are rejected here; legacy images with no arch
- * field execute as R2. */
+ * implements MIPS64r2, whose encodings are a superset of MIPS I
+ * through MIPS64r1, so every pre-R6 arch level (0x0 .. 0x8) is
+ * admitted here (Issue 3); only R6 (arch 0x9/0xA) and unknown levels
+ * are rejected. Legacy images with no arch field execute as R2. */
 static int classify(const ehdr_t *eh)
 {
     uint32_t arch = eh->flags & MIPS_EF_ARCH;
 
-    if (arch != 0U && arch != MIPS_EF_ARCH_32R2 &&
-        arch != MIPS_EF_ARCH_64R2) {
+    if (arch > MIPS_EF_ARCH_64R2) {
         return 0;
     }
     if (eh->is64) {

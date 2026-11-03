@@ -23,7 +23,7 @@
 
 /* ELF flag bits (binutils elf/mips.h): arch revision occupies the top
  * nibble (32R2 0x7, 64R2 0x8, 32R6 0x9, 64R6 0xA); NAN2008 selects
- * IEEE-2008 NaN polarity. Only R2 revisions execute (R7-1, R7-6). */
+ * IEEE-2008 NaN polarity. Only pre-R6 revisions execute (R7-1, R7-6). */
 #define MIPS_EF_ARCH 0xF0000000U
 #define MIPS_EF_ARCH_32R2 0x70000000U
 #define MIPS_EF_ARCH_64R2 0x80000000U

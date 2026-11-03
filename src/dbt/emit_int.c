@@ -572,7 +572,8 @@ static int ei_one(a64_emit_t *e, const mips_dec_t *d, uint64_t pc, int be,
         r = ef_emit_fp(e, d, pc, slot);
         break;
     case 0x13u: /* COP1X (Wave P): indexed FP mem via emit_fpmem.c,
-                 * MADD/MSUB/NMADD/NMSUB via emit_fp.c; others UNDEF. */
+                 * MADD/MSUB/NMADD/NMSUB decline to interp_step (Issue 1);
+                 * others UNDEF. */
         r = ei_fp_mem_idx(e, d, pc, be, slot);
         if (r != 0)
             r = ef_emit_cop1x(e, d, pc, slot);

@@ -671,123 +671,25 @@ int ef_emit_fp(a64_emit_t *e, const mips_dec_t *d, uint64_t pc, int slot)
     return 1;
 }
 
-/* ---- COP1X fused multiply-add (Wave P, lane P4) ----
+/* ---- COP1X multiply-add (Wave P, lane P4) ----
  *
- * MIPS64r2 COP1X (op 0x13) MADD/MSUB/NMADD/NMSUB (.S/.D) lower to the
- * single-rounding host FMA family, matching the interp oracle
- * (src/interp/fp_ps.c uses fmaf/fma, likewise single-rounding):
- *   MADD.S/D   fd = fr + fs*ft   FMADD  fd, fs, ft, fr
- *   MSUB.S/D   fd = fs*ft - fr   FNMSUB fd, fs, ft, fr
- *   NMADD.S/D  fd = -(fr + fs*ft) FNMADD fd, fs, ft, fr
- *   NMSUB.S/D  fd = fr - fs*ft   FMSUB  fd, fs, ft, fr
- * Field layout (decode.c): fr = rs, ft = rt, fs = rd, fd = sa.
- *
- * Exactness policy (same as ef_arith): the FCSR fast-path guard exits
- * when RM != RN, any enable is set, or FS is set; any NaN result
- * (propagated inputs, 0*Inf, SNaN) exits so interp owns default-NaN
- * canonicalization and Invalid flags. Sticky Inexact/Overflow flags
- * are deferred per the RC3 adjudication, exactly like S/D arithmetic.
- * Indexed COP1X memory words (LWXC1/LDXC1/SWXC1/SDXC1/PREFX) fault in
- * the interp oracle, so they return 1 here and the dispatcher replays
- * them (fault-identical). Guarded FMA words may emit in delay slots:
- * their guards exit at the branch (slot pc - 4u). */
-
-/* Assembler-verified FMA bases (Rd=0,Rn=0,Rm=0,Ra=0 probed with
- * aarch64 clang; o1 = bit 21, o0 = bit 15, type = bit 22):
- * FMADD = (0,0), FMSUB = (0,1), FNMADD = (1,0), FNMSUB = (1,1). */
-#define EF_FMADD_S 0x1F000000u
-#define EF_FMSUB_S 0x1F008000u
-#define EF_FNMADD_S 0x1F200000u
-#define EF_FNMSUB_S 0x1F208000u
-#define EF_FMADD_D 0x1F400000u
-#define EF_FMSUB_D 0x1F408000u
-#define EF_FNMADD_D 0x1F600000u
-#define EF_FNMSUB_D 0x1F608000u
-
-/* Four-source FMA: word = base | Rm<<16 | Ra<<10 | Rn<<5 | Rd. */
-static void ef_fma(a64_emit_t *e, uint32_t base, unsigned rd, unsigned rn,
-                   unsigned rm, unsigned ra)
-{
-    if (ra > 4u) {
-        if (e != NULL) {
-            e->err = 1;
-        }
-        return;
-    }
-    ef_put(e, base | ((rm & 31u) << 16) | ((ra & 31u) << 10) |
-               ((rn & 31u) << 5) | (rd & 31u),
-           rd, rn, rm, EI_XZR, EI_XZR);
-}
+ * MIPS64r2 COP1X (op 0x13) MADD/MSUB/NMADD/NMSUB (.S/.D) decline to
+ * the interpreter (nonzero return, like the indexed COP1X memory words
+ * and unknown functs): the interp oracle rounds the product first,
+ * then the sum, both in guest RM (R7-8), which native fused FMA cannot
+ * reproduce for inexact products. Emitting FMA here broke dual-engine
+ * parity (Issue 1: --difftest divergences on fpr), so the dispatcher
+ * replays these words via interp_step instead.
+ * Field layout (decode.c): fr = rs, ft = rt, fs = rd, fd = sa. */
 
 /* Entry point for op 0x13 (called from the COP1X case in
- * src/dbt/emit_int.c): 0 emitted, nonzero for the dispatcher to fall
- * back (indexed words, unknown functs). Guarded FMA words emit in
- * slots with branch-pc guard exits (see above). */
+ * src/dbt/emit_int.c): always nonzero so the dispatcher falls back to
+ * the interpreter (arithmetic and indexed words alike). */
 int ef_emit_cop1x(a64_emit_t *e, const mips_dec_t *d, uint64_t pc, int slot)
 {
-    unsigned fr = d->rs & 31u;
-    unsigned ft = d->rt & 31u;
-    unsigned fs = d->rd & 31u;
-    unsigned fd = d->sa & 31u;
-    uint32_t base = 0u;
-    int is_d = 0;
-
-    if (e == NULL || d == NULL || e->err != 0) {
-        return 1;
-    }
-    if (d->op != 0x13u) {
-        return 1;
-    }
-    /* Guarded COP1X words may emit in a delay slot: the mode and NaN
-     * guards below exit at the branch (pc - 4u) with zero
-     * architectural state modified. */
-    uint64_t gpc = slot != 0 ? (pc - 4u) : pc;
-
-    switch (d->funct) {
-    case 0x20u: /* MADD.S */
-        base = EF_FMADD_S;
-        break;
-    case 0x28u: /* MSUB.S */
-        base = EF_FNMSUB_S;
-        break;
-    case 0x30u: /* NMADD.S */
-        base = EF_FNMADD_S;
-        break;
-    case 0x38u: /* NMSUB.S */
-        base = EF_FMSUB_S;
-        break;
-    case 0x21u: /* MADD.D */
-        base = EF_FMADD_D;
-        is_d = 1;
-        break;
-    case 0x29u: /* MSUB.D */
-        base = EF_FNMSUB_D;
-        is_d = 1;
-        break;
-    case 0x31u: /* NMADD.D */
-        base = EF_FNMADD_D;
-        is_d = 1;
-        break;
-    case 0x39u: /* NMSUB.D */
-        base = EF_FMSUB_D;
-        is_d = 1;
-        break;
-    default: /* Indexed memory words and PREFX fault in interp. */
-        return 1;
-    }
-    ef_fill(e, is_d, is_d != 0 ? EF_D0 : EF_S0, fr);
-    ef_fill(e, is_d, is_d != 0 ? EF_D1 : EF_S1, fs);
-    ef_fill(e, is_d, is_d != 0 ? EF_D2 : EF_S2, ft);
-    ef_mode_guard(e, gpc);
-    /* rd = fd, rn = fs, rm = ft, ra = fr. */
-    if (is_d != 0) {
-        ef_fma(e, base, EF_D3, EF_D1, EF_D2, EF_D0);
-        ef_nan_guard(e, EF_D3, 1, gpc);
-        ef_spill(e, 1, EF_D3, fd);
-    } else {
-        ef_fma(e, base, EF_S3, EF_S1, EF_S2, EF_S0);
-        ef_nan_guard(e, EF_S3, 0, gpc);
-        ef_spill(e, 0, EF_S3, fd);
-    }
-    return 0;
+    (void)e;
+    (void)d;
+    (void)pc;
+    (void)slot;
+    return 1;
 }

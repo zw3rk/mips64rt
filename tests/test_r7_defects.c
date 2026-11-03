@@ -33,7 +33,7 @@
  *   leaves Cause clear, Flags.Z sticky).
  * - R7-13: a trapped op leaves sticky Flags untouched.
  * - R7-14: DIV.S 1/+inf is exact +0; inf/0 has no DivideByZero.
- * - R7-15: FS flushes tiny results to signed zero without U.
+ * - R7-15: FS flushes tiny results to signed zero with U and I.
  * - R7-16: PS cancellation under round-down yields -0 per lane.
  * - R7-17: FCCR/FEXR/FENR alias packing, masks, and trap checks.
  * - R7-18: MOVF/MOVT/MOVZ/MOVN move lanes with no FCSR effects.
@@ -229,6 +229,8 @@ static void t_bc_decode(void)
 
     R7_CHECK("bc-const-fl", MIPS64_COP1_BC1FL == 0x02u);
     R7_CHECK("bc-const-t", MIPS64_COP1_BC1T == 0x01u);
+    R7_CHECK("bc-shared-t", MIPS64_BC_T == MIPS64_COP1_BC1T);
+    R7_CHECK("bc-shared-fl", MIPS64_BC_FL == MIPS64_COP1_BC1FL);
     /* BC1T $fcc1: op 0x11, rs 8, rt (1<<2)|1 = 5. */
     mips_decode((uint32_t)((0x11u << 26) | (8u << 21) | (5u << 16)), &d);
     R7_CHECK("bc-fcc1-branch", mips_is_branch(&d) != 0);
@@ -242,9 +244,12 @@ static void t_bc_decode(void)
     mips_decode((uint32_t)((0x11u << 26) | (8u << 21)), &d);
     R7_CHECK("bc-fcc0-branch", mips_is_branch(&d) != 0);
     R7_CHECK("bc-fcc0-not-likely", mips_is_branch_likely(&d) == 0);
-    mips_decode((uint32_t)((0x10u << 26) | (8u << 21) | (2u << 16)), &d);
+    mips_decode((uint32_t)((0x10u << 26) | (8u << 21) | (1u << 16)), &d);
     R7_CHECK("bc0t-branch", mips_is_branch(&d) != 0);
     R7_CHECK("bc0t-not-likely", mips_is_branch_likely(&d) == 0);
+    mips_decode((uint32_t)((0x10u << 26) | (8u << 21) | (2u << 16)), &d);
+    R7_CHECK("bc0fl-branch", mips_is_branch(&d) != 0);
+    R7_CHECK("bc0fl-likely", mips_is_branch_likely(&d) != 0);
 }
 
 /* R7-10: BREAK code extraction (GNU history in bits 25:16). */
@@ -603,6 +608,17 @@ static void t_loader(void)
     rc = mips_load_elf(&ctx, path, path, argv, envp);
     R7_CHECK("elf-legacy-ok", rc == 0);
     R7_CHECK64("elf-legacy-isa", (uint64_t)ctx.isa_rev, 1u);
+    if (r7_write_elf(path, 0x30000007u) != 0) { /* MIPS III, pre-R2 */
+        R7_CHECK("elf-write-pre-r2", 0);
+        return;
+    }
+    (void)memset(&ctx, 0, sizeof ctx);
+    if (guest_mem_init(&ctx) != 0) {
+        R7_CHECK("elf-pre-r2-mem", 0);
+        return;
+    }
+    rc = mips_load_elf(&ctx, path, path, argv, envp);
+    R7_CHECK("elf-pre-r2-ok", rc == 0);
     if (r7_write_elf(path, 0x80000807u) != 0) { /* R2 + NAN2008 */
         R7_CHECK("elf-write-nan", 0);
         return;

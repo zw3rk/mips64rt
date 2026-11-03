@@ -13,7 +13,7 @@
  * - R7-12: FCSR Cause is replaced per op, Flags stay cumulative.
  * - R7-13: a trapped op leaves sticky Flags untouched.
  * - R7-14: DIV.S/DIV.D resolve infinities before residual rounding.
- * - R7-15: FS flushes tiny results to signed zero without U.
+ * - R7-15: FS flushes tiny results to signed zero with U and I.
  * - R7-16: PS cancellation under round-down yields -0 per lane.
  * - R7-17: FCCR/FEXR/FENR alias packing, masks, trap checks.
  * - R7-18: MOVF/MOVT/MOVZ/MOVN move lanes with no FCSR effects.
@@ -156,6 +156,16 @@ static void t_fcsr_cause(void)
     R7_CHECK64("cause-add-clear", (uint64_t)(ctx.fcsr & 0x3F000u), 0u);
     R7_CHECK64("cause-flag-sticky", (uint64_t)(ctx.fcsr & 0x7Cu),
         UINT64_C(0x20)); /* Flag.Z */
+    /* Issue 4: DMFC1/DMTC1 moves leave FCSR Cause untouched. */
+    ctx.fcsr |= UINT64_C(0x10000); /* Cause.V */
+    r7_arith_d(&d, 0x01u, 0x00u, 0u, 4u, 6u); /* DMFC1 $f4 -> $6 */
+    R7_CHECK("cause-dmfc1-rc", fp_cop1(&ctx, 0u, &d) == 0);
+    R7_CHECK64("cause-dmfc1-keep", (uint64_t)(ctx.fcsr & 0x3F000u),
+        UINT64_C(0x10000));
+    r7_arith_d(&d, 0x05u, 0x00u, 0u, 4u, 6u); /* DMTC1 $6 -> $f4 */
+    R7_CHECK("cause-dmtc1-rc", fp_cop1(&ctx, 0u, &d) == 0);
+    R7_CHECK64("cause-dmtc1-keep", (uint64_t)(ctx.fcsr & 0x3F000u),
+        UINT64_C(0x10000));
 }
 
 /* R7-13: a trapped op leaves sticky Flags untouched. */
@@ -323,7 +333,7 @@ static void t_madd(void)
     R7_CHECK64("madd-d-zero", ctx.fpr[2], 0u);
 }
 
-/* R7-15: FS flushes tiny results to signed zero without U. */
+/* R7-15: FS flushes tiny results to signed zero with U and I. */
 static void t_fs_flush(void)
 {
     mips64_ctx_t ctx;
@@ -336,8 +346,18 @@ static void t_fs_flush(void)
     r7_arith_d(&d, 0x10u, 0x02u, 2u, 4u, 6u); /* MUL.S */
     R7_CHECK("fs-mul-rc", fp_cop1(&ctx, 0u, &d) == 0);
     R7_CHECK64("fs-mul-zero", (uint64_t)(uint32_t)ctx.fpr[2], 0u);
-    R7_CHECK("fs-mul-no-u", (ctx.fcsr & (1u << 3)) == 0u);
+    R7_CHECK("fs-mul-u", (ctx.fcsr & (1u << 3)) != 0u);
     R7_CHECK("fs-mul-i", (ctx.fcsr & (1u << 2)) != 0u);
+    /* Double path (fp_round_d): subnormal MUL.D flushes with U and I. */
+    r7_fp_init(&ctx);
+    ctx.fcsr = 1u << 24; /* FS */
+    ctx.fpr[4] = UINT64_C(0x0008000000000000); /* 2^-1023, subnormal */
+    ctx.fpr[6] = UINT64_C(0x3FF0000000000000); /* 1.0 */
+    r7_arith_d(&d, 0x11u, 0x02u, 2u, 4u, 6u); /* MUL.D */
+    R7_CHECK("fs-muld-rc", fp_cop1(&ctx, 0u, &d) == 0);
+    R7_CHECK64("fs-muld-zero", ctx.fpr[2], 0u);
+    R7_CHECK("fs-muld-u", (ctx.fcsr & (1u << 3)) != 0u);
+    R7_CHECK("fs-muld-i", (ctx.fcsr & (1u << 2)) != 0u);
     /* Paired-single lanes flush independently. */
     r7_fp_init(&ctx);
     ctx.fcsr = 1u << 24;

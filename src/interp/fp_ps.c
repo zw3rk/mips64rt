@@ -5,9 +5,11 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * PS (fmt 0x16) scalar-lane ADD/SUB/MUL/ABS/NEG/MOV and COP1X MADD/MSUB/
- * NMADD/NMSUB (.S/.D). Per-lane IEEE semantics with MIPS R2 FCSR
- * accounting shared with fp.c (V on invalid lanes, I on inexact,
- * O (+I) on overflow to infinity; U never set). DIV.PS/SQRT.PS/CVT.PS/
+ * NMADD/NMSUB (.S/.D, product rounded first, then the sum, both in
+ * guest RM; NMSUB negates after rounding). Per-lane IEEE semantics
+ * with MIPS R2 FCSR accounting shared with fp.c (V on invalid lanes,
+ * I on inexact, U (+I) on FS-flushed tiny results, O (+I) on overflow
+ * to infinity). DIV.PS/SQRT.PS/CVT.PS/
  * C.cond.PS and the indexed COP1X memory ops fault (untested by the
  * RC3 suite; DBT falls back to interp_step for every word here).
  */
@@ -116,14 +118,14 @@ static uint32_t fp_ps_lane(mips64_ctx_t *ctx, unsigned op, uint32_t au,
         if (fp_issn_s(ctx, au) != 0 || fp_issn_s(ctx, bu) != 0) {
             *exc |= 1u << (unsigned)FP_EXC_V;
         }
-        return FP_DEFNAN_S;
+        return (ctx->nan2008 != 0u) ? FP_DEFNAN_S_2008 : FP_DEFNAN_S;
     }
     switch (op) {
     case 0x00u: /* ADD.PS */
         if (isinf(a) && isinf(b) &&
             ((signbit(a) != 0) != (signbit(b) != 0))) {
             *exc |= 1u << (unsigned)FP_EXC_V;
-            return FP_DEFNAN_S;
+            return (ctx->nan2008 != 0u) ? FP_DEFNAN_S_2008 : FP_DEFNAN_S;
         }
         r = a + b;
         q = (long double)((double)a + (double)b);
@@ -132,7 +134,7 @@ static uint32_t fp_ps_lane(mips64_ctx_t *ctx, unsigned op, uint32_t au,
         if (isinf(a) && isinf(b) &&
             ((signbit(a) != 0) == (signbit(b) != 0))) {
             *exc |= 1u << (unsigned)FP_EXC_V;
-            return FP_DEFNAN_S;
+            return (ctx->nan2008 != 0u) ? FP_DEFNAN_S_2008 : FP_DEFNAN_S;
         }
         r = a - b;
         q = (long double)((double)a - (double)b);
@@ -140,7 +142,7 @@ static uint32_t fp_ps_lane(mips64_ctx_t *ctx, unsigned op, uint32_t au,
     default: /* MUL.PS */
         if ((a == 0.0f && isinf(b)) || (isinf(a) && b == 0.0f)) {
             *exc |= 1u << (unsigned)FP_EXC_V;
-            return FP_DEFNAN_S;
+            return (ctx->nan2008 != 0u) ? FP_DEFNAN_S_2008 : FP_DEFNAN_S;
         }
         r = a * b;
         q = (long double)a * (long double)b;
@@ -229,8 +231,9 @@ int fp_ps_cop1(mips64_ctx_t *ctx, uint64_t cur_pc, const mips_dec_t *d)
     return 0;
 }
 
-/* COP1X fused multiply-add (op 0x13): fd = +/-(fr +/- fs * ft) with a
- * single rounding. NaN inputs raise V and yield the default NaN. */
+/* COP1X multiply-add (op 0x13): fd = +/-(fr +/- fs * ft) with the
+ * product rounded first, then the sum, both in guest RM (R7-8).
+ * NaN inputs raise V and yield the default NaN. */
 int fp_cop1x(mips64_ctx_t *ctx, uint64_t cur_pc, const mips_dec_t *d)
 {
     unsigned fr = d->rs & 31u;
@@ -318,9 +321,10 @@ int fp_cop1x(mips64_ctx_t *ctx, uint64_t cur_pc, const mips_dec_t *d)
         } else if (d->funct == 0x30u) { /* NMADD.S: -(fr + fs*ft) */
             s1 = a;
             s2 = rp;
-        } else { /* NMSUB.S: fr - fs*ft */
-            s1 = a;
-            s2 = -rp;
+        } else { /* NMSUB.S: -(fs*ft - fr): round p - fr, then negate,
+                  * so directed rounding (RP/RM) matches MIPS64r2. */
+            s1 = rp;
+            s2 = -a;
         }
         hs = s1 + s2;
         if (isnan(hs)) {
@@ -349,7 +353,7 @@ int fp_cop1x(mips64_ctx_t *ctx, uint64_t cur_pc, const mips_dec_t *d)
             }
             rs = fp_adj_f(ctx, hs, qq, rm);
         }
-        if (d->funct == 0x30u) {
+        if (d->funct == 0x30u || d->funct == 0x38u) {
             rs = -rs;
             q = -q;
         }
@@ -407,9 +411,10 @@ int fp_cop1x(mips64_ctx_t *ctx, uint64_t cur_pc, const mips_dec_t *d)
         } else if (d->funct == 0x31u) { /* NMADD.D: -(fr + fs*ft) */
             s1 = a;
             s2 = rp;
-        } else { /* NMSUB.D: fr - fs*ft */
-            s1 = a;
-            s2 = -rp;
+        } else { /* NMSUB.D: -(fs*ft - fr): round p - fr, then negate,
+                  * so directed rounding (RP/RM) matches MIPS64r2. */
+            s1 = rp;
+            s2 = -a;
         }
         if (isinf(s1) && isinf(s2) &&
             ((signbit(s1) != 0) != (signbit(s2) != 0))) {
@@ -419,6 +424,9 @@ int fp_cop1x(mips64_ctx_t *ctx, uint64_t cur_pc, const mips_dec_t *d)
         }
         hs = s1 + s2;
         if (isinf(s1) || isinf(s2)) {
+            if (d->funct == 0x31u || d->funct == 0x39u) {
+                hs = -hs;
+            }
             fp_put_d(ctx, fd, fp_d_bits(hs));
             return fp_finish_trap(ctx, cur_pc, fd, saved_fpr, saved_cc, 0);
         }
@@ -426,7 +434,7 @@ int fp_cop1x(mips64_ctx_t *ctx, uint64_t cur_pc, const mips_dec_t *d)
             int cancel = (signbit(s1) != 0) != (signbit(s2) != 0);
 
             hs = (rm == 3u && cancel) ? -0.0 : hs;
-            if (d->funct == 0x31u) {
+            if (d->funct == 0x31u || d->funct == 0x39u) {
                 hs = -hs;
             }
             fp_put_d(ctx, fd, fp_d_bits(hs));
@@ -434,7 +442,7 @@ int fp_cop1x(mips64_ctx_t *ctx, uint64_t cur_pc, const mips_dec_t *d)
         }
         if (!isfinite(hs)) {
             hs = fp_round_d(ctx, hs, (hs > 0.0) ? -1 : 1, rm);
-            if (d->funct == 0x31u) {
+            if (d->funct == 0x31u || d->funct == 0x39u) {
                 hs = -hs;
             }
             fp_put_d(ctx, fd, fp_d_bits(hs));
@@ -446,7 +454,7 @@ int fp_cop1x(mips64_ctx_t *ctx, uint64_t cur_pc, const mips_dec_t *d)
             double err = (s1 - a1) + (s2 - b1);
 
             hs = fp_round_d(ctx, hs, fp_cmp_sign(err), rm);
-            if (d->funct == 0x31u) {
+            if (d->funct == 0x31u || d->funct == 0x39u) {
                 hs = -hs;
             }
             fp_put_d(ctx, fd, fp_d_bits(hs));

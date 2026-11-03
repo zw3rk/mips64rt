@@ -11,8 +11,8 @@
  * fallback exit: the dispatcher single-steps the declining word in
  * `interp_step` and resumes, bit-identical to `interp` by
  * construction. Wave P compiles the L3b FP subset too (COP1
- * arithmetic/CVT/compare, COP1X FMA, LWC1/SWC1/LDC1/SDC1); indexed
- * COP1X words and COP2 still decline to `interp_step`.
+ * arithmetic/CVT/compare, LWC1/SWC1/LDC1/SDC1); COP1X words
+ * (arithmetic and indexed) and COP2 still decline to `interp_step`.
  *
  * Host register discipline (see `src/dbt/dbt.h`; U0 lane rebinds
  * `x20`): `x19` pins the `mips64_ctx_t *`, `x20` pins the U0

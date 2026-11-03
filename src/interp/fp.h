@@ -39,6 +39,7 @@ int fp_cop1x(mips64_ctx_t *ctx, uint64_t cur_pc, const mips_dec_t *d);
 
 /* Legacy default quiet NaNs (E04-observed 0.0/0.0 results). */
 #define FP_DEFNAN_S 0x7FBFFFFFu
+#define FP_DEFNAN_S_2008 0x7FC00000u
 #define FP_DEFNAN_D UINT64_C(0x7FF7FFFFFFFFFFFF)
 
 /* FCSR flush-to-zero control bit (R7-15). */
