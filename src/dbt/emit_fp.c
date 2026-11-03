@@ -126,14 +126,6 @@ static void ef_fcmp(a64_emit_t *e, int is_d, unsigned rn, unsigned rm)
            EI_XZR, EI_XZR);
 }
 
-/* FMOV Sd/Dd, #0.5 (ties-away ROUND sequence constant). */
-static void ef_fhalf(a64_emit_t *e, int is_d, unsigned rd)
-{
-    uint32_t base = is_d != 0 ? 0x1E6C1000u : 0x1E2C1000u;
-
-    ef_put(e, base | (rd & 31u), rd, 0u, 0u, EI_XZR, EI_XZR);
-}
-
 /* SIMD&FP LDR/STR lives in src/dbt/emit_fpmem.c (Wave P13 cache). */
 
 /* FCVTZS Wd/Xd, Sn/Dn (toward zero; saturates, NaN -> 0). */
@@ -193,26 +185,11 @@ static void ef_fmov_bit(a64_emit_t *e, int is_d, int to_gpr, unsigned rd,
  * because the inline sequence never raises a guest trap. */
 #define EF_FCSR_FAST_MASK 0x01000F83u
 
-/* Mode guard: FCSR RM != RN (bits 1:0), any exception enable (bits
- * 11:7), or flush-subnormals (FS) set. Covers every value-affecting
- * mode bit for arithmetic and RM-sensitive CVT. Uses EI_A/EI_C, dead
- * across words. */
+/* FCSR fast-path guard (R5: single helper for mode + fixed-mode
+ * CVT): RM != RN (bits 1:0), any enable (bits 11:7), or FS set.
+ * Fixed FRINT modes are RM-independent but a subnormal still
+ * depends on guest FS and any enabled trap must reach interp. */
 static void ef_mode_guard(a64_emit_t *e, uint64_t pc)
-{
-    size_t skip;
-
-    ei_ldr(e, 1, EI_A, EI_CTX, MIPS64_CTX_FCSR_OFFSET);
-    ei_mov32(e, EI_C, EF_FCSR_FAST_MASK);
-    ei_and(e, 1, EI_A, EI_A, EI_C);
-    skip = ei_cbz(e, 1, 0, EI_A);
-    ei_exit_undef(e, pc);
-    ei_patch(e, skip, 0);
-}
-
-/* Guard for fixed-rounding conversions (FRINT modes are
- * RM-independent, but a subnormal input still depends on guest FS
- * and any enabled exception still expects a guest trap). */
-static void ef_fs_guard(a64_emit_t *e, uint64_t pc)
 {
     size_t skip;
 
@@ -369,7 +346,7 @@ static int ef_cvt_ff(a64_emit_t *e, const mips_dec_t *d, uint64_t pc, int slot,
 #define EF_FABS_D 0x1E60C000u
 
 /* Rounding selector: 0 RM-nearest, 1 toward-zero, 2 +inf, 3 -inf,
- * 4 ties-away-from-zero (MIPS ROUND). */
+ * 4 FRINTN ties-to-even (MIPS ROUND/RINT). */
 static void ef_round_op(a64_emit_t *e, int is_d, unsigned mode, uint64_t pc)
 {
     unsigned s0 = is_d != 0 ? EF_D0 : EF_S0;
@@ -377,7 +354,6 @@ static void ef_round_op(a64_emit_t *e, int is_d, unsigned mode, uint64_t pc)
     uint32_t base = 0u;
 
     (void)pc;
-    (void)ef_fhalf;
     switch (mode) {
     case 0:
     case 4:
@@ -408,11 +384,7 @@ static int ef_cvt_to_int(a64_emit_t *e, const mips_dec_t *d, uint64_t pc,
     uint64_t gpc = slot != 0 ? (pc - 4u) : pc;
 
     ef_fill(e, is_d, s0, fs);
-    if (mode == 0u) {
-        ef_mode_guard(e, gpc);
-    } else {
-        ef_fs_guard(e, gpc);
-    }
+    ef_mode_guard(e, gpc);
     ef_round_op(e, is_d, (int)mode, pc);
     ef_fcvtsz(e, is_l, is_d, EI_B, s2);
     ef_roundtrip_guard(e, is_d, is_l, mode == 0u ? s0 : s2, gpc);

@@ -125,6 +125,14 @@ run_engine b "$ENGB"
 rca=$(cat "$TDIR/a.rc")
 rcb=$(cat "$TDIR/b.rc")
 echo "exits: $ENGA=$rca $ENGB=$rcb"
+if [ "$rca" -ge 124 ] || [ "$rcb" -ge 124 ]; then
+	echo "DIFFTEST: infrastructure/timeout failure ($ENGA=$rca $ENGB=$rcb)" >&2
+	echo "--- $ENGA stderr tail ---"
+	tail -5 "$TDIR/a.err"
+	echo "--- $ENGB stderr tail ---"
+	tail -5 "$TDIR/b.err"
+	exit 1
+fi
 if [ "$rca" != "$rcb" ]; then
 	echo "DIFFTEST: 1 divergences"
 	echo "first divergence: exit $ENGA=$rca $ENGB=$rcb"
@@ -134,17 +142,25 @@ if [ "$rca" != "$rcb" ]; then
 	tail -5 "$TDIR/b.err"
 	exit 1
 fi
-# Fork children interleave nondeterministically (parent/child race, and
-# PIDs vary run to run but never appear in these streams), so the
-# comparison is order-insensitive: identical multisets of executed
-# instructions and exit-state dumps. Exit codes stay strictly compared
-# above; a missing or extra process still diverges the multiset.
-grep '^I ' "$TDIR/a.err" | sort >"$TDIR/a.trace" || true
-grep '^I ' "$TDIR/b.err" | sort >"$TDIR/b.trace" || true
+# R5: instruction order is significant; keep per-process trace order
+# (no global sort). REGS dumps stay sorted (per-process exit states).
+grep '^I ' "$TDIR/a.err" >"$TDIR/a.trace" || true
+grep '^I ' "$TDIR/b.err" >"$TDIR/b.trace" || true
 grep '^REGS ' "$TDIR/a.err" | sort >"$TDIR/a.regs" || true
 grep '^REGS ' "$TDIR/b.err" | sort >"$TDIR/b.regs" || true
 echo "trace lines: $ENGA=$(wc -l <"$TDIR/a.trace") $ENGB=$(wc -l <"$TDIR/b.trace")"
 echo "regs lines: $ENGA=$(wc -l <"$TDIR/a.regs") $ENGB=$(wc -l <"$TDIR/b.regs")"
+if [ ! -s "$TDIR/a.trace" ] || [ ! -s "$TDIR/b.trace" ] || \
+   [ ! -s "$TDIR/a.regs" ] || [ ! -s "$TDIR/b.regs" ]; then
+	echo "DIFFTEST: 1 divergences"
+	echo "first divergence: missing trace/regs records"
+	exit 1
+fi
+if ! cmp -s "$TDIR/a.out" "$TDIR/b.out"; then
+	echo "DIFFTEST: 1 divergences"
+	echo "first divergence: stdout differs"
+	exit 1
+fi
 t_res=$(compare_stream "$TDIR/a.trace" "$TDIR/b.trace")
 g_res=$(compare_stream "$TDIR/a.regs" "$TDIR/b.regs")
 t_cnt=$(echo "$t_res" | sed -n '1p')

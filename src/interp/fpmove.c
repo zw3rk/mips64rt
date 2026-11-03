@@ -180,11 +180,12 @@ int fpmove_cop1(mips64_ctx_t *ctx, const mips_dec_t *d)
         return 0;
     case 0x02u: /* CFC1: $31 = FCSR, $0 = FIR (read-only ID). */
         if (fs == 31u) {
-            interp_set_reg(ctx, rt, (uint64_t)ctx->fcsr);
+            interp_set_reg(ctx, rt, interp_sext32(ctx->fcsr));
             return 0;
         }
         if (fs == 0u) {
-            interp_set_reg(ctx, rt, (uint64_t)MIPS64RT_FIR_MIPS64R2);
+            interp_set_reg(ctx, rt,
+                interp_sext32(MIPS64RT_FIR_MIPS64R2));
             return 0;
         }
         return MIPS_FAULT;

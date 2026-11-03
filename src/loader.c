@@ -242,12 +242,10 @@ static size_t str_len(const char *s)
     return n;
 }
 
-/* AT_RANDOM seed: mixed host realtime clock and pid. The
- * MIPS64RT_RANDSEED knob overrides the seed for deterministic runs
- * (difftest); production keeps host entropy. */
+/* AT_RANDOM: host CSPRNG (/dev/urandom, EINTR retry); RANDSEED
+ * overrides for deterministic difftest runs. */
 static void rand16(uint8_t out[16])
 {
-    struct timespec ts;
     const char *env = getenv("MIPS64RT_RANDSEED");
     uint64_t s = 0U;
     unsigned i;
@@ -255,17 +253,36 @@ static void rand16(uint8_t out[16])
     if (env != NULL && env[0] != '\0') {
         s = (uint64_t)strtoull(env, NULL, 0);
     } else {
-        clock_gettime(CLOCK_REALTIME, &ts);
-        s = (uint64_t)ts.tv_nsec ^ ((uint64_t)getpid() << 32) ^
-            (uint64_t)ts.tv_sec;
+        int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+        if (fd >= 0) {
+            size_t done = 0U;
+            while (done < 16U) {
+                ssize_t got = read(fd, out + done, 16U - done);
+                if (got < 0) {
+                    if (errno == EINTR) {
+                        continue;
+                    }
+                    break;
+                }
+                if (got == 0) {
+                    break;
+                }
+                done += (size_t)got;
+            }
+            (void)close(fd);
+            if (done == 16U) {
+                return;
+            }
+        }
+        { struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+          s = (uint64_t)ts.tv_nsec ^ ((uint64_t)getpid() << 32) ^
+              (uint64_t)ts.tv_sec; }
     }
     if (s == 0U) {
         s = UINT64_C(0x9E3779B97F4A7C15);
     }
     for (i = 0; i < 16U; i++) {
-        s ^= s << 13;
-        s ^= s >> 7;
-        s ^= s << 17;
+        s ^= s << 13; s ^= s >> 7; s ^= s << 17;
         out[i] = (uint8_t)s;
     }
 }

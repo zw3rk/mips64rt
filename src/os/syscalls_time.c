@@ -100,8 +100,8 @@ int64_t mips_sc_clock_gettime(mips64_ctx_t *ctx, uint64_t clk,
     return l2a_ret(ctx, 0);
 }
 
-int64_t mips_sc_nanosleep(mips64_ctx_t *ctx, uint64_t clk, uint64_t req_va,
-                          uint64_t rem_va, int is64, int use_clock)
+int64_t mips_sc_nanosleep(mips64_ctx_t *ctx, uint64_t req_va,
+                          uint64_t rem_va, int is64)
 {
     struct timespec rq;
     struct timespec rm;
@@ -122,20 +122,10 @@ int64_t mips_sc_nanosleep(mips64_ctx_t *ctx, uint64_t clk, uint64_t req_va,
     if (rq.tv_nsec < 0 || rq.tv_nsec >= L2A_NSEC_PER_SEC) {
         return l2a_ret(ctx, -(int64_t)EINVAL);
     }
-    /* Relative sleep only; TIMER_ABSTIME waits for Phase 4.
+    /* Relative sleep only (clock_nanosleep lives in syscalls_extra.c).
      * Park with 0 leases across the blocking sleep. */
     mips_qs_lease_exit(ctx);
-#if defined(__linux__)
-    rc = use_clock ? (int64_t)clock_nanosleep((clockid_t)(int)clk, 0, &rq,
-                                              remp) :
-                     (int64_t)nanosleep(&rq, remp);
-#else
-    /* No clock_nanosleep(2) on this host: every relative sleep
-     * lowers to nanosleep(2). */
-    (void)use_clock;
-    (void)clk;
     rc = (int64_t)nanosleep(&rq, remp);
-#endif
     mips_qs_lease_enter(ctx);
     if (rc != 0) {
         rc = -(int64_t)errno;

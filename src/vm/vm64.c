@@ -19,6 +19,7 @@
 #include "vm/vm_file.h"
 #include "core/cpu.h"
 
+#include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -61,8 +62,8 @@ static uint64_t u0_up(uint64_t x, uint64_t ps)
     return (x + (ps - 1u)) & ~(ps - 1u);
 }
 
-/* Sorted-insert one region; coalesce with a same-prot/same-tag
- * neighbor. MIPS_FAULT when full. */
+/* Sorted-insert one region; coalesce with same-prot/tag
+ * neighbors (R5: left+right absorb). MIPS_FAULT when full. */
 static int u0_record(mips_vm64_t *vm, uint64_t start, uint64_t end,
                      uint32_t prot, uint32_t tag)
 {
@@ -74,8 +75,16 @@ static int u0_record(mips_vm64_t *vm, uint64_t start, uint64_t end,
     if (i > 0 && vm->regions[i - 1].end == start &&
         vm->regions[i - 1].prot == prot && vm->regions[i - 1].tag == tag) {
         vm->regions[i - 1].end = end;
-        start = vm->regions[i - 1].start;
-        i--;
+        if (i < vm->region_count && vm->regions[i].start == end &&
+            vm->regions[i].prot == prot && vm->regions[i].tag == tag) {
+            if (vm->regions[i].end > end) {
+                vm->regions[i - 1].end = vm->regions[i].end;
+            }
+            memmove(&vm->regions[i], &vm->regions[i + 1],
+                    (vm->region_count - i - 1) * sizeof vm->regions[0]);
+            vm->region_count--;
+        }
+        return 0;
     }
     if (i < vm->region_count && vm->regions[i].start == end &&
         vm->regions[i].prot == prot && vm->regions[i].tag == tag) {
@@ -138,6 +147,41 @@ static void u0_forget(mips_vm64_t *vm, uint64_t start, uint64_t end)
     }
 }
 
+/* R5-8: capacity preflight before host mutation so tables never
+ * diverge on exhaustion. Map needs no slot when either neighbor
+ * coalesces; unmap needs one for a straddler split; protect may
+ * need two (split + record). */
+static int u0_can_map(mips_vm64_t *vm, uint64_t start, uint64_t end,
+                      uint32_t prot, uint32_t tag)
+{
+    size_t i = 0;
+    if (vm->region_count < MIPS64_VM64_MAX_REGIONS) {
+        return 1;
+    }
+    while (i < vm->region_count && vm->regions[i].start < start) {
+        i++;
+    }
+    if (i > 0 && vm->regions[i - 1].end == start &&
+        vm->regions[i - 1].prot == prot && vm->regions[i - 1].tag == tag) {
+        return 1;
+    }
+    if (i < vm->region_count && vm->regions[i].start == end &&
+        vm->regions[i].prot == prot && vm->regions[i].tag == tag) {
+        return 1;
+    }
+    return 0;
+}
+static int u0_unmap_splits(mips_vm64_t *vm, uint64_t start, uint64_t end)
+{
+    size_t i;
+    for (i = 0; i < vm->region_count; i++) {
+        if (vm->regions[i].start < start && vm->regions[i].end > end) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static int u0_a_reserve(mips_vm64_t *vm, uint64_t size)
 {
     uint64_t ps = (uint64_t)u0_page_size();
@@ -170,6 +214,9 @@ static int u0_a_map(mips_vm64_t *vm, uint64_t va, uint64_t len,
         va + len < va || end > vm->size || (prot & 4u) != 0u) {
         return MIPS_FAULT;
     }
+    if (!u0_can_map(vm, start, end, prot, tag)) {
+        return MIPS_FAULT;
+    }
     at = mmap((void *)(uintptr_t)(vm->base + start), (size_t)(end - start),
               u0_host_prot(prot), MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
               -1, 0);
@@ -191,6 +238,9 @@ static int u0_a_protect(mips_vm64_t *vm, uint64_t va, uint64_t len,
         return MIPS_FAULT;
     }
     if (mips_vm64_query(vm, start, NULL) != 0) {
+        return MIPS_FAULT;
+    }
+    if (vm->region_count + 2U > MIPS64_VM64_MAX_REGIONS) {
         return MIPS_FAULT;
     }
     if (mprotect((void *)(uintptr_t)(vm->base + start),
@@ -229,6 +279,10 @@ static int u0_a_unmap(mips_vm64_t *vm, uint64_t va, uint64_t len)
 
     if (vm == NULL || vm->base == 0U || len == 0U || end < start ||
         va + len < va || end > vm->size) {
+        return MIPS_FAULT;
+    }
+    if (u0_unmap_splits(vm, start, end) &&
+        vm->region_count >= MIPS64_VM64_MAX_REGIONS) {
         return MIPS_FAULT;
     }
     at = mmap((void *)(uintptr_t)(vm->base + start), (size_t)(end - start),
@@ -279,10 +333,15 @@ static int u0_f_protect(mips_vm64_t *vm, uint64_t va, uint64_t len,
 
     if (vm == NULL || vm->base == 0U || len == 0U || end < start ||
         va + len < va || end > vm->size || (prot & 4u) != 0u ||
-        mips_vm64_query(vm, start, NULL) != 0 ||
-        mprotect((void *)(uintptr_t)(vm->base + start),
-                 (size_t)(end - start), u0_host_prot(prot)) != 0)
+        mips_vm64_query(vm, start, NULL) != 0)
         return MIPS_FAULT;
+    if (vm->region_count + 2U > MIPS64_VM64_MAX_REGIONS) {
+        return MIPS_FAULT;
+    }
+    if (mprotect((void *)(uintptr_t)(vm->base + start),
+                 (size_t)(end - start), u0_host_prot(prot)) != 0) {
+        return MIPS_FAULT;
+    }
     u0_forget(vm, start, end);
     return u0_record(vm, start, end, prot, MIPS_VM_TAG_FILE);
 }
@@ -308,6 +367,9 @@ int mips_vmfile_map(mips_vm64_t *vm, int fd, uint64_t off, uint64_t va,
         (off & (ps - 1u)) != 0U || va + len < va || va + len > vm->size ||
         (prot & 4u) != 0u)
         return MIPS_FAULT;
+    if (!u0_can_map(vm, va, va + len, prot, MIPS_VM_TAG_FILE)) {
+        return MIPS_FAULT;
+    }
     at = mmap((void *)(uintptr_t)(vm->base + va), (size_t)len,
               u0_host_prot(prot), MAP_SHARED | MAP_FIXED, fd, (off_t)off);
     if (at == MAP_FAILED)
@@ -420,11 +482,10 @@ int mips_vm_inode_refresh_span(mips64_ctx_t *ctx, int fd, uint64_t page_va,
                                uint64_t glo, uint64_t ghi, uint64_t fpos)
 {
     uint8_t *p;
-    uint64_t from, to;
+    uint64_t from, to, want, have = 0U;
     void *host;
     size_t hlen;
     int restore;
-    ssize_t got;
 
     if (ctx == NULL || fd < 0 || glo >= ghi)
         return -1;
@@ -439,12 +500,24 @@ int mips_vm_inode_refresh_span(mips64_ctx_t *ctx, int fd, uint64_t page_va,
         return -1;
     if (u0_cover_rw(ctx, page_va, &host, &hlen, &restore) != 0)
         return -1;
-    got = pread(fd, p + from, (size_t)(to - from), (off_t)fpos);
-    if (got < 0)
-        got = 0;
-    if ((uint64_t)got < to - from) {
-        (void)memset(p + from + (uint64_t)got, 0,
-                     (size_t)(to - from - (uint64_t)got));
+    want = to - from;
+    while (have < want) {
+        ssize_t got;
+        do {
+            got = pread(fd, p + from + have, (size_t)(want - have),
+                        (off_t)(fpos + have));
+        } while (got < 0 && errno == EINTR);
+        if (got < 0) {
+            (void)mprotect(host, hlen, restore);
+            return -1;
+        }
+        if (got == 0) {
+            break;
+        }
+        have += (uint64_t)got;
+    }
+    if (have < want) {
+        (void)memset(p + from + have, 0, (size_t)(want - have));
     }
     if (mprotect(host, hlen, restore) != 0)
         return -1;

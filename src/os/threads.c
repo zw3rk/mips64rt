@@ -49,6 +49,7 @@
 #include <string.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
 #if defined(__linux__)
 #include <ucontext.h>
@@ -461,12 +462,28 @@ int64_t mips_clone_full(mips64_ctx_t *ctx, uint64_t flags,
     return l4b_clone_fork(ctx, flags, parent_tid_va, child_tid_va);
 }
 
+/* Live thread-group workers (R5: leader raw exit waits). */
+int mips_thread_group_live(void)
+{
+    size_t i;
+    int n = 0;
+
+    (void)pthread_mutex_lock(&l4b_mu);
+    for (i = 0U; i < L4B_THREAD_MAX; i++) {
+        if (l4b_slots[i].used != 0) {
+            n++;
+        }
+    }
+    (void)pthread_mutex_unlock(&l4b_mu);
+    return n;
+}
+
 /*
  * Terminate the calling thread: clear the LL reservation, store 0 to
  * the CLONE_CHILD_CLEARTID word (endian-correct), issue the joining
  * FUTEX_WAKE on it, drop the table slot, release the heap ctx, and end
- * the host thread (never returns). Non-worker contexts fall back to
- * process exit with the status.
+ * the host thread (never returns). Non-worker raw exit waits for live
+ * siblings; exit_group _Exits directly from the dispatcher.
  */
 void mips_thread_exit(mips64_ctx_t *ctx, int status)
 {
@@ -478,6 +495,10 @@ void mips_thread_exit(mips64_ctx_t *ctx, int status)
     }
     mips64_ctx_clear_ll(ctx);
     if (!ctx->is_thread_clone) {
+        while (mips_thread_group_live() > 0) {
+            struct timespec rq = { 0, 1000000L };
+            (void)nanosleep(&rq, NULL);
+        }
         _Exit(status);
     }
     clear_va = ctx->clear_child_tid;

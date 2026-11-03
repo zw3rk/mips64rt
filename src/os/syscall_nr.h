@@ -322,6 +322,7 @@
 /* N32 time64 variants (64-bit time_t on the 32-bit-pointer ABI). */
 #define MIPS64_NR32_clock_gettime64  6403 /* n32 index 403 */
 #define MIPS64_NR32_clock_settime64  6404 /* n32 index 404 */
+#define MIPS64_NR32_clock_getres_time64 6406 /* n32 index 406 */
 /* L2a: glibc nanosleep() lowers to clock_nanosleep(_time64) (observed
  * via qemu -strace), so the N32 time64 companion is wired too. */
 #define MIPS64_NR32_clock_nanosleep_time64 6407 /* n32 index 407 */

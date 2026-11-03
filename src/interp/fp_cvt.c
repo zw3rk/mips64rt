@@ -115,6 +115,9 @@ int fp_cvt_sd(mips64_ctx_t *ctx, const mips_dec_t *d, unsigned is_s)
             float r = (float)x;
 
             if (isnan(x)) {
+                if (fp_issn_d(ctx->fpr[fs]) != 0) {
+                    fp_raise(ctx, (unsigned)FP_EXC_V);
+                }
                 fp_put_s(ctx, fd, FP_DEFNAN_S);
                 return 0;
             }
@@ -132,6 +135,9 @@ int fp_cvt_sd(mips64_ctx_t *ctx, const mips_dec_t *d, unsigned is_s)
             float x = fp_bits_f((uint32_t)ctx->fpr[fs]);
 
             if (isnan(x)) {
+                if (fp_issn_s((uint32_t)ctx->fpr[fs]) != 0) {
+                    fp_raise(ctx, (unsigned)FP_EXC_V);
+                }
                 fp_put_d(ctx, fd, FP_DEFNAN_D);
                 return 0;
             }

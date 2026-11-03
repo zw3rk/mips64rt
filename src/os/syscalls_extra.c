@@ -109,6 +109,9 @@ int64_t mips_sc_clock_getres(mips64_ctx_t *ctx, uint64_t clk,
     if (clock_getres((clockid_t)(int)clk, &ts) != 0) {
         return l2a_ret(ctx, -(int64_t)errno);
     }
+    if (ts_va == 0U) {
+        return l2a_ret(ctx, 0);
+    }
     be = ctx->is_be != 0U;
     if (is64) {
         putn(img, (uint64_t)(int64_t)ts.tv_sec, 8, be);
@@ -174,7 +177,8 @@ int64_t mips_sc_clock_nanosleep(mips64_ctx_t *ctx, uint64_t clk,
     mips_qs_lease_enter(ctx);
     if (rc != 0) {
         rc = -(int64_t)saved_err;
-        if (remp != NULL && saved_err == EINTR) {
+        if (remp != NULL && saved_err == EINTR &&
+            (flags & (uint64_t)TIMER_ABSTIME) == 0U) {
             uint8_t img[16];
 
             if (is64) {
@@ -193,4 +197,17 @@ int64_t mips_sc_clock_nanosleep(mips64_ctx_t *ctx, uint64_t clk,
         return l2a_ret(ctx, rc);
     }
     return l2a_ret(ctx, 0);
+}
+
+/* R5 canonical names (M64-R5-1/10). */
+int64_t mips_sys_clock_nanosleep4(mips64_ctx_t *ctx, uint64_t clk,
+    uint64_t flags, uint64_t req_va, uint64_t rem_va, int is_time64)
+{
+    return mips_sc_clock_nanosleep(ctx, clk, flags, req_va, rem_va,
+        is_time64);
+}
+int64_t mips_sys_clock_getres(mips64_ctx_t *ctx, uint64_t clk,
+    uint64_t res_va, int is64)
+{
+    return mips_sc_clock_getres(ctx, clk, res_va, is64);
 }

@@ -8,6 +8,8 @@
  * flag, ENOSYS 38->89). Runs under a quiescence memory lease.
  */
 
+#define _POSIX_C_SOURCE 200809L
+
 #include "core/cpu.h"
 #include "os/errno_map.h"
 #include "os/syscall_nr.h"
@@ -21,6 +23,7 @@
 #include <sys/types.h>
 #include <sys/utsname.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 /* Region helpers owned by src/os/mem.c (lane L1c). */
@@ -36,9 +39,14 @@ extern int64_t mips_sc_fcntl(mips64_ctx_t *ctx, uint64_t fd, uint64_t cmd,
                              uint64_t arg);
 extern int64_t mips_sc_clock_gettime(mips64_ctx_t *ctx, uint64_t clk,
                                      uint64_t ts_va, int is64);
-extern int64_t mips_sc_nanosleep(mips64_ctx_t *ctx, uint64_t clk,
-                                 uint64_t req_va, uint64_t rem_va, int is64,
-                                 int use_clock);
+extern int64_t mips_sc_nanosleep(mips64_ctx_t *ctx, uint64_t req_va,
+                                 uint64_t rem_va, int is64);
+extern int64_t mips_sc_clock_nanosleep(mips64_ctx_t *ctx, uint64_t clk,
+                                       uint64_t flags, uint64_t req_va,
+                                       uint64_t rem_va, int is64);
+extern int64_t mips_sc_clock_getres(mips64_ctx_t *ctx, uint64_t clk,
+                                    uint64_t ts_va, int is64);
+extern int mips_thread_group_live(void);
 extern int64_t mips_sc_getrandom(mips64_ctx_t *ctx, uint64_t buf_va,
                                  uint64_t len, uint64_t flags);
 extern int64_t mips_sc_futex(mips64_ctx_t *ctx, uint64_t uaddr, uint64_t op,
@@ -553,13 +561,23 @@ static int64_t mips_syscall_inner(mips64_ctx_t *ctx)
         int is_group = (nr == (uint64_t)(n32 ? MIPS64_NR32_exit_group
                                              : MIPS64_NR_exit_group));
 
-        /* RC4: raw exit(2) from a thread-group member ends only that
-         * thread (musl thread teardown relies on this; qemu-observed),
-         * while exit_group — or exit from the main thread — ends the
-         * process. The guest already ran its own exit handlers; the
-         * translator holds no buffered guest output. */
+        /* R5: raw exit ends only the caller; exit_group ends all.
+         * A leader raw exit with live siblings waits (no _Exit kill). */
         if (!is_group && ctx->is_thread_clone) {
             mips_thread_exit(ctx, (int)(a0 & 0xFFU));
+            return sc_ret(ctx, 0); /* unreachable */
+        }
+        if (!is_group && !ctx->is_thread_clone &&
+            mips_thread_group_live() > 0) {
+            struct timespec rq = { 0, 1000000L };
+            mips_qs_lease_exit(ctx);
+            while (mips_thread_group_live() > 0) {
+                (void)nanosleep(&rq, NULL);
+            }
+            if (getenv("MIPS64RT_DUMPSTATE") != NULL) {
+                mips_dump_regs(ctx, stderr);
+            }
+            _Exit((int)(a0 & 0xFFU));
             return sc_ret(ctx, 0); /* unreachable */
         }
         if (getenv("MIPS64RT_DUMPSTATE") != NULL) {
@@ -668,14 +686,22 @@ static int64_t mips_syscall_inner(mips64_ctx_t *ctx)
     }
     if (nr == (uint64_t)(n32 ? MIPS64_NR32_nanosleep
                              : MIPS64_NR_nanosleep)) {
-        return mips_sc_nanosleep(ctx, 0U, a0, a1, n32 ? 0 : 1, 0);
+        return mips_sc_nanosleep(ctx, a0, a1, n32 ? 0 : 1);
+    }
+    if (nr == (uint64_t)(n32 ? MIPS64_NR32_clock_getres
+                             : MIPS64_NR_clock_getres)) {
+        return mips_sc_clock_getres(ctx, a0, a1, n32 ? 0 : 1);
+    }
+    if (n32 && nr == (uint64_t)MIPS64_NR32_clock_getres_time64) {
+        return mips_sc_clock_getres(ctx, a0, a1, 1);
     }
     if (nr == (uint64_t)(n32 ? MIPS64_NR32_clock_nanosleep
                              : MIPS64_NR_clock_nanosleep)) {
-        return mips_sc_nanosleep(ctx, a0, a1, a2, n32 ? 0 : 1, 1);
+        return mips_sc_clock_nanosleep(ctx, a0, a1, a2, a3,
+                                       n32 ? 0 : 1);
     }
     if (n32 && nr == (uint64_t)MIPS64_NR32_clock_nanosleep_time64) {
-        return mips_sc_nanosleep(ctx, a0, a1, a2, 1, 1);
+        return mips_sc_clock_nanosleep(ctx, a0, a1, a2, a3, 1);
     }
     if (nr == (uint64_t)(n32 ? MIPS64_NR32_getrandom
                              : MIPS64_NR_getrandom)) {
