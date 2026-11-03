@@ -417,7 +417,7 @@ int mips_vm_file_has_shared(uint64_t va, uint64_t len)
     size_t k;
     int i;
 
-    if (len == 0u || end < va) {
+    if (vm_inode_internal_prot != 0 || len == 0u || end < va) {
         return 0;
     }
     vm_lock();
