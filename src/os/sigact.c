@@ -306,6 +306,7 @@ int64_t mips_l4a_rt_sigprocmask(mips64_ctx_t *ctx, uint64_t sp)
     uint64_t set_va;
     uint64_t old_va;
     uint64_t setsize;
+    int n32;
     int be;
     uint64_t cur0;
     uint64_t cur1;
@@ -322,6 +323,7 @@ int64_t mips_l4a_rt_sigprocmask(mips64_ctx_t *ctx, uint64_t sp)
     if (setsize != MIPS64RT_SIGSETSIZE) {
         return l2a_ret(ctx, -(int64_t)EINVAL);
     }
+    n32 = ctx->is_n32 != 0U;
     be = ctx->is_be != 0U;
     cur0 = ctx->sig_blocked[0];
     cur1 = ctx->sig_blocked[1];
@@ -333,8 +335,15 @@ int64_t mips_l4a_rt_sigprocmask(mips64_ctx_t *ctx, uint64_t sp)
         if (p == NULL) {
             return l2a_ret(ctx, -(int64_t)EFAULT);
         }
-        nw0 = getn(p, 8, be) & ~L4A_UNBLOCKABLE;
-        nw1 = getn(p + 8, 8, be) & ~L4A_UNBLOCKABLE;
+        if (n32) {
+            nw0 = (getn(p, 4, be) | (getn(p + 4, 4, be) << 32)) &
+                ~L4A_UNBLOCKABLE;
+            nw1 = (getn(p + 8, 4, be) | (getn(p + 12, 4, be) << 32)) &
+                ~L4A_UNBLOCKABLE;
+        } else {
+            nw0 = getn(p, 8, be) & ~L4A_UNBLOCKABLE;
+            nw1 = getn(p + 8, 8, be) & ~L4A_UNBLOCKABLE;
+        }
         if (how == L4A_SIG_BLOCK) {
             ctx->sig_blocked[0] |= nw0;
             ctx->sig_blocked[1] |= nw1;
@@ -351,8 +360,15 @@ int64_t mips_l4a_rt_sigprocmask(mips64_ctx_t *ctx, uint64_t sp)
     if (old_va != 0U) {
         uint8_t img[16];
 
-        putn(img, cur0, 8, be);
-        putn(img + 8, cur1, 8, be);
+        if (n32) {
+            putn(img, (uint32_t)cur0, 4, be);
+            putn(img + 4, (uint32_t)(cur0 >> 32), 4, be);
+            putn(img + 8, (uint32_t)cur1, 4, be);
+            putn(img + 12, (uint32_t)(cur1 >> 32), 4, be);
+        } else {
+            putn(img, cur0, 8, be);
+            putn(img + 8, cur1, 8, be);
+        }
         /* Stage in host memory, commit under sc_lock (R3-1). */
         if (mips_sc_copyout(ctx, old_va, img, sizeof img) != 0) {
             return l2a_ret(ctx, -(int64_t)EFAULT);
@@ -529,6 +545,7 @@ static int64_t l4a_pending(mips64_ctx_t *ctx, uint64_t set_va,
 {
     uint64_t bits[2] = { 0U, 0U };
     uint32_t i;
+    int n32;
     int be;
 
     if (setsize > MIPS64RT_SIGSETSIZE) {
@@ -552,9 +569,17 @@ static int64_t l4a_pending(mips64_ctx_t *ctx, uint64_t set_va,
         if (set_va == 0U) {
             return l2a_ret(ctx, 0);
         }
+        n32 = ctx->is_n32 != 0U;
         be = ctx->is_be != 0U;
-        putn(img, w0, 8, be);
-        putn(img + 8, w1, 8, be);
+        if (n32) {
+            putn(img, (uint32_t)w0, 4, be);
+            putn(img + 4, (uint32_t)(w0 >> 32), 4, be);
+            putn(img + 8, (uint32_t)w1, 4, be);
+            putn(img + 12, (uint32_t)(w1 >> 32), 4, be);
+        } else {
+            putn(img, w0, 8, be);
+            putn(img + 8, w1, 8, be);
+        }
         /* Stage in host memory, commit under sc_lock (R3-1). */
         if (mips_sc_copyout(ctx, l4a_va(ctx, set_va), img,
                             setsize) != 0) {
@@ -577,6 +602,7 @@ static int64_t l4a_suspend(mips64_ctx_t *ctx, uint64_t a0, uint64_t a1,
     uint64_t mask_va;
     uint64_t setsize;
     const uint8_t *p;
+    int n32;
     int be;
 
     (void)a2;
@@ -603,9 +629,19 @@ static int64_t l4a_suspend(mips64_ctx_t *ctx, uint64_t a0, uint64_t a1,
         if (p == NULL) {
             return l2a_ret(ctx, -(int64_t)EFAULT);
         }
+        n32 = ctx->is_n32 != 0U;
         be = ctx->is_be != 0U;
-        ctx->sig_blocked[0] = getn(p, 8, be) & ~L4A_UNBLOCKABLE;
-        ctx->sig_blocked[1] = getn(p + 8, 8, be) & ~L4A_UNBLOCKABLE;
+        if (n32) {
+            ctx->sig_blocked[0] =
+                (getn(p, 4, be) | (getn(p + 4, 4, be) << 32)) &
+                ~L4A_UNBLOCKABLE;
+            ctx->sig_blocked[1] =
+                (getn(p + 8, 4, be) | (getn(p + 12, 4, be) << 32)) &
+                ~L4A_UNBLOCKABLE;
+        } else {
+            ctx->sig_blocked[0] = getn(p, 8, be) & ~L4A_UNBLOCKABLE;
+            ctx->sig_blocked[1] = getn(p + 8, 8, be) & ~L4A_UNBLOCKABLE;
+        }
     }
     return l2a_ret(ctx, -(int64_t)EINTR);
 }
