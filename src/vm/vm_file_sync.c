@@ -178,6 +178,113 @@ int mips_vm_file_read_page(mips64_ctx_t *ctx, uint64_t page_va,
     return done;
 }
 
+/* LL/SC shared-backing identity (R7-2): resolve va to the shared
+ * file mapping covering it (any pid: the (dev, ino) identity is
+ * per-file) with the inode's current LL/SC generation. */
+int mips_vm_file_backing_seq(uint64_t va, uint64_t *devp, uint64_t *inop,
+                             uint64_t *seqp)
+{
+    vm_inode_t *tab;
+    size_t k;
+
+    if (devp == NULL || inop == NULL || seqp == NULL ||
+        !vm_inode_table_tried || vm_inode_table_ptr == NULL) {
+        return 0;
+    }
+    vm_lock();
+    tab = vm_inode_table_ptr;
+    for (k = 0u; tab != NULL && k < VM_INODE_MAX; k++) {
+        vm_inode_t *in = &tab[k];
+        int i;
+
+        for (i = 0; in->used != 0 && i < in->nmaps; i++) {
+            vm_inode_map_t *m = &in->maps[i];
+
+            if (m->shared == 0) {
+                continue;
+            }
+            if (va >= m->va && va - m->va < m->len) {
+                *devp = in->dev;
+                *inop = in->ino;
+                *seqp = in->llsc_seq;
+                vm_unlock();
+                return 1;
+            }
+        }
+    }
+    vm_unlock();
+    return 0;
+}
+
+/* True when the shared LL/SC generation of (dev, ino) still equals
+ * seq. Unknown inodes report 0 so the reservation fails safely. */
+int mips_vm_file_llsc_seq_ok(uint64_t dev, uint64_t ino, uint64_t seq)
+{
+    vm_inode_t *in;
+    int ok = 0;
+
+    if (!vm_inode_table_tried || vm_inode_table_ptr == NULL) {
+        return 0;
+    }
+    vm_lock();
+    in = vm_inode_lookup(dev, ino, 0, 0u);
+    if (in != NULL && in->llsc_seq == seq) {
+        ok = 1;
+    }
+    vm_unlock();
+    return ok;
+}
+
+/* Advance the shared LL/SC generation of every shared inode that
+ * [va, va+len) overlaps. Called for every guest store (via
+ * mips_llsc_note_write), so an interfering write through another
+ * MAP_SHARED alias — same or another process — breaks LL snapshots
+ * even when it restores the old value. Same-file cross-offset writes
+ * only cause safe spurious SC failures. */
+void mips_vm_file_bump_llsc(uint64_t va, uint64_t len)
+{
+    vm_inode_t *tab;
+    size_t k;
+
+    if (len == 0u || !vm_inode_table_tried || vm_inode_table_ptr == NULL) {
+        return;
+    }
+    vm_lock();
+    tab = vm_inode_table_ptr;
+    for (k = 0u; tab != NULL && k < VM_INODE_MAX; k++) {
+        vm_inode_t *in = &tab[k];
+        int i;
+        int hit = 0;
+
+        if (in->used == 0) {
+            continue;
+        }
+        for (i = 0; i < in->nmaps; i++) {
+            vm_inode_map_t *m = &in->maps[i];
+            uint64_t mhi = m->va + m->len;
+            uint64_t end = va + len;
+
+            if (m->shared == 0) {
+                continue;
+            }
+            if (end < va) {
+                end = ~(uint64_t)0u;
+            }
+            if (mhi < m->va) {
+                mhi = ~(uint64_t)0u;
+            }
+            if (m->va < end && va < mhi) {
+                hit = 1;
+                break;
+            }
+        }
+        if (hit != 0) {
+            in->llsc_seq++;
+        }
+    }
+    vm_unlock();
+}
+
 void mips_vm_file_post_write(mips64_ctx_t *ctx, int fd, uint64_t off, uint64_t n)
 {
     struct stat st;

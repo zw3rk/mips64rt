@@ -37,6 +37,35 @@
 extern void mips_vm_file_shared_sync(mips64_ctx_t *ctx, uint64_t va,
                                      uint64_t len);
 
+/* R7-2 backing identity (strong in vm_file_sync.c; weak fallback). */
+__attribute__((weak)) int mips_vm_file_backing_seq(uint64_t va,
+                                                   uint64_t *devp,
+                                                   uint64_t *inop,
+                                                   uint64_t *seqp)
+{
+    (void)va;
+    (void)devp;
+    (void)inop;
+    (void)seqp;
+    return 0;
+}
+
+__attribute__((weak)) int mips_vm_file_llsc_seq_ok(uint64_t dev,
+                                                   uint64_t ino,
+                                                   uint64_t seq)
+{
+    (void)dev;
+    (void)ino;
+    (void)seq;
+    return 0;
+}
+
+__attribute__((weak)) void mips_vm_file_bump_llsc(uint64_t va, uint64_t len)
+{
+    (void)va;
+    (void)len;
+}
+
 /* Byte position p (0 = LSB) of a 32/64-bit value. */
 static uint32_t get_pos32(uint32_t v, unsigned p)
 {
@@ -59,7 +88,10 @@ static uint64_t set_pos64(uint64_t v, unsigned p, uint64_t b)
     return (v & ~((uint64_t)0xFFu << (8u * p))) | ((b & 0xFFu) << (8u * p));
 }
 
-/* Load n bytes at PA..PA+n-1 into m (endianness-neutral). */
+/* Load n bytes at PA..PA+n-1 into m (endianness-neutral). The
+ * accessor already delivered any fault (a handled fault leaves
+ * exit_reason NONE with pc at the handler), so failures propagate
+ * without raising a second fault (R7-4). */
 static int load_bytes(mips64_ctx_t *ctx, uint64_t pa, uint8_t m[8], unsigned n)
 {
     unsigned i;
@@ -68,9 +100,6 @@ static int load_bytes(mips64_ctx_t *ctx, uint64_t pa, uint8_t m[8], unsigned n)
         uint64_t v = 0u;
 
         if (guest_ld8(ctx, pa + i, &v) != 0) {
-            if (ctx->exit_reason == MIPS64_EXIT_NONE) {
-                mips_fault(ctx, pa + i);
-            }
             return MIPS_FAULT;
         }
         m[i] = (uint8_t)v;
@@ -78,7 +107,8 @@ static int load_bytes(mips64_ctx_t *ctx, uint64_t pa, uint8_t m[8], unsigned n)
     return 0;
 }
 
-/* Store m[lo..hi] to PA+lo..PA+hi (endianness-neutral). */
+/* Store m[lo..hi] to PA+lo..PA+hi (endianness-neutral). Same single-
+ * delivery contract as load_bytes (R7-4). */
 static int store_bytes(mips64_ctx_t *ctx, uint64_t pa, const uint8_t m[8],
                        unsigned lo, unsigned hi)
 {
@@ -86,9 +116,6 @@ static int store_bytes(mips64_ctx_t *ctx, uint64_t pa, const uint8_t m[8],
 
     for (i = lo; i <= hi; i++) {
         if (guest_st8(ctx, pa + i, m[i]) != 0) {
-            if (ctx->exit_reason == MIPS64_EXIT_NONE) {
-                mips_fault(ctx, pa + i);
-            }
             return MIPS_FAULT;
         }
     }
@@ -292,6 +319,12 @@ typedef struct {
     int active;
     uint64_t epoch0;
     uint64_t epoch1;
+    /* R7-2: shared file backing (cross-alias/cross-process SC check;
+     * value CAS and VA epochs cannot see alias ABA). */
+    int backing_valid;
+    uint64_t back_dev;
+    uint64_t back_ino;
+    uint64_t back_seq;
 } llsc_slot_t;
 
 static unsigned char sc_lock;
@@ -348,6 +381,10 @@ void mips_llsc_atfork_child(const mips64_ctx_t *ctx)
         g_llsc_slots[i].active = 0;
         g_llsc_slots[i].epoch0 = 0u;
         g_llsc_slots[i].epoch1 = 0u;
+        g_llsc_slots[i].backing_valid = 0;
+        g_llsc_slots[i].back_dev = 0u;
+        g_llsc_slots[i].back_ino = 0u;
+        g_llsc_slots[i].back_seq = 0u;
     }
 }
 
@@ -374,6 +411,10 @@ static llsc_slot_t *llsc_slot_locked(const mips64_ctx_t *ctx, int create)
             g_llsc_slots[i].active = 0;
             g_llsc_slots[i].epoch0 = 0u;
             g_llsc_slots[i].epoch1 = 0u;
+            g_llsc_slots[i].backing_valid = 0;
+            g_llsc_slots[i].back_dev = 0u;
+            g_llsc_slots[i].back_ino = 0u;
+            g_llsc_slots[i].back_seq = 0u;
             return &g_llsc_slots[i];
         }
     }
@@ -408,6 +449,8 @@ static void llsc_note_write_locked(uint64_t va, uint64_t len)
             s->active = 0;
         }
     }
+    /* R7-2: bump shared backing generations (sc_lock held). */
+    mips_vm_file_bump_llsc(va, len);
 }
 
 void mips_llsc_note_write(uint64_t va, uint64_t len)
@@ -436,6 +479,10 @@ void mips_llsc_release(const mips64_ctx_t *ctx)
         s->active = 0;
         s->epoch0 = 0u;
         s->epoch1 = 0u;
+        s->backing_valid = 0;
+        s->back_dev = 0u;
+        s->back_ino = 0u;
+        s->back_seq = 0u;
     }
     sc_lock_release();
 }
@@ -457,7 +504,8 @@ int do_ll(mips64_ctx_t *ctx, uint64_t addr, unsigned rt)
     llsc_slot_t *s;
 
     if ((addr & 3u) != 0u) {
-        mips_fault(ctx, addr);
+        /* R7-11: LL/SC alignment is never emulated: SIGBUS. */
+        mips_bus_fault(ctx, addr);
         return MIPS_FAULT;
     }
     sc_lock_acquire();
@@ -468,11 +516,24 @@ int do_ll(mips64_ctx_t *ctx, uint64_t addr, unsigned rt)
     }
     s = llsc_slot_locked(ctx, 1);
     if (s != NULL) {
+        uint64_t dev = 0u;
+        uint64_t ino = 0u;
+        uint64_t seq = 0u;
+
         s->addr = addr;
         s->width = 4u;
         s->epoch0 = g_llsc_epoch[(addr >> 2) & (LLSC_BUCKETS - 1u)];
         s->epoch1 = s->epoch0;
         s->active = 1;
+        /* R7-2: snapshot the shared-backing generation when the
+         * reservation sits on a shared file mapping. */
+        s->backing_valid = 0;
+        if (mips_vm_file_backing_seq(addr, &dev, &ino, &seq) != 0) {
+            s->backing_valid = 1;
+            s->back_dev = dev;
+            s->back_ino = ino;
+            s->back_seq = seq;
+        }
     }
     ctx->llbit = 1;
     ctx->lladdr = addr;
@@ -488,7 +549,8 @@ int do_sc(mips64_ctx_t *ctx, uint64_t addr, unsigned rt)
     int sc_ok = 0;
 
     if ((addr & 3u) != 0u) {
-        mips_fault(ctx, addr);
+        /* R7-11: LL/SC alignment is never emulated: SIGBUS. */
+        mips_bus_fault(ctx, addr);
         return MIPS_FAULT;
     }
     if (ctx->llbit != 0u && ctx->lladdr == addr) {
@@ -500,7 +562,10 @@ int do_sc(mips64_ctx_t *ctx, uint64_t addr, unsigned rt)
         epoch_ok = (s != NULL && s->active != 0 &&
                     s->addr == addr && s->width == 4u &&
                     s->epoch0 ==
-                        g_llsc_epoch[(addr >> 2) & (LLSC_BUCKETS - 1u)]);
+                        g_llsc_epoch[(addr >> 2) & (LLSC_BUCKETS - 1u)] &&
+                    (s->backing_valid == 0 ||
+                     mips_vm_file_llsc_seq_ok(s->back_dev, s->back_ino,
+                                              s->back_seq)));
         if (s != NULL) {
             s->active = 0;
         }
@@ -586,7 +651,8 @@ int do_lld(mips64_ctx_t *ctx, uint64_t addr, unsigned rt)
     llsc_slot_t *s;
 
     if ((addr & 7u) != 0u) {
-        mips_fault(ctx, addr);
+        /* R7-11: LL/SC alignment is never emulated: SIGBUS. */
+        mips_bus_fault(ctx, addr);
         return MIPS_FAULT;
     }
     sc_lock_acquire();
@@ -597,12 +663,25 @@ int do_lld(mips64_ctx_t *ctx, uint64_t addr, unsigned rt)
     }
     s = llsc_slot_locked(ctx, 1);
     if (s != NULL) {
+        uint64_t dev = 0u;
+        uint64_t ino = 0u;
+        uint64_t seq = 0u;
+
         s->addr = addr;
         s->width = 8u;
         s->epoch0 = g_llsc_epoch[(addr >> 2) & (LLSC_BUCKETS - 1u)];
         s->epoch1 =
             g_llsc_epoch[((addr + 4u) >> 2) & (LLSC_BUCKETS - 1u)];
         s->active = 1;
+        /* R7-2: snapshot the shared-backing generation when the
+         * reservation sits on a shared file mapping. */
+        s->backing_valid = 0;
+        if (mips_vm_file_backing_seq(addr, &dev, &ino, &seq) != 0) {
+            s->backing_valid = 1;
+            s->back_dev = dev;
+            s->back_ino = ino;
+            s->back_seq = seq;
+        }
     }
     ctx->llbit = 1;
     ctx->lladdr = addr;
@@ -618,7 +697,8 @@ int do_scd(mips64_ctx_t *ctx, uint64_t addr, unsigned rt)
     int sc_ok = 0;
 
     if ((addr & 7u) != 0u) {
-        mips_fault(ctx, addr);
+        /* R7-11: LL/SC alignment is never emulated: SIGBUS. */
+        mips_bus_fault(ctx, addr);
         return MIPS_FAULT;
     }
     if (ctx->llbit != 0u && ctx->lladdr == addr) {
@@ -633,7 +713,10 @@ int do_scd(mips64_ctx_t *ctx, uint64_t addr, unsigned rt)
              s->epoch0 ==
                  g_llsc_epoch[(addr >> 2) & (LLSC_BUCKETS - 1u)] &&
              s->epoch1 ==
-                 g_llsc_epoch[((addr + 4u) >> 2) & (LLSC_BUCKETS - 1u)]);
+                 g_llsc_epoch[((addr + 4u) >> 2) & (LLSC_BUCKETS - 1u)] &&
+             (s->backing_valid == 0 ||
+              mips_vm_file_llsc_seq_ok(s->back_dev, s->back_ino,
+                                       s->back_seq)));
         if (s != NULL) {
             s->active = 0;
         }

@@ -32,6 +32,12 @@ typedef struct {
 typedef struct {
     int used, nmaps, wide;
     uint64_t dev, ino, size, write_seq, resize_seq;
+    /* LL/SC shared generation (R7-2): bumped under vm_lock on every
+     * guest store overlapping a shared mapping of this inode, so an
+     * ABA through another alias (same or another process) breaks the
+     * snapshot an LL armed on this backing. Same-file cross-offset
+     * writes only cause safe spurious SC failures. */
+    uint64_t llsc_seq;
     vm_inode_map_t maps[VM_INODE_MAPS];
 } vm_inode_t;
 

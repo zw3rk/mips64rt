@@ -72,5 +72,16 @@ void mips_vm_file_post_truncate_path(mips64_ctx_t *ctx,
  * host-page protect cover cannot represent shared sub-page
  * permissions, so the protect path rejects with -EINVAL. */
 int mips_vm_file_has_shared(uint64_t va, uint64_t len);
+/* LL/SC backing identity (R7-2): mips_vm_file_backing_seq resolves
+ * va to its shared file backing and current LL/SC generation (1 with
+ * outputs set, else 0); mips_vm_file_llsc_seq_ok reports whether the
+ * inode's shared LL/SC generation still equals seq (0 when the inode
+ * is unknown, which fails the reservation safely);
+ * mips_vm_file_bump_llsc advances the generation of every shared
+ * inode overlapped by [va, va+len). */
+int mips_vm_file_backing_seq(uint64_t va, uint64_t *devp, uint64_t *inop,
+                             uint64_t *seqp);
+int mips_vm_file_llsc_seq_ok(uint64_t dev, uint64_t ino, uint64_t seq);
+void mips_vm_file_bump_llsc(uint64_t va, uint64_t len);
 
 #endif /* MIPS64RT_VM_VM_FILE_H */

@@ -168,47 +168,6 @@ static uint64_t rd64(const uint8_t *p, int be)
            ((uint64_t)p[6] << 48) | ((uint64_t)p[7] << 56);
 }
 
-/* Store a native stack/auxv word (4 bytes N32, 8 bytes N64) in guest
- * byte order. N32 values always fit: placements stay below 4 GiB. */
-static void st_word(uint8_t *p, uint64_t v, int w32, int be)
-{
-    if (w32) {
-        uint32_t w = (uint32_t)v;
-
-        if (be) {
-            p[0] = (uint8_t)((w >> 24) & 0xFFU);
-            p[1] = (uint8_t)((w >> 16) & 0xFFU);
-            p[2] = (uint8_t)((w >> 8) & 0xFFU);
-            p[3] = (uint8_t)(w & 0xFFU);
-        } else {
-            p[0] = (uint8_t)(w & 0xFFU);
-            p[1] = (uint8_t)((w >> 8) & 0xFFU);
-            p[2] = (uint8_t)((w >> 16) & 0xFFU);
-            p[3] = (uint8_t)((w >> 24) & 0xFFU);
-        }
-        return;
-    }
-    if (be) {
-        p[0] = (uint8_t)((v >> 56) & 0xFFU);
-        p[1] = (uint8_t)((v >> 48) & 0xFFU);
-        p[2] = (uint8_t)((v >> 40) & 0xFFU);
-        p[3] = (uint8_t)((v >> 32) & 0xFFU);
-        p[4] = (uint8_t)((v >> 24) & 0xFFU);
-        p[5] = (uint8_t)((v >> 16) & 0xFFU);
-        p[6] = (uint8_t)((v >> 8) & 0xFFU);
-        p[7] = (uint8_t)(v & 0xFFU);
-    } else {
-        p[0] = (uint8_t)(v & 0xFFU);
-        p[1] = (uint8_t)((v >> 8) & 0xFFU);
-        p[2] = (uint8_t)((v >> 16) & 0xFFU);
-        p[3] = (uint8_t)((v >> 24) & 0xFFU);
-        p[4] = (uint8_t)((v >> 32) & 0xFFU);
-        p[5] = (uint8_t)((v >> 40) & 0xFFU);
-        p[6] = (uint8_t)((v >> 48) & 0xFFU);
-        p[7] = (uint8_t)((v >> 56) & 0xFFU);
-    }
-}
-
 static ssize_t read_at(int fd, void *buf, size_t n, uint64_t off)
 {
     size_t done = 0U;
@@ -366,9 +325,18 @@ static int parse_ehdr(int fd, ehdr_t *eh)
     return 0;
 }
 
-/* Returns 1 for N64, 2 for N32, 0 to reject. */
+/* Returns 1 for N64, 2 for N32, 0 to reject. R7-1: the decoder
+ * implements MIPS64r2 only, so R6 (arch 0x9/0xA) and any other
+ * non-R2 arch revision are rejected here; legacy images with no arch
+ * field execute as R2. */
 static int classify(const ehdr_t *eh)
 {
+    uint32_t arch = eh->flags & MIPS_EF_ARCH;
+
+    if (arch != 0U && arch != MIPS_EF_ARCH_32R2 &&
+        arch != MIPS_EF_ARCH_64R2) {
+        return 0;
+    }
     if (eh->is64) {
         if ((eh->flags & MIPS_EF_ABI) == 0U) {
             return 1;
@@ -686,7 +654,7 @@ static int build_stack(mips64_ctx_t *ctx, int argc, char **argv, char **envp,
     {
         /* Slots are byte-addressed and word-sized (4 bytes N32, 8
          * bytes N64): every store, terminators included, goes
-         * through st_word in guest byte order. */
+         * through mips_loader_st_word in guest byte order. */
         uint8_t *slot = mem + (sp - stack_base);
         int be = ctx->is_be != 0U;
         uint64_t off = 0U;
@@ -696,23 +664,23 @@ static int build_stack(mips64_ctx_t *ctx, int argc, char **argv, char **envp,
         unsigned naux = 0U;
         unsigned r;
 
-        st_word(slot + off, (uint64_t)argc, w32, be);
+        mips_loader_st_word(slot + off, (uint64_t)argc, w32, be);
         off += ws;
         for (i = 0; i < argc; i++) {
-            st_word(slot + off, p, w32, be);
+            mips_loader_st_word(slot + off, p, w32, be);
             off += ws;
             p += (uint64_t)str_len(argv[i]) + 1U;
         }
-        st_word(slot + off, 0U, w32, be);
+        mips_loader_st_word(slot + off, 0U, w32, be);
         off += ws;
         for (i = 0; envp[i] != NULL; i++) {
             if (!env_hidden(envp[i])) {
-                st_word(slot + off, q, w32, be);
+                mips_loader_st_word(slot + off, q, w32, be);
                 off += ws;
                 q += (uint64_t)str_len(envp[i]) + 1U;
             }
         }
-        st_word(slot + off, 0U, w32, be);
+        mips_loader_st_word(slot + off, 0U, w32, be);
         off += ws;
 #define AUX(tag, val)                       \
     do {                                    \
@@ -745,7 +713,7 @@ static int build_stack(mips64_ctx_t *ctx, int argc, char **argv, char **envp,
         AUX(MIPS_AT_NULL, 0U);
 #undef AUX
         for (r = 0U; r < naux; r++) {
-            st_word(slot + off, auxv[r], w32, be);
+            mips_loader_st_word(slot + off, auxv[r], w32, be);
             off += ws;
         }
         /* Guest-visible auxv copy for the /proc/self layer (Phase 5);
@@ -811,6 +779,8 @@ int mips_load_elf(mips64_ctx_t *ctx, const char *path,
     mips_loader_init_ctx(ctx);
     ctx->is_be = eh.be ? 1U : 0U;
     ctx->is_n32 = kind == 2 ? 1U : 0U;
+    ctx->isa_rev = 1U; /* R7-1: admitted images are R2 (or legacy). */
+    ctx->nan2008 = (eh.flags & MIPS_EF_NAN2008) != 0U ? 1U : 0U;
     if (guest_mem_init(ctx) != 0) {
         close(fd);
         errno = ENOMEM;

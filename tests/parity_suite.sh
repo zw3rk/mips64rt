@@ -177,7 +177,8 @@ fi
 if [ -x _build/test_r3_defects ] || "$CC_HOST" -std=c11 -Werror=vla -pedantic -Wall -Wextra -Werror \
     -pthread -Isrc tests/test_r3_defects.c src/interp/decode.c src/interp/interp.c \
     src/interp/unaligned.c src/interp/fpmove.c src/interp/fp.c src/interp/fp_cvt.c \
-    src/interp/fp_ps.c src/os/mem.c src/os/mem_table.c src/os/backend_state.c \
+    src/interp/fp_ps.c src/interp/fp_round.c src/os/mem.c src/os/mem_table.c \
+    src/os/backend_state.c \
     src/os/proc.c src/os/syscalls.c src/os/syscalls_extra.c src/os/syscalls_sync.c \
     src/os/syscalls_time.c src/os/syscalls_stat.c src/os/host_args.c src/os/quiesce.c \
     src/os/signal_core.c src/vm/vm64.c src/vm/vm_file.c src/vm/vm_file_sync.c src/vm/vm_pages.c \
@@ -190,6 +191,44 @@ if [ -x _build/test_r3_defects ] || "$CC_HOST" -std=c11 -Werror=vla -pedantic -W
 else
     _t0=$(parity_now_ms)
     parity_row "host" "$HOST_TAG" "test_r3_defects" "host" "FAIL" "$(( $(parity_now_ms) - _t0 ))" "build failed"
+fi
+
+if [ -x _build/test_r7_defects ] || "$CC_HOST" -std=c11 -Werror=vla -pedantic -Wall -Wextra -Werror \
+    -pthread -Isrc tests/test_r7_defects.c src/loader.c src/interp/decode.c \
+    src/interp/interp.c src/interp/unaligned.c src/interp/fpmove.c src/interp/fp.c \
+    src/interp/fp_cvt.c src/interp/fp_ps.c src/interp/fp_round.c src/os/mem.c \
+    src/os/mem_table.c src/os/backend_state.c \
+    src/os/proc.c src/os/syscalls.c src/os/syscalls_extra.c src/os/syscalls_sync.c \
+    src/os/syscalls_time.c src/os/syscalls_stat.c src/os/host_args.c src/os/quiesce.c \
+    src/os/signal_core.c src/vm/vm64.c src/vm/vm_file.c src/vm/vm_file_sync.c src/vm/vm_pages.c \
+    src/dbt/aot/sites.c src/dbt/a64_emit.c src/dbt/emit_enc.c src/dbt/emit_alu.c \
+    src/dbt/emit_mem.c src/dbt/emit_fpmem.c src/dbt/emit_int.c src/dbt/emit_fp.c \
+    src/dbt/arena.c src/dbt/dbt.c src/dbt/mem_recover.c src/dbt/trampoline_a64.S \
+    "$OS_BACKEND" \
+    -o _build/test_r7_defects >/dev/null 2>&1; then
+    run_unit "test_r7_defects" ./_build/test_r7_defects
+else
+    _t0=$(parity_now_ms)
+    parity_row "host" "$HOST_TAG" "test_r7_defects" "host" "FAIL" "$(( $(parity_now_ms) - _t0 ))" "build failed"
+fi
+
+if [ -x _build/test_r7_fp ] || "$CC_HOST" -std=c11 -Werror=vla -pedantic -Wall -Wextra -Werror \
+    -pthread -Isrc tests/test_r7_fp.c src/interp/decode.c \
+    src/interp/interp.c src/interp/unaligned.c src/interp/fpmove.c src/interp/fp.c \
+    src/interp/fp_cvt.c src/interp/fp_ps.c src/interp/fp_round.c src/os/mem.c \
+    src/os/mem_table.c src/os/backend_state.c \
+    src/os/proc.c src/os/syscalls.c src/os/syscalls_extra.c src/os/syscalls_sync.c \
+    src/os/syscalls_time.c src/os/syscalls_stat.c src/os/host_args.c src/os/quiesce.c \
+    src/os/signal_core.c src/vm/vm64.c src/vm/vm_file.c src/vm/vm_file_sync.c src/vm/vm_pages.c \
+    src/dbt/aot/sites.c src/dbt/a64_emit.c src/dbt/emit_enc.c src/dbt/emit_alu.c \
+    src/dbt/emit_mem.c src/dbt/emit_fpmem.c src/dbt/emit_int.c src/dbt/emit_fp.c \
+    src/dbt/arena.c src/dbt/dbt.c src/dbt/mem_recover.c src/dbt/trampoline_a64.S \
+    "$OS_BACKEND" \
+    -o _build/test_r7_fp >/dev/null 2>&1; then
+    run_unit "test_r7_fp" ./_build/test_r7_fp
+else
+    _t0=$(parity_now_ms)
+    parity_row "host" "$HOST_TAG" "test_r7_fp" "host" "FAIL" "$(( $(parity_now_ms) - _t0 ))" "build failed"
 fi
 
 if [ -x _build/test_u0_fill_retry ] && [ -x _build/test_u0_gate ]; then

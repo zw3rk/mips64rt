@@ -224,6 +224,12 @@ typedef struct mips64_ctx {
     mips64_sigpend_t pend_queue[16];
     uint32_t pend_head;
     uint32_t pend_count;
+
+    /* ISA revision from ELF e_flags (R7-1, set by the loader):
+     * 0 = legacy/unspecified, 1 = MIPS64r2. R6+ images are rejected
+     * at admission until R6 compact branches/forbidden slots are
+     * implemented, so only R2 encodings ever execute. */
+    uint32_t isa_rev;
 } mips64_ctx_t;
 
 /* ABI-locked offsets (SPEC 2.1, verified by tests/check_abi_invariants). */

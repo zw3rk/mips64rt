@@ -178,9 +178,11 @@ int fpmove_cop1(mips64_ctx_t *ctx, const mips_dec_t *d)
         ctx->fpr[fs] = (ctx->fpr[fs] & UINT64_C(0xFFFFFFFF)) |
             ((uint64_t)(uint32_t)ctx->gpr[rt] << 32u);
         return 0;
-    case 0x02u: /* CFC1: $31 = FCSR, $0 = FIR (read-only ID). */
+    case 0x02u: { /* CFC1: $31 = FCSR, $0 = FIR (R7-17 aliases). */
+        uint32_t fcsr = ctx->fcsr;
+
         if (fs == 31u) {
-            interp_set_reg(ctx, rt, interp_sext32(ctx->fcsr));
+            interp_set_reg(ctx, rt, interp_sext32(fcsr));
             return 0;
         }
         if (fs == 0u) {
@@ -188,23 +190,51 @@ int fpmove_cop1(mips64_ctx_t *ctx, const mips_dec_t *d)
                 interp_sext32(MIPS64RT_FIR_MIPS64R2));
             return 0;
         }
+        if (fs == 25u) { /* FCCR: bit0 = FCC0, bits7:1 = FCC7:1. */
+            uint32_t v = ((fcsr >> 23u) & 1u) | ((fcsr >> 24u) & 0xFEu);
+
+            interp_set_reg(ctx, rt, interp_sext32(v));
+            return 0;
+        }
+        if (fs == 26u) { /* FEXR: Cause + Flags at FCSR positions. */
+            interp_set_reg(ctx, rt, interp_sext32(fcsr & 0x3F07Cu));
+            return 0;
+        }
+        if (fs == 28u) { /* FENR: FS (bit2) + Enables + RM. */
+            uint32_t v = ((fcsr >> 22u) & 4u) | (fcsr & 0xF83u);
+
+            interp_set_reg(ctx, rt, interp_sext32(v));
+            return 0;
+        }
         return MIPS_FAULT;
-    case 0x06u: /* CTC1: $31 = FCSR, $0 = FIR (writes ignored). */
+    }
+    case 0x06u: { /* CTC1: $31 = FCSR, $0 = FIR ignored (R7-17). */
+        uint32_t v = (uint32_t)ctx->gpr[rt];
+
         if (fs == 31u) {
-            ctx->fcsr = (uint32_t)ctx->gpr[rt];
-            if ((((ctx->fcsr >> 12u) & (ctx->fcsr >> 7u) & 0x1Fu) != 0u) ||
-                ((ctx->fcsr & (1u << 17u)) != 0u)) {
-                mips_insn_trap_code(ctx, 8, fp_fcsr_sicode(ctx->fcsr),
-                                    ctx->pc);
-                return (ctx->exit_reason == MIPS64_EXIT_NONE) ?
-                    FP_RC_BRANCH : MIPS_FAULT;
-            }
+            ctx->fcsr = v;
+        } else if (fs == 0u) {
             return 0;
+        } else if (fs == 25u) { /* FCCR. */
+            ctx->fcsr = (ctx->fcsr & ~(0xFE800000u)) |
+                (((v & 1u) << 23u) | ((v & 0xFEu) << 24u));
+        } else if (fs == 26u) { /* FEXR: Cause + Flags. */
+            ctx->fcsr = (ctx->fcsr & ~(0x3F07Cu)) | (v & 0x3F07Cu);
+        } else if (fs == 28u) { /* FENR: FS (bit2) + Enables + RM. */
+            ctx->fcsr = (ctx->fcsr & ~(0x1000F83u)) |
+                (((v << 22u) & 0x1000000u) | (v & 0xF83u));
+        } else {
+            return MIPS_FAULT;
         }
-        if (fs == 0u) {
-            return 0;
+        if ((((ctx->fcsr >> 12u) & (ctx->fcsr >> 7u) & 0x1Fu) != 0u) ||
+            ((ctx->fcsr & (1u << 17u)) != 0u)) {
+            mips_insn_trap_code(ctx, 8, fp_fcsr_sicode(ctx->fcsr),
+                                ctx->pc);
+            return (ctx->exit_reason == MIPS64_EXIT_NONE) ?
+                FP_RC_BRANCH : MIPS_FAULT;
         }
-        return MIPS_FAULT;
+        return 0;
+    }
     case 0x01u: /* DMFC1: full 64-bit lane to GPR */
     case 0x05u: /* DMTC1: full 64-bit lane from GPR */
     case 0x08u: /* BC1F/BC1FL/BC1T/BC1TL (any cc) */
@@ -239,4 +269,32 @@ int fpmove_cop0(mips64_ctx_t *ctx, const mips_dec_t *d)
         return 0;
     }
     return MIPS_FAULT;
+}
+
+/* Conditional FPR moves MOVF/MOVT/MOVZ/MOVN .S/.D (R7-18): predicate
+ * on the FCC (cc = rt>>2, tf = rt&1) or GPR, full 64-bit lane copy
+ * (FR=1) on true, no-op on false, and never any arithmetic exception
+ * side effects. 0 ok, MIPS_FAULT otherwise (caller maps it). */
+int fp_cond_move(mips64_ctx_t *ctx, const mips_dec_t *d)
+{
+    unsigned fd = d->sa & 31u;
+    unsigned fs = d->rd & 31u;
+    int move = 0;
+
+    if (d->funct == 0x11u) {
+        unsigned cc = ((unsigned)d->rt >> 2u) & 7u;
+        unsigned tf = (unsigned)d->rt & 1u;
+
+        move = (fp_get_cc(ctx, cc) == tf);
+    } else if (d->funct == 0x12u) {
+        move = ctx->gpr[d->rt] == 0u;
+    } else if (d->funct == 0x13u) {
+        move = ctx->gpr[d->rt] != 0u;
+    } else {
+        return MIPS_FAULT;
+    }
+    if (move != 0) {
+        ctx->fpr[fd] = ctx->fpr[fs];
+    }
+    return 0;
 }

@@ -59,6 +59,7 @@ BOOT_COMMON := src/main.c \
 	src/interp/fp.c \
 	src/interp/fp_cvt.c \
 	src/interp/fp_ps.c \
+	src/interp/fp_round.c \
 	src/os/mem.c \
 	src/os/mem_table.c \
 	src/os/backend_state.c \
@@ -97,7 +98,7 @@ BOOT_COMMON := src/main.c \
 BOOT_SRCS := $(BOOT_COMMON) $(OS_BACKEND)
 DARWIN_SRCS := $(BOOT_COMMON) $(HOST_BACKEND)
 
-.PHONY: help build build-cross build-darwin check check-line-limits check-abi-invariants clean
+.PHONY: help build build-cross build-darwin check check-line-limits check-abi-invariants test clean
 
 help:
 	@echo "Targets:"
@@ -107,6 +108,7 @@ help:
 	@echo "  check                 build + check-line-limits + self-checks"
 	@echo "  check-line-limits     every .c/.h/.S under src/ is <= 900 lines"
 	@echo "  check-abi-invariants  build+run tests/check_abi_invariants (lane L0b)"
+	@echo "  test                  host-native R3+R7 defect gates + line limits"
 	@echo "  clean                 remove $(BUILD)"
 
 build: $(BUILD)/mips64rt
@@ -162,7 +164,8 @@ GATE_SRCS := tests/test_u0_gate.c \
 	src/interp/fpmove.c \
 	src/interp/fp.c \
 	src/interp/fp_cvt.c \
-	src/interp/fp_ps.c
+	src/interp/fp_ps.c \
+	src/interp/fp_round.c
 
 # Wave P12: focused GPR-cache regression gate (host-native; same TU as
 # the U0 gate with the driver swapped, so it links the real emitter).
@@ -231,6 +234,41 @@ check-abi-invariants:
 	@mkdir -p $(BUILD)
 	$(HOST_CC) -std=c11 -Werror=vla -pedantic -Wall -Wextra -Werror -Isrc tests/check_abi_invariants.c -o $(BUILD)/check_abi_invariants
 	$(BUILD)/check_abi_invariants
+
+# Host-native defect regression gates (Round 3 + Round 7): build and
+# run the interpreter/FP/loader/LLSC unit tests with the host C
+# compiler. AArch64 host required (the trampoline is A64 assembly).
+R3TEST_SRCS := tests/test_r3_defects.c \
+	src/interp/decode.c src/interp/interp.c src/interp/unaligned.c \
+	src/interp/fpmove.c src/interp/fp.c src/interp/fp_cvt.c \
+	src/interp/fp_round.c src/interp/fp_ps.c src/os/mem.c \
+	src/os/mem_table.c src/os/backend_state.c src/os/proc.c \
+	src/os/syscalls.c src/os/syscalls_extra.c src/os/syscalls_sync.c \
+	src/os/syscalls_time.c src/os/syscalls_stat.c src/os/host_args.c \
+	src/os/quiesce.c src/os/signal_core.c src/vm/vm64.c \
+	src/vm/vm_file.c src/vm/vm_file_sync.c src/vm/vm_pages.c \
+	src/dbt/aot/sites.c src/dbt/a64_emit.c src/dbt/emit_enc.c \
+	src/dbt/emit_alu.c src/dbt/emit_mem.c src/dbt/emit_fpmem.c \
+	src/dbt/emit_int.c src/dbt/emit_fp.c src/dbt/arena.c src/dbt/dbt.c \
+	src/dbt/mem_recover.c src/dbt/trampoline_a64.S $(HOST_BACKEND) \
+	tests/stubs_signal.c
+
+R7TEST_SRCS := tests/test_r7_defects.c src/loader.c \
+	$(filter-out tests/stubs_signal.c tests/test_r3_defects.c,$(R3TEST_SRCS))
+
+R7FPTEST_SRCS := tests/test_r7_fp.c \
+	$(filter-out tests/test_r3_defects.c tests/stubs_signal.c,$(R3TEST_SRCS))
+
+test: check-line-limits
+	@mkdir -p $(BUILD)
+	$(HOST_CC) -std=c11 -Werror=vla -pedantic -Wall -Wextra -Werror -Isrc tests/check_abi_invariants.c -o $(BUILD)/check_abi_invariants
+	$(BUILD)/check_abi_invariants
+	$(HOST_CC) -std=c11 -Werror=vla -pedantic -Wall -Wextra -Werror -pthread -Isrc $(R3TEST_SRCS) -o $(BUILD)/test_r3_defects
+	$(BUILD)/test_r3_defects
+	$(HOST_CC) -std=c11 -Werror=vla -pedantic -Wall -Wextra -Werror -pthread -Isrc $(R7TEST_SRCS) -o $(BUILD)/test_r7_defects
+	$(BUILD)/test_r7_defects
+	$(HOST_CC) -std=c11 -Werror=vla -pedantic -Wall -Wextra -Werror -pthread -Isrc $(R7FPTEST_SRCS) -o $(BUILD)/test_r7_fp
+	$(BUILD)/test_r7_fp
 
 clean:
 	rm -rf $(BUILD)

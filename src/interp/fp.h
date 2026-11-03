@@ -41,9 +41,18 @@ int fp_cop1x(mips64_ctx_t *ctx, uint64_t cur_pc, const mips_dec_t *d);
 #define FP_DEFNAN_S 0x7FBFFFFFu
 #define FP_DEFNAN_D UINT64_C(0x7FF7FFFFFFFFFFFF)
 
-/* Nonzero iff the raw bits are a signalling NaN (fp.c): */
-int fp_issn_s(uint32_t u);
-int fp_issn_d(uint64_t u);
+/* FCSR flush-to-zero control bit (R7-15). */
+#define FP_FS_BIT 24u
+
+/* Default quiet NaN for the mode selected by ctx->nan2008 (R7-6):
+ * legacy 0x7FBFFFFF/0x7FF7FFFFFFFFFFFF, 2008 0x7FC00000/0x7FF8.... */
+uint32_t fp_defnan_s(const mips64_ctx_t *ctx);
+uint64_t fp_defnan_d(const mips64_ctx_t *ctx);
+
+/* Nonzero iff the raw bits are a signalling NaN under the selected
+ * NaN mode (fp.c): legacy quiet bit is clear, 2008 quiet bit is set. */
+int fp_issn_s(const mips64_ctx_t *ctx, uint32_t u);
+int fp_issn_d(const mips64_ctx_t *ctx, uint64_t u);
 
 /* Bit-cast and lane helpers shared by fp.c, fp_cvt.c and fp_ps.c: */
 uint64_t fp_d_bits(double x);
@@ -53,13 +62,21 @@ float fp_bits_f(uint32_t u);
 void fp_put_s(mips64_ctx_t *ctx, unsigned fd, uint32_t v);
 void fp_put_d(mips64_ctx_t *ctx, unsigned fd, uint64_t v);
 unsigned fp_rm(const mips64_ctx_t *ctx);
-float fp_adj_f(float r, long double q, unsigned rm);
+unsigned fp_get_cc(const mips64_ctx_t *ctx, unsigned cc);
+float fp_adj_f(const mips64_ctx_t *ctx, float r, long double q,
+    unsigned rm);
+float fp_sqrt_adj_f(const mips64_ctx_t *ctx, float r, float x,
+    unsigned rm);
+int fp_cmp_sign(double x);
 long double fp_rne_q(long double q);
 
 /* Set FCSR cause + sticky flag for exception e (FP_EXC_*), or arm an
  * enabled IEEE exception trap (SIGFPE) when FCSR enable bit (7 + e) is set. */
 void fp_raise(mips64_ctx_t *ctx, unsigned e);
 void fp_clear_trap(void);
+/* Start one arithmetic op (R7-12): clear trap state and replace the
+ * Cause field; sticky Flags commit at fp_finish_trap (R7-13). */
+void fp_begin_op(mips64_ctx_t *ctx);
 int32_t fp_fcsr_sicode(uint32_t fcsr);
 int fp_finish_trap(mips64_ctx_t *ctx, uint64_t cur_pc, unsigned fd,
     uint64_t saved_fpr, uint32_t saved_cc, int rc);
@@ -95,5 +112,9 @@ int fp_cvt_wl(mips64_ctx_t *ctx, const mips_dec_t *d, unsigned is_l);
 
 /* Paired-single + COP1X (defined in fp_ps.c): */
 int fp_ps_cop1(mips64_ctx_t *ctx, uint64_t cur_pc, const mips_dec_t *d);
+
+/* Conditional FPR moves MOVF/MOVT/MOVZ/MOVN .S/.D (fpmove.c, R7-18):
+ * FCC/GPR predicate, full lane copy, no arithmetic side effects. */
+int fp_cond_move(mips64_ctx_t *ctx, const mips_dec_t *d);
 
 #endif /* MIPS64RT_INTERP_FP_H */

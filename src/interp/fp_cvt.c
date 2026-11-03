@@ -115,14 +115,14 @@ int fp_cvt_sd(mips64_ctx_t *ctx, const mips_dec_t *d, unsigned is_s)
             float r = (float)x;
 
             if (isnan(x)) {
-                if (fp_issn_d(ctx->fpr[fs]) != 0) {
+                if (fp_issn_d(ctx, ctx->fpr[fs]) != 0) {
                     fp_raise(ctx, (unsigned)FP_EXC_V);
                 }
-                fp_put_s(ctx, fd, FP_DEFNAN_S);
+                fp_put_s(ctx, fd, fp_defnan_s(ctx));
                 return 0;
             }
             {
-                float rf = fp_adj_f(r, (long double)x, rm);
+                float rf = fp_adj_f(ctx, r, (long double)x, rm);
 
                 fp_put_s(ctx, fd, fp_f_bits(rf));
                 fp_inexact(ctx, (long double)rf, (long double)x);
@@ -135,10 +135,10 @@ int fp_cvt_sd(mips64_ctx_t *ctx, const mips_dec_t *d, unsigned is_s)
             float x = fp_bits_f((uint32_t)ctx->fpr[fs]);
 
             if (isnan(x)) {
-                if (fp_issn_s((uint32_t)ctx->fpr[fs]) != 0) {
+                if (fp_issn_s(ctx, (uint32_t)ctx->fpr[fs]) != 0) {
                     fp_raise(ctx, (unsigned)FP_EXC_V);
                 }
-                fp_put_d(ctx, fd, FP_DEFNAN_D);
+                fp_put_d(ctx, fd, fp_defnan_d(ctx));
                 return 0;
             }
             fp_put_d(ctx, fd, fp_d_bits((double)x));

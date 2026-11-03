@@ -60,7 +60,7 @@ unsigned fp_rm(const mips64_ctx_t *ctx)
     return ctx->fcsr & FP_RM_MASK;
 }
 
-static unsigned fp_get_cc(const mips64_ctx_t *ctx, unsigned cc)
+unsigned fp_get_cc(const mips64_ctx_t *ctx, unsigned cc)
 {
     if (cc == 0u) {
         return (ctx->fcsr >> FP_FCC0_BIT) & 1u;
@@ -83,29 +83,79 @@ static void fp_set_cc(mips64_ctx_t *ctx, unsigned cc, unsigned v)
     }
 }
 
-/* Legacy SNaN: all-ones exponent, nonzero mantissa, top bit set. */
-int fp_issn_s(uint32_t u)
+/* Default quiet NaN for the mode selected by ctx->nan2008 (R7-6):
+ * 2008 uses an all-ones fraction top bit (IEEE-2008 polarity). */
+uint32_t fp_defnan_s(const mips64_ctx_t *ctx)
 {
-    return ((u & 0x7F800000u) == 0x7F800000u) &&
-        ((u & 0x007FFFFFu) != 0u) && ((u & 0x00400000u) != 0u);
+    if (ctx != NULL && ctx->nan2008 != 0u) {
+        return 0x7FC00000u;
+    }
+    return FP_DEFNAN_S;
 }
 
-int fp_issn_d(uint64_t u)
+uint64_t fp_defnan_d(const mips64_ctx_t *ctx)
 {
-    return ((u & UINT64_C(0x7FF0000000000000)) ==
-            UINT64_C(0x7FF0000000000000)) &&
-        ((u & UINT64_C(0x000FFFFFFFFFFFFF)) != 0u) &&
-        ((u & UINT64_C(0x0008000000000000)) != 0u);
+    if (ctx != NULL && ctx->nan2008 != 0u) {
+        return UINT64_C(0x7FF8000000000000);
+    }
+    return FP_DEFNAN_D;
+}
+
+/* SNaN: all-ones exponent, nonzero mantissa. The quiet bit polarity
+ * follows ctx->nan2008 (R7-6): legacy sNaN has it set, 2008 clear. */
+int fp_issn_s(const mips64_ctx_t *ctx, uint32_t u)
+{
+    int quiet;
+
+    if (((u & 0x7F800000u) != 0x7F800000u) ||
+        ((u & 0x007FFFFFu) == 0u)) {
+        return 0;
+    }
+    quiet = (u & 0x00400000u) != 0u;
+    if (ctx != NULL && ctx->nan2008 != 0u) {
+        return quiet ? 0 : 1;
+    }
+    return quiet ? 1 : 0;
+}
+
+int fp_issn_d(const mips64_ctx_t *ctx, uint64_t u)
+{
+    int quiet;
+
+    if (((u & UINT64_C(0x7FF0000000000000)) !=
+         UINT64_C(0x7FF0000000000000)) ||
+        ((u & UINT64_C(0x000FFFFFFFFFFFFF)) == 0u)) {
+        return 0;
+    }
+    quiet = (u & UINT64_C(0x0008000000000000)) != 0u;
+    if (ctx != NULL && ctx->nan2008 != 0u) {
+        return quiet ? 0 : 1;
+    }
+    return quiet ? 1 : 0;
 }
 
 static _Thread_local int fp_trapped;
+static _Thread_local unsigned fp_pending;
 
 void fp_clear_trap(void)
 {
     fp_trapped = 0;
 }
 
-/* Set FCSR cause/flag for e; enabled traps defer to fp_finish_trap. */
+/* Start one arithmetic op (R7-12): Cause describes the latest op, so
+ * it is replaced here while sticky Flags stay cumulative (R7-13
+ * commits them at fp_finish_trap only when the op is untrapped). */
+void fp_begin_op(mips64_ctx_t *ctx)
+{
+    fp_clear_trap();
+    fp_pending = 0u;
+    if (ctx != NULL) {
+        ctx->fcsr &= ~(uint32_t)0x3F000u;
+    }
+}
+
+/* Set FCSR Cause for e now; Flags commit at fp_finish_trap (R7-13),
+ * so a trapped op (enabled) never modifies sticky Flags. */
 void fp_raise(mips64_ctx_t *ctx, unsigned e)
 {
     if (e > (unsigned)FP_EXC_V) {
@@ -115,7 +165,7 @@ void fp_raise(mips64_ctx_t *ctx, unsigned e)
     if ((ctx->fcsr & (1u << (7u + e))) != 0u) {
         fp_trapped = 1;
     } else {
-        ctx->fcsr |= (1u << (2u + e));
+        fp_pending |= 1u << e;
     }
 }
 
@@ -144,7 +194,12 @@ int32_t fp_fcsr_sicode(uint32_t fcsr)
 int fp_finish_trap(mips64_ctx_t *ctx, uint64_t cur_pc, unsigned fd,
                    uint64_t saved_fpr, uint32_t saved_cc, int rc)
 {
+    unsigned pend = fp_pending;
+    unsigned e;
+
+    fp_pending = 0u;
     if (rc == 0 && fp_trapped != 0) {
+        /* Trapped: restore destination/FCC, leave Flags untouched. */
         fp_trapped = 0;
         ctx->fpr[fd & 31u] = saved_fpr;
         ctx->fcsr = (ctx->fcsr & ~0xFE800000u) | (saved_cc & 0xFE800000u);
@@ -153,167 +208,18 @@ int fp_finish_trap(mips64_ctx_t *ctx, uint64_t cur_pc, unsigned fd,
             FP_RC_BRANCH : MIPS_FAULT;
     }
     fp_trapped = 0;
+    if (rc == 0) {
+        for (e = 0u; e <= (unsigned)FP_EXC_V; e++) {
+            if ((pend & (1u << e)) != 0u) {
+                ctx->fcsr |= (1u << (2u + e));
+            }
+        }
+    }
     return rc;
 }
 
-/* Single-precision O/U/I bits for rf vs exact q (R4-6 shared path). */
-unsigned fp_inexact_exc(mips64_ctx_t *ctx, long double rf, long double q)
-{
-    unsigned exc = 0u;
-
-    if (((isinf(rf) != 0) || (isinf((float)q) != 0)) &&
-        (isinf(q) == 0)) {
-        return (1u << (unsigned)FP_EXC_O) | (1u << (unsigned)FP_EXC_I);
-    }
-    if (q != 0.0L && fabsl(q) < (long double)FLT_MIN) {
-        if (rf != q ||
-            (ctx->fcsr & (1u << (7u + (unsigned)FP_EXC_U))) != 0u) {
-            exc |= 1u << (unsigned)FP_EXC_U;
-        }
-    }
-    if (rf != q) {
-        exc |= 1u << (unsigned)FP_EXC_I;
-    }
-    return exc;
-}
-
-/* Raise O/U/I for finished single result rf vs exact q. */
-void fp_inexact(mips64_ctx_t *ctx, long double rf, long double q)
-{
-    unsigned exc = fp_inexact_exc(ctx, rf, q);
-    unsigned e;
-
-    for (e = 0u; e <= (unsigned)FP_EXC_V; e++) {
-        if ((exc & (1u << e)) != 0u) {
-            fp_raise(ctx, e);
-        }
-    }
-}
-
-/* Directed binary64 rounding of RNE r by residual sign cmp. */
-double fp_round_d(mips64_ctx_t *ctx, double r, int cmp, unsigned rm)
-{
-    double rf = r;
-    int is_tiny;
-
-    if (!isfinite(r)) {
-        if (rm == 1u) {
-            rf = (r > 0.0) ? DBL_MAX : -DBL_MAX;
-        } else if (rm == 2u) {
-            rf = (r > 0.0) ? INFINITY : -DBL_MAX;
-        } else if (rm == 3u) {
-            rf = (r > 0.0) ? DBL_MAX : -INFINITY;
-        }
-        fp_raise(ctx, (unsigned)FP_EXC_O);
-        fp_raise(ctx, (unsigned)FP_EXC_I);
-        return rf;
-    }
-    if (cmp != 0) {
-        if (rm == 1u) {
-            if ((r > 0.0 && cmp < 0) || (r < 0.0 && cmp > 0)) {
-                rf = nextafter(r, 0.0);
-            }
-        } else if (rm == 2u) {
-            if (cmp > 0) {
-                rf = nextafter(r, INFINITY);
-            }
-        } else if (rm == 3u) {
-            if (cmp < 0) {
-                rf = nextafter(r, -INFINITY);
-            }
-        }
-    }
-    if (!isfinite(rf)) {
-        fp_raise(ctx, (unsigned)FP_EXC_O);
-        fp_raise(ctx, (unsigned)FP_EXC_I);
-        return rf;
-    }
-    is_tiny = (fabs(r) < DBL_MIN && (r != 0.0 || cmp != 0)) ||
-              (fabs(r) == DBL_MIN &&
-               ((r > 0.0 && cmp < 0) || (r < 0.0 && cmp > 0)));
-    if (is_tiny &&
-        (cmp != 0 ||
-         (ctx->fcsr & (1u << (7u + (unsigned)FP_EXC_U))) != 0u)) {
-        fp_raise(ctx, (unsigned)FP_EXC_U);
-    }
-    if (cmp != 0) {
-        fp_raise(ctx, (unsigned)FP_EXC_I);
-    }
-    return rf;
-}
-
-/* S write: low lane replaced, upper preserved (FR=1). */
-void fp_put_s(mips64_ctx_t *ctx, unsigned fd, uint32_t v)
-{
-    ctx->fpr[fd] = (ctx->fpr[fd] & UINT64_C(0xFFFFFFFF00000000)) | v;
-}
-
-void fp_put_d(mips64_ctx_t *ctx, unsigned fd, uint64_t v)
-{
-    ctx->fpr[fd] = v;
-}
-
-float fp_adj_f(float r, long double q, unsigned rm)
-{
-    long double lr;
-
-    if (rm == 0u) {
-        return r;
-    }
-    lr = (long double)r;
-    if (lr == q) {
-        return r;
-    }
-    switch (rm) {
-    case 1u:
-        return (fabsl(q) < fabsl(lr)) ? nextafterf(r, 0.0f) : r;
-    case 2u:
-        return (q > lr) ? nextafterf(r, INFINITY) : r;
-    default:
-        return (q < lr) ? nextafterf(r, -INFINITY) : r;
-    }
-}
-
-/* Directed sqrt fixup: r*r is exact in quad; compare vs x. */
-static float fp_sqrt_adj_f(float r, float x, unsigned rm)
-{
-    long double sq;
-
-    if (rm == 0u) {
-        return r;
-    }
-    sq = (long double)r * (long double)r;
-    if (rm == 2u) {
-        return (sq < (long double)x) ? nextafterf(r, INFINITY) : r;
-    }
-    return (sq > (long double)x) ? nextafterf(r, 0.0f) : r;
-}
-
-/* Round quad q to integer, ties to even. */
-long double fp_rne_q(long double q)
-{
-    long double lo = truncl(q);
-    long double d = q - lo;
-    long double ad = fabsl(d);
-    long double half;
-
-    if (ad < 0.5L) {
-        return lo;
-    }
-    if (ad > 0.5L) {
-        return lo + ((q > 0.0L) ? 1.0L : -1.0L);
-    }
-    half = lo * 0.5L;
-    if (half == truncl(half)) {
-        return lo;
-    }
-    return lo + ((q > 0.0L) ? 1.0L : -1.0L);
-}
-
-static int fp_cmp_sign(double x)
-{
-    return (x > 0.0) ? 1 : ((x < 0.0) ? -1 : 0);
-}
+/* Directed rounding, FCSR accounting, and lane writeback live in
+ * fp_round.c (split so every TU stays <= 900 lines). */
 
 /* S/D arithmetic core; unknown funct returns MIPS_FAULT. */
 static int fp_arith(mips64_ctx_t *ctx, const mips_dec_t *d, unsigned is_s)
@@ -324,8 +230,13 @@ static int fp_arith(mips64_ctx_t *ctx, const mips_dec_t *d, unsigned is_s)
     unsigned rm = fp_rm(ctx);
 
     if (!is_s) {
-        double a = fp_bits_d(ctx->fpr[fs]);
-        double b = fp_bits_d(ctx->fpr[ft]);
+        /* Snapshot sources before any writeback (R7-7): fd may alias
+         * fs/ft, and classification must see the inputs, not the
+         * default NaN just stored. */
+        uint64_t su = ctx->fpr[fs];
+        uint64_t tu = ctx->fpr[ft];
+        double a = fp_bits_d(su);
+        double b = fp_bits_d(tu);
         double r;
 
         switch (d->funct) {
@@ -340,14 +251,14 @@ static int fp_arith(mips64_ctx_t *ctx, const mips_dec_t *d, unsigned is_s)
             return 0;
         case 0x04u: /* SQRT.D */
             if (isnan(a)) {
-                fp_put_d(ctx, fd, FP_DEFNAN_D);
-                if (fp_issn_d(ctx->fpr[fs]) != 0) {
+                fp_put_d(ctx, fd, fp_defnan_d(ctx));
+                if (fp_issn_d(ctx, su) != 0) {
                     fp_raise(ctx, (unsigned)FP_EXC_V);
                 }
                 return 0;
             }
             if (a < 0.0) {
-                fp_put_d(ctx, fd, FP_DEFNAN_D);
+                fp_put_d(ctx, fd, fp_defnan_d(ctx));
                 fp_raise(ctx, (unsigned)FP_EXC_V);
                 return 0;
             }
@@ -379,9 +290,8 @@ static int fp_arith(mips64_ctx_t *ctx, const mips_dec_t *d, unsigned is_s)
             return MIPS_FAULT;
         }
         if (isnan(a) || isnan(b)) {
-            fp_put_d(ctx, fd, FP_DEFNAN_D);
-            if (fp_issn_d(ctx->fpr[fs]) != 0 ||
-                fp_issn_d(ctx->fpr[ft]) != 0) {
+            fp_put_d(ctx, fd, fp_defnan_d(ctx));
+            if (fp_issn_d(ctx, su) != 0 || fp_issn_d(ctx, tu) != 0) {
                 fp_raise(ctx, (unsigned)FP_EXC_V);
             }
             return 0;
@@ -391,7 +301,7 @@ static int fp_arith(mips64_ctx_t *ctx, const mips_dec_t *d, unsigned is_s)
 
             if (isinf(a) && isinf(bb) &&
                 ((signbit(a) != 0) != (signbit(bb) != 0))) {
-                fp_put_d(ctx, fd, FP_DEFNAN_D);
+                fp_put_d(ctx, fd, fp_defnan_d(ctx));
                 fp_raise(ctx, (unsigned)FP_EXC_V);
                 return 0;
             }
@@ -423,7 +333,7 @@ static int fp_arith(mips64_ctx_t *ctx, const mips_dec_t *d, unsigned is_s)
         }
         if (d->funct == 0x02u) {
             if ((a == 0.0 && isinf(b)) || (isinf(a) && b == 0.0)) {
-                fp_put_d(ctx, fd, FP_DEFNAN_D);
+                fp_put_d(ctx, fd, fp_defnan_d(ctx));
                 fp_raise(ctx, (unsigned)FP_EXC_V);
                 return 0;
             }
@@ -450,13 +360,18 @@ static int fp_arith(mips64_ctx_t *ctx, const mips_dec_t *d, unsigned is_s)
             }
         }
         if ((a == 0.0 && b == 0.0) || (isinf(a) && isinf(b))) {
-            fp_put_d(ctx, fd, FP_DEFNAN_D);
+            fp_put_d(ctx, fd, fp_defnan_d(ctx));
             fp_raise(ctx, (unsigned)FP_EXC_V);
             return 0;
         }
         if (b == 0.0) {
             int sx = (signbit(a) != 0) != (signbit(b) != 0);
 
+            /* R7-14: inf/0 is signed infinity, no DivideByZero. */
+            if (isinf(a)) {
+                fp_put_d(ctx, fd, fp_d_bits(sx ? -INFINITY : INFINITY));
+                return 0;
+            }
             fp_put_d(ctx, fd, fp_d_bits(sx ? -INFINITY : INFINITY));
             fp_raise(ctx, (unsigned)FP_EXC_Z);
             return 0;
@@ -487,8 +402,12 @@ static int fp_arith(mips64_ctx_t *ctx, const mips_dec_t *d, unsigned is_s)
         }
     }
     {
-        float a = fp_bits_f((uint32_t)ctx->fpr[fs]);
-        float b = fp_bits_f((uint32_t)ctx->fpr[ft]);
+        /* Snapshot sources before any writeback (R7-7): fd may alias
+         * fs/ft (e.g. SQRT.S $f0,$f0 must still see its sNaN). */
+        uint32_t su = (uint32_t)ctx->fpr[fs];
+        uint32_t tu = (uint32_t)ctx->fpr[ft];
+        float a = fp_bits_f(su);
+        float b = fp_bits_f(tu);
         float r;
         long double q;
 
@@ -504,20 +423,20 @@ static int fp_arith(mips64_ctx_t *ctx, const mips_dec_t *d, unsigned is_s)
             return 0;
         case 0x04u: /* SQRT.S */
             if (isnan(a)) {
-                fp_put_s(ctx, fd, FP_DEFNAN_S);
-                if (fp_issn_s((uint32_t)ctx->fpr[fs]) != 0) {
+                fp_put_s(ctx, fd, fp_defnan_s(ctx));
+                if (fp_issn_s(ctx, su) != 0) {
                     fp_raise(ctx, (unsigned)FP_EXC_V);
                 }
                 return 0;
             }
             if (a < 0.0f) {
-                fp_put_s(ctx, fd, FP_DEFNAN_S);
+                fp_put_s(ctx, fd, fp_defnan_s(ctx));
                 fp_raise(ctx, (unsigned)FP_EXC_V);
                 return 0;
             }
             r = sqrtf(a);
             {
-                float rf = fp_sqrt_adj_f(r, a, rm);
+                float rf = fp_sqrt_adj_f(ctx, r, a, rm);
 
                 fp_put_s(ctx, fd, fp_f_bits(rf));
                 if ((long double)rf * (long double)rf != (long double)a) {
@@ -534,9 +453,8 @@ static int fp_arith(mips64_ctx_t *ctx, const mips_dec_t *d, unsigned is_s)
             return MIPS_FAULT;
         }
         if (isnan(a) || isnan(b)) {
-            fp_put_s(ctx, fd, FP_DEFNAN_S);
-            if (fp_issn_s((uint32_t)ctx->fpr[fs]) != 0 ||
-                fp_issn_s((uint32_t)ctx->fpr[ft]) != 0) {
+            fp_put_s(ctx, fd, fp_defnan_s(ctx));
+            if (fp_issn_s(ctx, su) != 0 || fp_issn_s(ctx, tu) != 0) {
                 fp_raise(ctx, (unsigned)FP_EXC_V);
             }
             return 0;
@@ -545,7 +463,7 @@ static int fp_arith(mips64_ctx_t *ctx, const mips_dec_t *d, unsigned is_s)
         case 0x00u:
             if (isinf(a) && isinf(b) &&
                 ((signbit(a) != 0) != (signbit(b) != 0))) {
-                fp_put_s(ctx, fd, FP_DEFNAN_S);
+                fp_put_s(ctx, fd, fp_defnan_s(ctx));
                 fp_raise(ctx, (unsigned)FP_EXC_V);
                 return 0;
             }
@@ -555,7 +473,7 @@ static int fp_arith(mips64_ctx_t *ctx, const mips_dec_t *d, unsigned is_s)
         case 0x01u:
             if (isinf(a) && isinf(b) &&
                 ((signbit(a) != 0) == (signbit(b) != 0))) {
-                fp_put_s(ctx, fd, FP_DEFNAN_S);
+                fp_put_s(ctx, fd, fp_defnan_s(ctx));
                 fp_raise(ctx, (unsigned)FP_EXC_V);
                 return 0;
             }
@@ -564,7 +482,7 @@ static int fp_arith(mips64_ctx_t *ctx, const mips_dec_t *d, unsigned is_s)
             break;
         case 0x02u:
             if ((a == 0.0f && isinf(b)) || (isinf(a) && b == 0.0f)) {
-                fp_put_s(ctx, fd, FP_DEFNAN_S);
+                fp_put_s(ctx, fd, fp_defnan_s(ctx));
                 fp_raise(ctx, (unsigned)FP_EXC_V);
                 return 0;
             }
@@ -578,18 +496,29 @@ static int fp_arith(mips64_ctx_t *ctx, const mips_dec_t *d, unsigned is_s)
         }
         if (d->funct == 0x03u) {
             if ((a == 0.0f && b == 0.0f) || (isinf(a) && isinf(b))) {
-                fp_put_s(ctx, fd, FP_DEFNAN_S);
+                fp_put_s(ctx, fd, fp_defnan_s(ctx));
                 fp_raise(ctx, (unsigned)FP_EXC_V);
                 return 0;
             }
             if (b == 0.0f) {
                 int sx = (signbit(a) != 0) != (signbit(b) != 0);
 
+                /* R7-14: inf/0 is signed infinity, no DivideByZero. */
+                if (isinf(a)) {
+                    fp_put_s(ctx, fd,
+                        fp_f_bits(sx ? -INFINITY : INFINITY));
+                    return 0;
+                }
                 fp_put_s(ctx, fd, fp_f_bits(sx ? -INFINITY : INFINITY));
                 fp_raise(ctx, (unsigned)FP_EXC_Z);
                 return 0;
             }
             r = a / b;
+            if (a == 0.0f || isinf(a) || isinf(b)) {
+                /* R7-14: exact zero/infinity quotient, no residual. */
+                fp_put_s(ctx, fd, fp_f_bits(r));
+                return 0;
+            }
             {
                 long double m = (long double)r * (long double)b;
                 long double la = (long double)a;
@@ -654,7 +583,7 @@ static int fp_arith(mips64_ctx_t *ctx, const mips_dec_t *d, unsigned is_s)
             }
         }
         {
-            float rf = fp_adj_f(r, q, rm);
+            float rf = fp_adj_f(ctx, r, q, rm);
 
             fp_put_s(ctx, fd, fp_f_bits(rf));
             fp_inexact(ctx, (long double)rf, q);
@@ -697,6 +626,10 @@ static int fp_fmt_sd(mips64_ctx_t *ctx, const mips_dec_t *d)
     case FP_FN_CVT_W:
     case FP_FN_CVT_L:
         return fp_cvt_sd(ctx, d, d->rs == 0x10u);
+    case 0x11u: /* MOVF/MOVT: cc = rt>>2, tf = rt&1 (R7-18). */
+    case 0x12u: /* MOVZ: move when GPR[rt] == 0. */
+    case 0x13u: /* MOVN: move when GPR[rt] != 0. */
+        return fp_cond_move(ctx, d);
     default:
         break;
     }
@@ -715,8 +648,8 @@ static int fp_fmt_sd(mips64_ctx_t *ctx, const mips_dec_t *d)
             l = (a < b) ? 1u : 0u;
             e = (a == b) ? 1u : 0u;
             u = (isnan(a) || isnan(b)) ? 1u : 0u;
-            if ((u != 0u) && (fp_issn_s((uint32_t)ctx->fpr[d->rd]) != 0 ||
-                              fp_issn_s((uint32_t)ctx->fpr[d->rt]) != 0)) {
+            if ((u != 0u) && (fp_issn_s(ctx, (uint32_t)ctx->fpr[d->rd]) != 0 ||
+                              fp_issn_s(ctx, (uint32_t)ctx->fpr[d->rt]) != 0)) {
                 fp_raise(ctx, (unsigned)FP_EXC_V); /* SNaN R4-7 */
             }
         } else {
@@ -726,8 +659,8 @@ static int fp_fmt_sd(mips64_ctx_t *ctx, const mips_dec_t *d)
             l = (a < b) ? 1u : 0u;
             e = (a == b) ? 1u : 0u;
             u = (isnan(a) || isnan(b)) ? 1u : 0u;
-            if ((u != 0u) && (fp_issn_d(ctx->fpr[d->rd]) != 0 ||
-                              fp_issn_d(ctx->fpr[d->rt]) != 0)) {
+            if ((u != 0u) && (fp_issn_d(ctx, ctx->fpr[d->rd]) != 0 ||
+                              fp_issn_d(ctx, ctx->fpr[d->rt]) != 0)) {
                 fp_raise(ctx, (unsigned)FP_EXC_V);
             }
         }
@@ -813,6 +746,14 @@ static int fp_branch(mips64_ctx_t *ctx, uint64_t cur_pc, const mips_dec_t *d)
     ctx->pc = cur_pc + 4u;
     rc = interp_step(ctx);
     if (rc == 0) {
+        if (ctx->pc != cur_pc + 8u) {
+            /* R7-3: the slot redirected pc itself (a handled fault
+             * installed a signal frame, the dispatcher moved pc, or
+             * an inner control transfer won): keep it, like interp. */
+            ctx->in_delay_slot = 0;
+            ctx->next_pc = ctx->pc + 4u;
+            return FP_RC_BRANCH;
+        }
         ctx->in_delay_slot = 0;
         ctx->pc = taken ? target : cur_pc + 8u;
         ctx->next_pc = ctx->pc + 4u;
@@ -840,7 +781,7 @@ int fp_cop1(mips64_ctx_t *ctx, uint64_t cur_pc, const mips_dec_t *d)
     }
     saved_fpr = ctx->fpr[d->sa & 31u];
     saved_cc = ctx->fcsr & 0xFE800000u;
-    fp_clear_trap();
+    fp_begin_op(ctx);
     switch (d->rs) {
     case 0x01u: /* DMFC1: full 64-bit lane to GPR ($0 stays 0) */
         interp_set_reg(ctx, d->rt, ctx->fpr[d->rd]);

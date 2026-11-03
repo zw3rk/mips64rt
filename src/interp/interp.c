@@ -53,11 +53,23 @@ static int trap_at(mips64_ctx_t *ctx, int signo, uint64_t addr)
 
 static int trap_code(mips64_ctx_t *ctx, uint64_t addr, const mips_dec_t *d)
 {
-    unsigned bcode = ((unsigned)d->uimm >> 6u) & 0x3FFu;
-    int signo = (bcode == 6u || bcode == 7u) ? 8 : 5;
-    int32_t scode = (bcode == 6u) ? 2 : 1;
+    unsigned bcode;
 
-    return trap_at_code(ctx, signo, scode, addr);
+    if (d->funct == 0x0Du) {
+        /* BREAK carries a 20-bit code; GNU history puts the payload
+         * in bits 25:16 (R7-10: break 6/7 are SIGFPE, not SIGTRAP). */
+        unsigned hi = (d->word >> 16) & 0x3FFu;
+        unsigned lo = ((unsigned)d->uimm >> 6u) & 0x3FFu;
+        unsigned norm = (hi != 0u) ? hi : lo;
+
+        if (norm == 6u || norm == 7u) {
+            return trap_at_code(ctx, 8, (norm == 6u) ? 2 : 1, addr);
+        }
+        return trap_at_code(ctx, 5, 1, addr);
+    }
+    bcode = ((unsigned)d->uimm >> 6u) & 0x3FFu;
+    return trap_at_code(ctx, (bcode == 6u || bcode == 7u) ? 8 : 5,
+                        (bcode == 6u) ? 2 : 1, addr);
 }
 
 /* Shared COP1/COP1X result mapping: 1/2 = BC1 run-stop/pc-final. */
@@ -738,6 +750,7 @@ static int exec_branch(mips64_ctx_t *ctx, uint64_t pc, const mips_dec_t *d)
     int link = 0;
     int likely = 0;
     int taken = 0;
+    int defer_align = 0;
 
     switch (d->op) {
     case 0x02u: /* J */
@@ -784,12 +797,11 @@ static int exec_branch(mips64_ctx_t *ctx, uint64_t pc, const mips_dec_t *d)
             return trap_at(ctx, 4, pc);
         }
         break;
-    case 0x00u: /* JR / JALR */
+    case 0x00u: /* JR / JALR: the alignment exception fires when
+        * the target is fetched, after link + slot (R7-9). */
         taken = 1;
         target = rs;
-        if ((target & 3u) != 0u) {
-            return fault_at(ctx, target);
-        }
+        defer_align = 1;
         if (d->funct == 0x09u) {
             link = 1;
             link_rd = d->rd;
@@ -824,6 +836,11 @@ static int exec_branch(mips64_ctx_t *ctx, uint64_t pc, const mips_dec_t *d)
         }
         rc = exec_simple(ctx, pc + 4u, &s);
         if (rc == 0) {
+            if (defer_align != 0 && (target & 3u) != 0u) {
+                ctx->in_delay_slot = 0;
+                ctx->pc = target;
+                return fault_at(ctx, target);
+            }
             ctx->in_delay_slot = 0;
             ctx->pc = taken ? target : pc + 8u;
             ctx->next_pc = ctx->pc + 4u;

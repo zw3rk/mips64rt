@@ -125,19 +125,25 @@ static int is_regimm_trap(uint8_t rt)
 
 static int is_bc(uint8_t op, const mips_dec_t *d)
 {
-    if (op != MIPS64_OP_COP0 && op != MIPS64_OP_COP1) {
-        return 0;
-    }
     if (op == MIPS64_OP_COP0) {
         return d->rs == MIPS64_COP0_BC && d->rt <= MIPS64_BC_TL;
     }
-    return d->rs == MIPS64_COP1_BC && d->rt <= MIPS64_BC_TL;
+    if (op == MIPS64_OP_COP1) {
+        /* Any rt: bits 4:2 select FCC0-7, bits 1:0 the T/F + likely
+         * variant (R7-5: FCC1-7 are branches too). */
+        return d->rs == MIPS64_COP1_BC;
+    }
+    return 0;
 }
 
 static int is_bc_likely(uint8_t op, const mips_dec_t *d)
 {
     if (!is_bc(op, d)) {
         return 0;
+    }
+    if (op == MIPS64_OP_COP1) {
+        /* COP1 variant bit 1 selects likely (BC1FL/BC1TL). */
+        return (d->rt & 0x02u) != 0u;
     }
     return d->rt == MIPS64_BC_FL || d->rt == MIPS64_BC_TL;
 }
