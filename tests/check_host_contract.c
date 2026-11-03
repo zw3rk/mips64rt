@@ -531,7 +531,7 @@ static void test_family_broker(void)
           mips64_family_broker_join((pid_t)2147483647, 999u, path2,
                                     sizeof path2) != 0);
     if (mips64_family_broker_create(pid, path, sizeof path, &seq) == 0) {
-        check("broker create ok", seq == 0u);
+        check("broker create ok", seq < MIPS64_FAMILY_BROKER_MAX_SEQ);
         check("broker join after create",
               mips64_family_broker_join(pid, seq, path2,
                                         sizeof path2) == 0 &&

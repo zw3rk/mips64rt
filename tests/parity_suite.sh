@@ -125,7 +125,7 @@ run_unit() {
     if "$@" >"$OUT_DIR/u-$_ru_case.log" 2>&1; then
         _st="PASS"; _det="exit 0"
     else
-        _st="FAIL"; _det="exit $?"
+        _rc=$?; _st="FAIL"; _det="exit $_rc"
     fi
     parity_row "host" "$HOST_TAG" "$_ru_case" "host" "$_st" "$(( $(parity_now_ms) - _t0 ))" "$_det"
 }
