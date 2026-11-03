@@ -135,16 +135,6 @@ extern void mips_llsc_write_lock(void);
 extern void mips_llsc_write_unlock(void);
 extern void mips_qs_lease_enter(mips64_ctx_t *ctx);
 extern void mips_qs_lease_exit(mips64_ctx_t *ctx);
-#define G_SYNC_MAX 64U
-static _Thread_local uint64_t g_sync_va[G_SYNC_MAX], g_sync_len[G_SYNC_MAX];
-static _Thread_local unsigned g_sync_cnt;
-
-void mips_guest_range_flush(mips64_ctx_t *ctx)
-{
-    for (unsigned i = 0U; i < g_sync_cnt; i++)
-        mips_vm_file_shared_sync(ctx, g_sync_va[i], g_sync_len[i]);
-    g_sync_cnt = 0U;
-}
 
 /* Serialized syscall copyout (R3-1): the caller stages the output in
  * host memory first — never holding sc_lock across a blocking host
@@ -184,15 +174,9 @@ uint8_t *guest_range(mips64_ctx_t *ctx, uint64_t va, uint64_t len, int write)
         return (uint8_t *)mips64_guest_ptr(ctx, va);
     if (!mips_mem_ok(ctx, va, len, need))
         return NULL;
-    if (write != 0) {
-        mips_llsc_note_write(va, len);
-        mips_vm_pages_clear(va, len, (unsigned)MIPS_VM_PAGE_COW_CLEAN);
-        mips_vm_pages_retire_code(va, len);
-        if (g_sync_cnt >= G_SYNC_MAX)
-            mips_guest_range_flush(ctx);
-        g_sync_va[g_sync_cnt] = va;
-        g_sync_len[g_sync_cnt++] = len;
-    }
+    /* Read-only view: writes commit via mips_sc_copyout, which owns
+     * range validation, LL invalidation, COW clearing, code
+     * retirement, and shared-file sync. */
     return (uint8_t *)mips64_guest_ptr(ctx, va);
 }
 

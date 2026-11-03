@@ -377,7 +377,21 @@ static int u0_cover_rw(mips64_ctx_t *ctx, uint64_t page_va, void **host_out,
         return -1;
     *host_out = host;
     *len_out = (size_t)hlen;
-    *restore_out = u0_host_prot(u0_union_prot(halo, halo + hlen));
+    {
+        int restore = u0_host_prot(u0_union_prot(halo, halo + hlen));
+        uint64_t off;
+
+        /* Respect COW-clean / write-tracked pages: intersect with the
+         * per-page host prot so the cover restore cannot strip
+         * write-tracking protection. */
+        for (off = halo; off < halo + hlen; off += 4096u) {
+            int ip = mips_vm_inode_page_host_prot(off);
+
+            if (ip >= 0)
+                restore &= ip;
+        }
+        *restore_out = restore;
+    }
     return 0;
 }
 

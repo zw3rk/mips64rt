@@ -772,7 +772,12 @@ static int fp_fmt_sd(mips64_ctx_t *ctx, const mips_dec_t *d)
         if ((u != 0u) && ((cond & 8u) != 0u)) {
             fp_raise(ctx, (unsigned)FP_EXC_V);
         }
-        fp_set_cc(ctx, cc, res);
+        /* R4-7: an enabled Invalid trap leaves the FCC bit untouched;
+         * fp_finish_trap restores the saved CC and raises the guest
+         * trap instead of reporting the comparison result. */
+        if (fp_trapped == 0) {
+            fp_set_cc(ctx, cc, res);
+        }
         return 0;
     }
     return MIPS_FAULT;

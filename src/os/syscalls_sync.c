@@ -37,7 +37,6 @@ extern void mips_vm_file_post_write_seq(mips64_ctx_t *ctx, int fd,
                                         uint64_t n);
 extern void mips_vm_file_shared_sync(mips64_ctx_t *ctx, uint64_t va,
                                      uint64_t len);
-extern void mips_guest_range_flush(mips64_ctx_t *ctx);
 extern void mips_llsc_note_write(uint64_t addr, uint64_t size);
 extern void mips_llsc_write_lock(void);
 extern void mips_llsc_write_unlock(void);
@@ -115,58 +114,6 @@ int64_t mips_sc_futex(mips64_ctx_t *ctx, uint64_t uaddr, uint64_t op,
     return l2a_ret(ctx, 0);
 }
 
-/* Recorded guest signal mask (no delivery until Phase 4). The kernel
- * mask is 16 bytes on both ABIs, so other sigsetsizes are -EINVAL. */
-static uint64_t l2a_sigmask[2];
-
-int64_t mips_sc_rt_sigprocmask(mips64_ctx_t *ctx, uint64_t how,
-                               uint64_t set_va, uint64_t oldset_va,
-                               uint64_t sigsetsize)
-{
-    uint8_t *p;
-    int be;
-
-    if (sigsetsize != 16U) {
-        return l2a_ret(ctx, -(int64_t)EINVAL);
-    }
-    be = ctx->is_be != 0U;
-    if (set_va != 0U) {
-        uint64_t nw0;
-        uint64_t nw1;
-
-        p = guest_range(ctx, set_va, 16U, 0);
-        if (p == NULL) {
-            return l2a_ret(ctx, -(int64_t)EFAULT);
-        }
-        /* Opaque 16-byte record in guest byte order; Phase 4 splits
-         * it into words at delivery time. */
-        nw0 = getn(p, 8, be);
-        nw1 = getn(p + 8, 8, be);
-        if (how == (uint64_t)MIPS_SIG_BLOCK) {
-            l2a_sigmask[0] |= nw0;
-            l2a_sigmask[1] |= nw1;
-        } else if (how == (uint64_t)MIPS_SIG_UNBLOCK) {
-            l2a_sigmask[0] &= ~nw0;
-            l2a_sigmask[1] &= ~nw1;
-        } else if (how == (uint64_t)MIPS_SIG_SETMASK) {
-            l2a_sigmask[0] = nw0;
-            l2a_sigmask[1] = nw1;
-        } else {
-            return l2a_ret(ctx, -(int64_t)EINVAL);
-        }
-    }
-    if (oldset_va != 0U) {
-        uint8_t img[16];
-
-        putn(img, l2a_sigmask[0], 8, be);
-        putn(img + 8, l2a_sigmask[1], 8, be);
-        if (mips_sc_copyout(ctx, oldset_va, img, sizeof img) != 0) {
-            return l2a_ret(ctx, -(int64_t)EFAULT);
-        }
-    }
-    return l2a_ret(ctx, 0);
-}
-
 /* Robust lists are recorded in ctx, never installed on the host.
  * len is sizeof(struct robust_list_head): 24 on N64 (3x8), 12 on N32. */
 int64_t mips_sc_robust(mips64_ctx_t *ctx, int set, uint64_t a0, uint64_t a1,
@@ -206,15 +153,10 @@ int64_t mips_sc_robust(mips64_ctx_t *ctx, int set, uint64_t a0, uint64_t a1,
 static void l2a_commit_guest_write(mips64_ctx_t *ctx, uint64_t va,
                                    const uint8_t *src, uint64_t n)
 {
-    uint8_t *dst = (uint8_t *)mips64_guest_ptr(ctx, va);
-
-    mips_llsc_write_lock();
-    memcpy(dst, src, (size_t)n);
-    mips_llsc_note_write(va, n);
-    mips_llsc_write_unlock();
-    mips_vm_pages_clear(va, n, (unsigned)MIPS_VM_PAGE_COW_CLEAN);
-    mips_vm_pages_retire_code(va, n);
-    mips_vm_file_shared_sync(ctx, va, n);
+    /* Single shared commit path (R3-1): range validation, LL-bit
+     * clearing, LL reservation invalidation, COW clearing, code
+     * retirement, and shared-file sync live in mips_sc_copyout. */
+    (void)mips_sc_copyout(ctx, va, src, n);
 }
 
 static void l2a_vec_free(uint8_t **kbuf, uint64_t n)

@@ -416,8 +416,12 @@ int mips_mem_protect(mips64_ctx_t *ctx, uint64_t va, uint64_t len,
         return -EINVAL;
     }
     end = va + len;
-    if (mips_vm_file_has_shared(va, len) != 0) {
-        return -EINVAL;
+    {
+        long hps = sysconf(_SC_PAGESIZE);
+        uint64_t hm = (uint64_t)hps - 1u;
+        if (hps > 4096L && mips_vm_file_has_shared(va, len) != 0 &&
+            (((va & hm) != 0U) || ((len & hm) != 0U)))
+            return -EINVAL;
     }
     mips_qs_begin(ctx);
     mem_lock();

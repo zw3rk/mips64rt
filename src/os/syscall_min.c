@@ -44,9 +44,6 @@ extern int64_t mips_sc_getrandom(mips64_ctx_t *ctx, uint64_t buf_va,
 extern int64_t mips_sc_futex(mips64_ctx_t *ctx, uint64_t uaddr, uint64_t op,
                              uint64_t val, uint64_t timeout_va,
                              uint64_t uaddr2, uint64_t val3);
-extern int64_t mips_sc_rt_sigprocmask(mips64_ctx_t *ctx, uint64_t how,
-                                      uint64_t set_va, uint64_t oldset_va,
-                                      uint64_t sigsetsize);
 extern int64_t mips_sc_ioctl(mips64_ctx_t *ctx, uint64_t fd, uint64_t cmd,
                              uint64_t arg);
 extern int64_t mips_sc_lseek(mips64_ctx_t *ctx, uint64_t fd, uint64_t offset,
@@ -100,7 +97,6 @@ extern void mips_vm_file_map_hook(mips64_ctx_t *ctx, int fd, uint64_t va,
 extern void mips_vm_file_shared_sync(mips64_ctx_t *ctx, uint64_t va,
                                      uint64_t len);
 extern void mips_vm_file_reconcile(mips64_ctx_t *ctx);
-extern void mips_guest_range_flush(mips64_ctx_t *ctx);
 /* Phase 4 seams (lanes L4a/L4b/L4c). The (ctx, sp) signal seams read
  * their arguments from the guest registers; sp is reserved. */
 extern int64_t mips_sc_rt_sigaction(mips64_ctx_t *ctx, uint64_t sp);
@@ -868,7 +864,6 @@ int64_t mips_syscall(mips64_ctx_t *ctx)
     mips_qs_lease_enter(ctx);
     mips_vm_file_reconcile(ctx);
     rc = mips_syscall_inner(ctx);
-    mips_guest_range_flush(ctx);
     mips_qs_lease_exit(ctx);
     sc_deliver_pending(ctx);
     return rc;

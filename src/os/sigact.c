@@ -386,66 +386,70 @@ int64_t mips_sc_sigaltstack(mips64_ctx_t *ctx, uint64_t sp)
                sp - ctx->sigalt_sp <= ctx->sigalt_size;
     reported = ctx->sigalt_size == 0U ? L4A_SS_DISABLE :
                (on_stack ? L4A_SS_ONSTACK : 0U);
-    if (ss_va != 0U) {
-        const uint8_t *p = guest_range(ctx, ss_va, n32 ? 12U : 24U, 0);
-        uint64_t nsp;
-        uint64_t nsize;
-        uint32_t nflags;
-        uint32_t mode;
+    {
+        uint64_t old_sp = ctx->sigalt_sp;
+        uint64_t old_size = ctx->sigalt_size;
+        uint32_t old_flags = reported;
+        if (ss_va != 0U) {
+            const uint8_t *p = guest_range(ctx, ss_va, n32 ? 12U : 24U, 0);
+            uint64_t nsp;
+            uint64_t nsize;
+            uint32_t nflags;
+            uint32_t mode;
 
-        if (p == NULL) {
-            return l2a_ret(ctx, -(int64_t)EFAULT);
-        }
-        if (n32) {
-            nsp = getn(p, 4, be);
-            nsize = getn(p + 4, 4, be);
-            nflags = (uint32_t)getn(p + 8, 4, be);
-        } else {
-            nsp = getn(p, 8, be);
-            nsize = getn(p + 8, 8, be);
-            nflags = (uint32_t)getn(p + 16, 4, be);
-        }
-        if (on_stack) {
-            return l2a_ret(ctx, -(int64_t)EPERM);
-        }
-        mode = nflags & ~L4A_SS_AUTODISARM;
-        if (mode != 0U && mode != L4A_SS_ONSTACK &&
-            mode != L4A_SS_DISABLE) {
-            return l2a_ret(ctx, -(int64_t)EINVAL);
-        }
-        if (mode == L4A_SS_DISABLE) {
-            ctx->sigalt_sp = 0U;
-            ctx->sigalt_size = 0U;
-            ctx->sigalt_flags = nflags;
-        } else {
-            if (nsize < L4A_MINSIGSTKSZ) {
-                return l2a_ret(ctx, -(int64_t)ENOMEM);
+            if (p == NULL) {
+                return l2a_ret(ctx, -(int64_t)EFAULT);
             }
-            ctx->sigalt_sp = nsp;
-            ctx->sigalt_size = nsize;
-            ctx->sigalt_flags = nflags;
+            if (n32) {
+                nsp = getn(p, 4, be);
+                nsize = getn(p + 4, 4, be);
+                nflags = (uint32_t)getn(p + 8, 4, be);
+            } else {
+                nsp = getn(p, 8, be);
+                nsize = getn(p + 8, 8, be);
+                nflags = (uint32_t)getn(p + 16, 4, be);
+            }
+            if (on_stack) {
+                return l2a_ret(ctx, -(int64_t)EPERM);
+            }
+            mode = nflags & ~L4A_SS_AUTODISARM;
+            if (mode != 0U && mode != L4A_SS_ONSTACK &&
+                mode != L4A_SS_DISABLE) {
+                return l2a_ret(ctx, -(int64_t)EINVAL);
+            }
+            if (mode == L4A_SS_DISABLE) {
+                ctx->sigalt_sp = 0U;
+                ctx->sigalt_size = 0U;
+                ctx->sigalt_flags = nflags;
+            } else {
+                if (nsize < L4A_MINSIGSTKSZ) {
+                    return l2a_ret(ctx, -(int64_t)ENOMEM);
+                }
+                ctx->sigalt_sp = nsp;
+                ctx->sigalt_size = nsize;
+                ctx->sigalt_flags = nflags;
+            }
         }
-    }
-    if (oss_va != 0U) {
-        uint8_t img[24];
+        if (oss_va != 0U) {
+            uint8_t img[24];
 
-        if (n32) {
-            putn(img, ctx->sigalt_sp & UINT64_C(0xffffffff), 4, be);
-            putn(img + 4, ctx->sigalt_size & UINT64_C(0xffffffff), 4,
-                 be);
-            putn(img + 8, reported, 4, be);
-        } else {
-            putn(img, ctx->sigalt_sp, 8, be);
-            putn(img + 8, ctx->sigalt_size, 8, be);
-            putn(img + 16, reported, 4, be);
-            putn(img + 20, 0U, 4, be);
+            if (n32) {
+                putn(img, old_sp & UINT64_C(0xffffffff), 4, be);
+                putn(img + 4, old_size & UINT64_C(0xffffffff), 4, be);
+                putn(img + 8, old_flags, 4, be);
+            } else {
+                putn(img, old_sp, 8, be);
+                putn(img + 8, old_size, 8, be);
+                putn(img + 16, old_flags, 4, be);
+                putn(img + 20, 0U, 4, be);
+            }
+            /* Stage in host memory, commit under sc_lock (R3-1). */
+            if (mips_sc_copyout(ctx, oss_va, img, n32 ? 12U : 24U) != 0) {
+                return l2a_ret(ctx, -(int64_t)EFAULT);
+            }
         }
-        /* Stage in host memory, commit under sc_lock (R3-1). */
-        if (mips_sc_copyout(ctx, oss_va, img, n32 ? 12U : 24U) != 0) {
-            return l2a_ret(ctx, -(int64_t)EFAULT);
-        }
+        return l2a_ret(ctx, 0);
     }
-    return l2a_ret(ctx, 0);
 }
 
 /* Whether signo currently has a guest handler installed (consults the
