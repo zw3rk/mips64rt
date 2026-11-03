@@ -15,9 +15,9 @@
  *
  * Raw slot convention (matches Linux futex(2)): the timeout_va slot is
  * a guest timespec pointer for WAIT/WAIT_BITSET (NULL = infinite), is
- * ignored for WAKE/WAKE_BITSET/REQUEUE, and is an integer requeue count
- * for CMP_REQUEUE; val3 is the expected value for CMP_REQUEUE and the
- * bitset for WAIT_BITSET/WAKE_BITSET.
+ * ignored for WAKE/WAKE_BITSET, and is an integer requeue count for
+ * REQUEUE/CMP_REQUEUE; val3 is the expected value for CMP_REQUEUE and
+ * the bitset for WAIT_BITSET/WAKE_BITSET (ignored for REQUEUE).
  *
  * Limitation: N32 futex_time64 (64-bit timespec on the 32-bit-pointer
  * ABI) is out of scope for this seam; N32 reads the classic 8-byte
@@ -72,6 +72,37 @@ static uint64_t l4f_trunc_va(const mips64_ctx_t *ctx, uint64_t va)
         return va & UINT64_C(0xFFFFFFFF);
     }
     return va;
+}
+
+/* In-memory host representation of a guest futex word: a BE guest word
+ * is byte-swapped in host memory on this LE host, so the host futex
+ * comparison operand must be swapped while counts/bitsets pass through. */
+static uint32_t l4f_host_word(uint32_t v, int be)
+{
+    if (be != 0) {
+        return __builtin_bswap32(v);
+    }
+    return v;
+}
+
+/* Saturating time_t addition (clamps to TIME_T_MAX/MIN on overflow). */
+static time_t l4f_time_max(void)
+{
+    return (time_t)(((uint64_t)1 << (sizeof(time_t) * 8U - 1U)) - 1U);
+}
+
+static time_t l4f_sat_add(time_t a, time_t b)
+{
+    time_t mx = l4f_time_max();
+    time_t mn = (time_t)(-mx - 1);
+
+    if (b > 0 && a > mx - b) {
+        return mx;
+    }
+    if (b < 0 && a < mn - b) {
+        return mn;
+    }
+    return a + b;
 }
 
 /* Darwin futex table: __ulock_wait/__ulock_wake are private SPI
@@ -136,10 +167,11 @@ static void l4f_deadline(const struct timespec *rel_or_abs, int is_abs,
                          int realtime, struct timespec *out)
 {
     struct timespec now;
+    time_t mx = l4f_time_max();
 
     if (!is_abs) {
         (void)clock_gettime(CLOCK_REALTIME, &now);
-        out->tv_sec = now.tv_sec + rel_or_abs->tv_sec;
+        out->tv_sec = l4f_sat_add(now.tv_sec, rel_or_abs->tv_sec);
         out->tv_nsec = now.tv_nsec + rel_or_abs->tv_nsec;
     } else if (realtime) {
         *out = *rel_or_abs;
@@ -150,11 +182,13 @@ static void l4f_deadline(const struct timespec *rel_or_abs, int is_abs,
         out->tv_sec = rel_or_abs->tv_sec - mono.tv_sec;
         out->tv_nsec = rel_or_abs->tv_nsec - mono.tv_nsec;
         (void)clock_gettime(CLOCK_REALTIME, &now);
-        out->tv_sec += now.tv_sec;
+        out->tv_sec = l4f_sat_add(out->tv_sec, now.tv_sec);
         out->tv_nsec += now.tv_nsec;
     }
     while (out->tv_nsec >= 1000000000L) {
-        out->tv_sec++;
+        if (out->tv_sec < mx) {
+            out->tv_sec++;
+        }
         out->tv_nsec -= 1000000000L;
     }
     while (out->tv_nsec < 0L) {
@@ -264,10 +298,16 @@ static long l4f_darwin(uint32_t *uaddr, uint64_t va, int op, int val,
     }
     /* REQUEUE / CMP_REQUEUE degrade to wake-all on the source (the
      * guest protocol always re-waits, so moved waiters still make
-     * progress; see the table comment). */
-    if (check_exp && l4f_word_raw(uaddr) != expected) {
-        errno = EAGAIN;
-        return -1;
+     * progress; see the table comment). The expected word arrives as
+     * the guest logical value; compare against the in-memory host
+     * representation. */
+    if (check_exp) {
+        uint32_t exp_raw = l4f_host_word(expected, be);
+
+        if (l4f_word_raw(uaddr) != exp_raw) {
+            errno = EAGAIN;
+            return -1;
+        }
     }
     return l4f_darwin_wake(va, req_nr > 0 ? req_nr : INT_MAX);
 }
@@ -282,12 +322,15 @@ static void l4f_wait_deadline(const struct timespec *rel,
                               struct timespec *dl)
 {
     struct timespec now;
+    time_t mx = l4f_time_max();
 
     (void)clock_gettime(CLOCK_MONOTONIC, &now);
-    dl->tv_sec = now.tv_sec + rel->tv_sec;
+    dl->tv_sec = l4f_sat_add(now.tv_sec, rel->tv_sec);
     dl->tv_nsec = now.tv_nsec + rel->tv_nsec;
     while (dl->tv_nsec >= 1000000000L) {
-        dl->tv_sec++;
+        if (dl->tv_sec < mx) {
+            dl->tv_sec++;
+        }
         dl->tv_nsec -= 1000000000L;
     }
 }
@@ -445,10 +488,14 @@ int64_t mips_futex_op(mips64_ctx_t *ctx, uint64_t uaddr, uint64_t op,
          * relative FUTEX_WAIT uses one monotonic deadline sampled
          * before the loop; EINTR retries recompute the remaining
          * span from it (R4-5). Absolute WAIT_BITSET passes through. */
+        /* Host comparison uses the in-memory representation: swap the
+         * expected word on BE guests, keep bitset/count slots as-is. */
         mips_qs_lease_exit(ctx);
         if (base == L4F_WAIT && top != NULL) {
             struct timespec dl;
             struct timespec rem;
+            int exp = (int)l4f_host_word((uint32_t)val,
+                                         ctx->is_be != 0);
 
             l4f_wait_deadline(top, &dl);
             for (;;) {
@@ -457,14 +504,17 @@ int64_t mips_futex_op(mips64_ctx_t *ctx, uint64_t uaddr, uint64_t op,
                     rc = -1;
                     break;
                 }
-                rc = l4f_host(hp, hop, (int)(uint32_t)val, &rem,
+                rc = l4f_host(hp, hop, exp, &rem,
                               NULL, (uint32_t)val3);
                 if (rc >= 0 || errno != EINTR) {
                     break;
                 }
             }
         } else {
-            rc = l4f_host(hp, hop, (int)(uint32_t)val, top, NULL,
+            int exp = (int)l4f_host_word((uint32_t)val,
+                                         ctx->is_be != 0);
+
+            rc = l4f_host(hp, hop, exp, top, NULL,
                           (uint32_t)val3);
         }
         mips_qs_lease_enter(ctx);
@@ -510,23 +560,22 @@ int64_t mips_futex_op(mips64_ctx_t *ctx, uint64_t uaddr, uint64_t op,
         }
         return l2a_ret(ctx, (int64_t)rc);
     }
-    /* REQUEUE / CMP_REQUEUE: val is the wake count, val3 the requeue
-     * count (REQUEUE) or the expected word value (CMP_REQUEUE); the
-     * timeout slot carries the integer requeue count for CMP_REQUEUE
-     * (same slot the raw syscall reinterprets). */
+    /* REQUEUE / CMP_REQUEUE: val is the wake count, timeout_va the
+     * integer requeue count (4th syscall arg slot for both ops); val3
+     * is the expected word for CMP_REQUEUE (full uint32_t range) and
+     * is ignored for REQUEUE. */
     {
         uint32_t *hp2;
-        const struct timespec *nrq = NULL;
+        const struct timespec *nrq;
+#if defined(__linux__) && defined(SYS_futex)
+        uint32_t cmp_exp;
+#endif
 
-        if (val > (uint64_t)INT_MAX || val3 > (uint64_t)INT_MAX) {
+        if (val > (uint64_t)INT_MAX ||
+            timeout_va > (uint64_t)INT_MAX) {
             return l2a_ret(ctx, -(int64_t)EINVAL);
         }
-        if (base == L4F_CMP_REQUEUE) {
-            if (timeout_va > (uint64_t)INT_MAX) {
-                return l2a_ret(ctx, -(int64_t)EINVAL);
-            }
-            nrq = (const struct timespec *)(uintptr_t)timeout_va;
-        }
+        nrq = (const struct timespec *)(uintptr_t)timeout_va;
         if ((uaddr2 & 3U) != 0U) {
             return l2a_ret(ctx, -(int64_t)EINVAL);
         }
@@ -535,19 +584,18 @@ int64_t mips_futex_op(mips64_ctx_t *ctx, uint64_t uaddr, uint64_t op,
         }
         hp2 = (uint32_t *)mips64_guest_ptr(ctx, uaddr2);
 #if defined(__linux__) && defined(SYS_futex)
+        cmp_exp = l4f_host_word((uint32_t)val3, ctx->is_be != 0);
         rc = l4f_host(hp, hop, (int)(uint32_t)val, nrq, hp2,
-                      (uint32_t)val3);
+                      base == L4F_CMP_REQUEUE ? cmp_exp : 0U);
 #else
         /* REQUEUE/CMP_REQUEUE degrade to wake-all on the source;
-         * req_nr is val3 (REQUEUE) or the integer timeout_va slot
-         * (CMP_REQUEUE, already range-checked); CMP_REQUEUE also
-         * checks the expected word. */
+         * req_nr is the integer timeout_va slot for both ops;
+         * CMP_REQUEUE also checks the expected word. */
         (void)nrq;
         rc = l4f_darwin(hp, uaddr, hop, (int)(uint32_t)val,
                         ctx->is_be != 0, NULL, 0,
                         0, hp2, uaddr2,
-                        base == L4F_CMP_REQUEUE ? (int)(uint32_t)timeout_va :
-                                                  (int)(uint32_t)val3,
+                        (int)(uint32_t)timeout_va,
                         base == L4F_CMP_REQUEUE ? 1 : 0,
                         (uint32_t)val3);
 #endif

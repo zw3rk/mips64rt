@@ -294,8 +294,11 @@ static int64_t l4b_clone_thread(mips64_ctx_t *ctx, uint64_t flags,
     if (stack_va == 0U || stack_va > ctx->task_size) {
         return l2a_ret(ctx, -(int64_t)EINVAL);
     }
-    if (l4b_check_tid(ctx, parent_tid_va) != 0 ||
-        l4b_check_tid(ctx, child_tid_va) != 0) {
+    if (((flags & L4B_CLONE_PARENT_SETTID) != 0U &&
+         l4b_check_tid(ctx, parent_tid_va) != 0) ||
+        ((flags & (L4B_CLONE_CHILD_SETTID | L4B_CLONE_CHILD_CLEARTID)) !=
+             0U &&
+         l4b_check_tid(ctx, child_tid_va) != 0)) {
         return l2a_ret(ctx, -(int64_t)EFAULT);
     }
     child = (mips64_ctx_t *)malloc(sizeof *child);
@@ -392,13 +395,16 @@ static int64_t l4b_clone_thread(mips64_ctx_t *ctx, uint64_t flags,
  * touches the thread table lock (the lock state is undefined in the
  * child when other threads exist). */
 static int64_t l4b_clone_fork(mips64_ctx_t *ctx, uint64_t flags,
-                               uint64_t parent_tid_va,
-                               uint64_t child_tid_va)
+                               uint64_t stack_va, uint64_t parent_tid_va,
+                               uint64_t tls_va, uint64_t child_tid_va)
 {
     pid_t pid;
 
-    if (l4b_check_tid(ctx, parent_tid_va) != 0 ||
-        l4b_check_tid(ctx, child_tid_va) != 0) {
+    if (((flags & L4B_CLONE_PARENT_SETTID) != 0U &&
+         l4b_check_tid(ctx, parent_tid_va) != 0) ||
+        ((flags & (L4B_CLONE_CHILD_SETTID | L4B_CLONE_CHILD_CLEARTID)) !=
+             0U &&
+         l4b_check_tid(ctx, child_tid_va) != 0)) {
         return l2a_ret(ctx, -(int64_t)EFAULT);
     }
     pid = fork();
@@ -412,6 +418,12 @@ static int64_t l4b_clone_fork(mips64_ctx_t *ctx, uint64_t flags,
         ctx->is_thread_clone = false;
         ctx->host_tid = 0;
         mips_threads_atfork_child(ctx);
+        if (stack_va != 0U) {
+            ctx->gpr[29] = stack_va;
+        }
+        if ((flags & L4B_CLONE_SETTLS) != 0U) {
+            ctx->ulr = tls_va;
+        }
         if ((flags & L4B_CLONE_CHILD_CLEARTID) != 0U) {
             ctx->clear_child_tid = child_tid_va;
         }
@@ -459,7 +471,8 @@ int64_t mips_clone_full(mips64_ctx_t *ctx, uint64_t flags,
          * sc_clone share mask). */
         return l2a_ret(ctx, -(int64_t)ENOSYS);
     }
-    return l4b_clone_fork(ctx, flags, parent_tid_va, child_tid_va);
+    return l4b_clone_fork(ctx, flags, stack_va, parent_tid_va, tls_va,
+                           child_tid_va);
 }
 
 /* Live thread-group workers (R5: leader raw exit waits). */
@@ -546,10 +559,9 @@ static _Thread_local int l4b_fault_sig = 0;
 static _Thread_local uint64_t l4b_fault_addr = 0U;
 /* In-handler capture of the faulting host pc (integer only; the
  * site-table resolve runs after the longjmp, outside signal
- * context). The ctx is stashed by mips_hostfault_run so the guard
- * can report the precise guest pc through the scratch slot. */
+ * context). mips_hostfault_run resolves the captured host pc to the
+ * faulting guest pc via dbt_host_pc_to_guest. */
 static _Thread_local uint64_t l4b_fault_host_pc = 0U;
-static _Thread_local mips64_ctx_t *l4b_ctx = NULL;
 
 /* Faulting host pc from the machine context (AArch64 only; 0
  * elsewhere, which disables site resolution on those hosts). */
@@ -684,18 +696,15 @@ int mips_hostfault_run(mips64_ctx_t *ctx, void *code, uint32_t *reasonp)
     l4b_fault_sig = 0;
     l4b_fault_addr = 0U;
     l4b_fault_host_pc = 0U;
-    l4b_ctx = ctx;
     if (_setjmp(l4b_jb) == 0) {
         fn(ctx);
         l4b_armed = 0;
-        l4b_ctx = NULL;
         if (reasonp != NULL) {
             *reasonp = ctx->exit_reason;
         }
         return 0;
     }
     l4b_armed = 0;
-    l4b_ctx = NULL;
     (void)l4b_fault_sig;
     ctx->llbit = 0U;
     ctx->exit_reason = MIPS64_EXIT_FAULT;
