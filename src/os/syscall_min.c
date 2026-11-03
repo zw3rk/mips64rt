@@ -134,6 +134,8 @@ extern int mips_mem_map(mips64_ctx_t *ctx, uint64_t va, uint64_t len,
                         uint32_t prot, const char *tag);
 extern int mips_mem_map_replace(mips64_ctx_t *ctx, uint64_t va, uint64_t len,
                                 uint32_t prot, const char *tag);
+extern int mips_mem_map_shared(mips64_ctx_t *ctx, uint64_t va, uint64_t len, uint32_t prot, const char *tag);
+extern int mips_mem_map_replace_shared(mips64_ctx_t *ctx, uint64_t va, uint64_t len, uint32_t prot, const char *tag);
 extern int mips_mem_unmap(mips64_ctx_t *ctx, uint64_t va, uint64_t len);
 extern int mips_mem_protect(mips64_ctx_t *ctx, uint64_t va, uint64_t len,
                             uint32_t prot);
@@ -292,9 +294,14 @@ static int64_t sc_mmap(mips64_ctx_t *ctx, uint64_t addr, uint64_t len,
     uint64_t va;
     uint8_t *fbuf = NULL;
     int rc;
-    int anon;
+    int anon, shared;
 
     if (len == 0U || (prot & ~(uint64_t)7U) != 0U) {
+        return sc_ret(ctx, -(int64_t)EINVAL);
+    }
+    if ((flags & (MIPS_MAP_SHARED | MIPS_MAP_PRIVATE)) == 0U ||
+        (flags & (MIPS_MAP_SHARED | MIPS_MAP_PRIVATE)) ==
+            (MIPS_MAP_SHARED | MIPS_MAP_PRIVATE)) {
         return sc_ret(ctx, -(int64_t)EINVAL);
     }
     size = (len + (MIPS64_PAGE_SIZE - 1U)) & MIPS64_PAGE_MASK;
@@ -302,6 +309,7 @@ static int64_t sc_mmap(mips64_ctx_t *ctx, uint64_t addr, uint64_t len,
         return sc_ret(ctx, -(int64_t)ENOMEM);
     }
     anon = (flags & (MIPS_MAP_ANONYMOUS | MIPS_MAP_ANON_O32)) != 0U;
+    shared = (anon != 0 && (flags & MIPS_MAP_SHARED) != 0U) ? 1 : 0;
     if (!anon && (offset & (MIPS64_PAGE_SIZE - 1U)) != 0U) {
         return sc_ret(ctx, -(int64_t)EINVAL);
     }
@@ -310,7 +318,7 @@ static int64_t sc_mmap(mips64_ctx_t *ctx, uint64_t addr, uint64_t len,
             addr + size < addr || addr + size > ctx->task_size) {
             return sc_ret(ctx, -(int64_t)EINVAL);
         }
-        if ((flags & MIPS_MAP_FIXED) == 0U &&
+        if ((flags & MIPS_MAP_FIXED_NOREPLACE) != 0U &&
             (mips_mem_ok(ctx, addr, 1U, 0U) ||
              hole_from(ctx, addr, size) != addr)) {
             return sc_ret(ctx, -(int64_t)EEXIST);
@@ -343,29 +351,25 @@ static int64_t sc_mmap(mips64_ctx_t *ctx, uint64_t addr, uint64_t len,
             left -= (uint64_t)got;
         }
     }
-    if ((flags & MIPS_MAP_FIXED) != 0U) {
+    if ((flags & MIPS_MAP_FIXED_NOREPLACE) != 0U) {
         va = addr;
-        rc = mips_mem_map_replace(ctx, va, size, (uint32_t)(prot & 7U), "map");
+        rc = shared != 0 ? mips_mem_map_shared(ctx, va, size, (uint32_t)(prot & 7U), "map") : mips_mem_map(ctx, va, size, (uint32_t)(prot & 7U), "map");
+    } else if ((flags & MIPS_MAP_FIXED) != 0U) {
+        va = addr;
+        rc = shared != 0 ? mips_mem_map_replace_shared(ctx, va, size, (uint32_t)(prot & 7U), "map") : mips_mem_map_replace(ctx, va, size, (uint32_t)(prot & 7U), "map");
         if (rc == -ENOMEM &&
             sysconf(_SC_PAGESIZE) > (long)MIPS64_PAGE_SIZE) {
-            /* Big-host fallback: the fixed mmap above only fails
-             * for 4 KiB-granular ranges inside a 16 KiB host page.
-             * Unmap retires the covered regions, map re-adds with
-             * RW cover (a second quiescence section; FIXED maps
-             * are rare and the fast path stays atomic). */
+            /* Big-host fallback: the fixed mmap above only fails for 4
+             * KiB-granular ranges inside a 16 KiB host page; unmap then
+             * re-adds the range (a second quiescence section). */
             rc = mips_mem_unmap(ctx, va, size);
             if (rc == 0) {
-                rc = mips_mem_map(ctx, va, size, (uint32_t)(prot & 7U),
-                                  "map");
+                rc = shared != 0 ? mips_mem_map_shared(ctx, va, size, (uint32_t)(prot & 7U), "map") : mips_mem_map(ctx, va, size, (uint32_t)(prot & 7U), "map");
             }
         }
-    } else if ((flags & MIPS_MAP_FIXED_NOREPLACE) != 0U) {
-        va = addr;
-        rc = mips_mem_map(ctx, va, size, (uint32_t)(prot & 7U), "map");
     } else {
         va = pick_hole(ctx, addr, size);
-        rc = va == 0U ? -ENOMEM :
-             mips_mem_map(ctx, va, size, (uint32_t)(prot & 7U), "map");
+        rc = va == 0U ? -ENOMEM : (shared != 0 ? mips_mem_map_shared(ctx, va, size, (uint32_t)(prot & 7U), "map") : mips_mem_map(ctx, va, size, (uint32_t)(prot & 7U), "map"));
     }
     if (rc != 0) {
         free(fbuf);
@@ -420,6 +424,7 @@ static int64_t sc_uname(mips64_ctx_t *ctx, uint64_t va)
     mips_llsc_note_write(va, MIPS_UTS_SIZE);
     mips_llsc_write_unlock();
     mips_vm_pages_clear(va, MIPS_UTS_SIZE, (unsigned)MIPS_VM_PAGE_COW_CLEAN);
+    mips_vm_pages_retire_code(va, MIPS_UTS_SIZE);
     mips_vm_file_shared_sync(ctx, va, MIPS_UTS_SIZE);
     return sc_ret(ctx, 0);
 }
@@ -434,9 +439,10 @@ static int64_t sc_close(mips64_ctx_t *ctx, uint64_t fd)
     return sc_ret(ctx, 0);
 }
 
-/* Plain fork(): every guest mapping is MAP_PRIVATE (COW), so host
- * fork() diverges parent and child with no extra work. Full clone(2)
- * (thread sharing included) is lane L4b's mips_clone_full. */
+/* Plain fork(): private guest mappings are MAP_PRIVATE (COW) while
+ * MAP_SHARED|MAP_ANONYMOUS keeps host MAP_SHARED backing, so host
+ * fork() diverges the former and preserves sharing in the latter.
+ * Full clone(2) (thread sharing included) is lane L4b's mips_clone_full. */
 static int64_t sc_fork(mips64_ctx_t *ctx)
 {
     pid_t pid = fork();

@@ -27,17 +27,28 @@ static uint8_t fetch_window[0x3000];
 
 /*
  * Point the Phase 1 reservation at the scratch buffer (see NOTE above):
- * region_count stays 0 so mips_fetch applies only the TASK_SIZE bound
- * here, through the real guest_mem_init from src/os/mem.c.
+ * the window is recorded as one mapped region so mips_fetch applies
+ * the EXEC cover check against it, through the real guest_mem_init
+ * from src/os/mem.c.
  */
 static void use_scratch_window(mips64_ctx_t *ctx)
 {
+    mips64_region_t cover;
+
     if (guest_mem_init(ctx) != 0) {
         printf("FAIL fetch: guest_mem_init failed\n");
         return;
     }
     ctx->guest_base = (uint64_t)(uintptr_t)fetch_window;
+    /* R9-4: an emptied table denies fetch, so record the scratch
+     * window (no host mapping is touched; fetch reads the window
+     * through guest_base). */
     mips_mem_reset();
+    memset(&cover, 0, sizeof cover);
+    cover.start = 0U;
+    cover.end = sizeof fetch_window;
+    cover.prot = MIPS_PROT_READ | MIPS_PROT_EXEC;
+    mips_mem_restore(&cover, 1U);
 }
 
 typedef struct {
@@ -454,6 +465,12 @@ static void check_fetch_regions(mips64_ctx_t *ctx)
         failures++;
     }
     mips_mem_reset();
+    /* R9-4: an emptied address space denies fetch (guest SIGSEGV
+     * downstream) instead of faulting the host. */
+    if (mips_fetch(ctx, 0x1000U, &word) != MIPS_FAULT) {
+        printf("FAIL fetch-region: emptied table 0x1000 did not fault\n");
+        failures++;
+    }
 }
 
 int main(void)

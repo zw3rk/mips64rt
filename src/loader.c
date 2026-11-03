@@ -829,7 +829,8 @@ int mips_load_elf(mips64_ctx_t *ctx, const char *path,
             errno = e;
             return -1;
         }
-        if (parse_ehdr(ifd, &ieh) != 0 || classify(&ieh) != kind) {
+        if (parse_ehdr(ifd, &ieh) != 0 || classify(&ieh) != kind ||
+            ieh.be != eh.be) {
             close(ifd);
             close(fd);
             errno = ENOEXEC;

@@ -339,27 +339,6 @@ void vm_inode_note_resize_locked(vm_inode_t *in, uint64_t newsize,
 
 static _Thread_local int vm_inode_internal_prot;
 
-static int vm_inode_apply_region_prots(mips64_ctx_t *ctx, uint64_t span_lo,
-                                       uint64_t span_hi)
-{
-    size_t n = mips_mem_region_count(), i;
-
-    for (i = 0u; i < n; i++) {
-        uint64_t rs = 0u, re = 0u, lo, hi;
-        uint32_t rprot = 0u;
-
-        if (mips_mem_region_at(i, &rs, &re, &rprot) != 0)
-            break;
-        lo = rs > span_lo ? rs : span_lo;
-        hi = re < span_hi ? re : span_hi;
-        if (lo < hi &&
-            mprotect((void *)(uintptr_t)(ctx->guest_base + lo),
-                     (size_t)(hi - lo), u0f_host_prot(rprot)) != 0)
-            return -1;
-    }
-    return 0;
-}
-
 /* Split the self-owned record straddling split_va (R4-4). Capacity
  * and the replacement descriptor are reserved BEFORE the stored
  * record is mutated; on exhaustion or dup failure the existing record
@@ -770,8 +749,11 @@ void vm_inode_post_truncate_locked(mips64_ctx_t *ctx, vm_inode_t *in,
 }
 
 
+/* R9-5: prot restore over a pre-lock snapshot (mem_lock is never
+ * taken under vm_lock here; see vm_file_int.h). */
 static void vm_inode_restore_slice(mips64_ctx_t *ctx, const vm_inode_map_t *m,
-                                   uint64_t slo, uint64_t shi)
+                                   uint64_t slo, uint64_t shi,
+                                   const mips_vm_prot_t *snap, size_t n)
 {
     uint64_t hmask = (uint64_t)u0f_page_size() - 1u;
     uint64_t alo = slo & ~hmask, ahi = (shi + hmask) & ~hmask;
@@ -781,7 +763,7 @@ static void vm_inode_restore_slice(mips64_ctx_t *ctx, const vm_inode_map_t *m,
         (void)mmap((void *)(uintptr_t)(ctx->guest_base + lo), (size_t)(hi - lo),
                    u0f_host_prot(m->prot), MAP_SHARED | MAP_FIXED, m->fd_dup,
                    (off_t)(m->file_offset + (lo - m->va)));
-        (void)vm_inode_apply_region_prots(ctx, lo, hi);
+        (void)mips_vm_prot_apply(ctx, lo, hi, snap, n);
     }
 }
 
@@ -791,6 +773,8 @@ void mips_vm_file_restore(mips64_ctx_t *ctx, uint64_t va1, uint64_t len1,
     vm_inode_t *tab;
     pid_t self = getpid();
     size_t k;
+    mips_vm_prot_t snap[MIPS64_MAX_REGIONS];
+    size_t n = mips_vm_prot_snapshot(snap, MIPS64_MAX_REGIONS);
     if (ctx == NULL || !vm_inode_table_tried || vm_inode_table_ptr == NULL)
         return;
     vm_lock();
@@ -801,9 +785,9 @@ void mips_vm_file_restore(mips64_ctx_t *ctx, uint64_t va1, uint64_t len1,
         for (i = 0; in->used != 0 && i < in->nmaps; i++) {
             vm_inode_map_t *m = &in->maps[i];
             if (m->pid == self && len1 > 0u)
-                vm_inode_restore_slice(ctx, m, va1, va1 + len1);
+                vm_inode_restore_slice(ctx, m, va1, va1 + len1, snap, n);
             if (m->pid == self && len2 > 0u)
-                vm_inode_restore_slice(ctx, m, va2, va2 + len2);
+                vm_inode_restore_slice(ctx, m, va2, va2 + len2, snap, n);
         }
     }
     vm_unlock();
@@ -818,12 +802,18 @@ void mips_vm_file_remap_hook(mips64_ctx_t *ctx, uint64_t old_va,
     uint64_t hmask = (uint64_t)u0f_page_size() - 1u;
     pid_t self = getpid();
     size_t k;
+    mips_vm_prot_t snap[MIPS64_MAX_REGIONS];
+    size_t n;
     if (ctx == NULL || !vm_inode_table_tried || vm_inode_table_ptr == NULL)
         return;
     if (dst_va != old_va)
         mips_vm_file_unmap_hook(dst_va, new_size);
     if (new_size < old_size)
         mips_vm_file_unmap_hook(old_va + new_size, old_size - new_size);
+    /* R9-5: snapshot region prots before vm_lock; the in-loop apply
+     * below then restores host prots without taking mem_lock, so the
+     * moving-mremap (mem->vm) order is never inverted. */
+    n = mips_vm_prot_snapshot(snap, MIPS64_MAX_REGIONS);
     vm_lock();
     tab = vm_inode_table_ptr;
     for (k = 0u; k < VM_INODE_MAX; k++) {
@@ -856,7 +846,8 @@ void mips_vm_file_remap_hook(mips64_ctx_t *ctx, uint64_t old_va,
                       (size_t)m->len, u0f_host_prot(m->prot),
                       MAP_SHARED | MAP_FIXED, m->fd_dup,
                       (off_t)m->file_offset) == MAP_FAILED ||
-                 vm_inode_apply_region_prots(ctx, m->va, m->va + m->len) != 0)) {
+                 mips_vm_prot_apply(ctx, m->va, m->va + m->len,
+                                    snap, n) != 0)) {
                 m->native = 0;
                 if (m->shared != 0)
                     vm_has_shared_fallback = 1;

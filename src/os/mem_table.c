@@ -92,9 +92,14 @@ __attribute__((weak)) void mips_qs_abort(mips64_ctx_t *ctx) { (void)ctx; }
 __attribute__((weak)) int mips_qs_has_peers(void) { return 0; }
 __attribute__((weak)) void mips_vm_file_unmap_hook(uint64_t va, uint64_t len) { (void)va; (void)len; }
 __attribute__((weak)) void mips_vm_file_protect_hook(uint64_t va, uint64_t len, uint32_t prot) { (void)va; (void)len; (void)prot; }
-__attribute__((weak)) int mips_vm_file_read_page(mips64_ctx_t *ctx,
+__attribute__((weak)) void *mips_vm_file_snapshot_spans(mips64_ctx_t *ctx,
+    uint64_t va1, uint64_t len1, uint64_t va2, uint64_t len2)
+{ (void)ctx; (void)va1; (void)len1; (void)va2; (void)len2; return NULL; }
+__attribute__((weak)) int mips_vm_file_snapshot_fetch(const void *snap,
     uint64_t page_va, uint8_t *out_page)
-{ (void)ctx; (void)page_va; (void)out_page; return 0; }
+{ (void)snap; (void)page_va; (void)out_page; return 0; }
+__attribute__((weak)) void mips_vm_file_snapshot_free(void *snap)
+{ (void)snap; }
 __attribute__((weak)) void mips_vm_file_restore(mips64_ctx_t *ctx,
     uint64_t va1, uint64_t len1, uint64_t va2, uint64_t len2)
 { (void)ctx; (void)va1; (void)len1; (void)va2; (void)len2; }
@@ -213,9 +218,22 @@ int mips_mem_ok(const mips64_ctx_t *ctx, uint64_t va, uint64_t len,
     return ok;
 }
 
+/* Region flag: host MAP_SHARED backing (MAP_SHARED|MAP_ANONYMOUS),
+ * so host fork() preserves sharing instead of COW-diverging. */
+#define MIPS_REGION_SHARED 1U
+
+/* Mark covered regions shared; caller holds mem_lock. */
+static void mark_shared(uint64_t va, uint64_t len)
+{
+    size_t i;
+    for (i = 0U; i < g_region_count; i++)
+        if (g_regions[i].start >= va && g_regions[i].end <= va + len)
+            g_regions[i].flags |= MIPS_REGION_SHARED;
+}
+
 /* Map [va, va+len); host EXEC stripped. Returns 0/-errno. */
-int mips_mem_map(mips64_ctx_t *ctx, uint64_t va, uint64_t len, uint32_t prot,
-                 const char *tag)
+static int map_inner(mips64_ctx_t *ctx, uint64_t va, uint64_t len,
+                     uint32_t prot, const char *tag, int shared)
 {
     void *got;
     size_t i;
@@ -246,7 +264,7 @@ int mips_mem_map(mips64_ctx_t *ctx, uint64_t va, uint64_t len, uint32_t prot,
             uint64_t hps = (uint64_t)sysconf(_SC_PAGESIZE);
             uint64_t hlo = va & ~(hps - 1u), hhi = (va + len + hps - 1u) & ~(hps - 1u);
             got = mmap((void *)(uintptr_t)(ctx->guest_base + va), (size_t)len,
-                       host_prot(prot), MAP_PRIVATE | MAP_FIXED | MAP_ANONYMOUS, -1, 0);
+                       host_prot(prot), (shared != 0 ? MAP_SHARED : MAP_PRIVATE) | MAP_FIXED | MAP_ANONYMOUS, -1, 0);
             if (got == MAP_FAILED && hps > MIPS64_PAGE_SIZE &&
                 mprotect((void *)(uintptr_t)(ctx->guest_base + hlo),
                          (size_t)(hhi - hlo), PROT_READ | PROT_WRITE) == 0) {
@@ -257,6 +275,8 @@ int mips_mem_map(mips64_ctx_t *ctx, uint64_t va, uint64_t len, uint32_t prot,
                 rc = -ENOMEM;
             } else {
                 insert_region(va, len, prot, tag);
+                if (shared != 0)
+                    mark_shared(va, len);
                 dbt_invalidate_range(va, len);
             }
         }
@@ -268,6 +288,9 @@ int mips_mem_map(mips64_ctx_t *ctx, uint64_t va, uint64_t len, uint32_t prot,
         mips_qs_commit(ctx);
     return rc;
 }
+
+int mips_mem_map(mips64_ctx_t *ctx, uint64_t va, uint64_t len, uint32_t prot, const char *tag) { return map_inner(ctx, va, len, prot, tag, 0); }
+int mips_mem_map_shared(mips64_ctx_t *ctx, uint64_t va, uint64_t len, uint32_t prot, const char *tag) { return map_inner(ctx, va, len, prot, tag, 1); }
 
 size_t mips_mem_snapshot(mips64_region_t *out, size_t cap);
 void mips_mem_restore(const mips64_region_t *regs, size_t count);
@@ -330,8 +353,8 @@ int mips_mem_unmap(mips64_ctx_t *ctx, uint64_t va, uint64_t len)
 }
 
 /* Atomically replace [va, va+len) for MAP_FIXED / MREMAP_FIXED. */
-int mips_mem_map_replace(mips64_ctx_t *ctx, uint64_t va, uint64_t len,
-                         uint32_t prot, const char *tag)
+static int replace_inner(mips64_ctx_t *ctx, uint64_t va, uint64_t len,
+                         uint32_t prot, const char *tag, int shared)
 {
     uint64_t end;
     size_t saved_count;
@@ -371,7 +394,7 @@ int mips_mem_map_replace(mips64_ctx_t *ctx, uint64_t va, uint64_t len,
     g_region_count = w;
     got = g_region_count >= MIPS64_MAX_REGIONS ? MAP_FAILED :
           mmap((void *)(uintptr_t)(ctx->guest_base + va), (size_t)len,
-               host_prot(prot), MAP_PRIVATE | MAP_FIXED | MAP_ANONYMOUS,
+               host_prot(prot), (shared != 0 ? MAP_SHARED : MAP_PRIVATE) | MAP_FIXED | MAP_ANONYMOUS,
                -1, 0);
     if (got == MAP_FAILED) {
         mips_mem_restore(g_saved_regions, saved_count);
@@ -380,6 +403,8 @@ int mips_mem_map_replace(mips64_ctx_t *ctx, uint64_t va, uint64_t len,
         return -ENOMEM;
     }
     insert_region(va, len, prot, tag);
+    if (shared != 0)
+        mark_shared(va, len);
     dbt_invalidate_range(va, len);
     mips_vm_pages_clear(va, len,
                         (unsigned)(MIPS_VM_PAGE_COW_CLEAN |
@@ -390,6 +415,9 @@ int mips_mem_map_replace(mips64_ctx_t *ctx, uint64_t va, uint64_t len,
     mips_qs_commit(ctx);
     return 0;
 }
+
+int mips_mem_map_replace(mips64_ctx_t *ctx, uint64_t va, uint64_t len, uint32_t prot, const char *tag) { return replace_inner(ctx, va, len, prot, tag, 0); }
+int mips_mem_map_replace_shared(mips64_ctx_t *ctx, uint64_t va, uint64_t len, uint32_t prot, const char *tag) { return replace_inner(ctx, va, len, prot, tag, 1); }
 
 /* Protect: skip host downgrade; upgrades use host-rounded range.
  * Shared file mappings are rejected (R4-7): a 4 KiB guest sub-page is
@@ -496,56 +524,15 @@ static uint32_t remap_prot(uint64_t va, char *tag_out)
     return 0U;
 }
 
-static int remap_host_prot_at(const mips64_region_t *regs, size_t nregs,
-                              uint64_t hlo_va, uint64_t hhi_va)
-{
-    size_t i;
-    int hp = 0;
-
-    for (i = 0u; i < nregs; i++)
-        if (regs[i].end > hlo_va && regs[i].start < hhi_va)
-            hp |= host_prot(regs[i].prot);
-    return hp;
-}
-
-static int remap_copy_span(mips64_ctx_t *ctx, uint8_t *buf,
-                           const mips64_region_t *regs, size_t nregs,
-                           uint64_t span_va, uint64_t span_len)
-{
-    long ps = sysconf(_SC_PAGESIZE);
-    uint64_t hpsz = (uint64_t)(ps > 4096L ? ps : 4096L), hmask = hpsz - 1u;
-    size_t ri;
-
-    for (ri = 0u; ri < nregs; ri++) {
-        uint64_t lo = regs[ri].start > span_va ? regs[ri].start : span_va;
-        uint64_t hi = regs[ri].end < span_va + span_len ?
-                      regs[ri].end : span_va + span_len;
-        uint64_t pva;
-
-        for (pva = lo; pva < hi; pva += MIPS64_PAGE_SIZE) {
-            uint8_t *out = buf + (pva - span_va);
-            uint8_t *hp = (uint8_t *)mips64_guest_ptr(ctx, pva);
-            uintptr_t haddr = (uintptr_t)hp & ~(uintptr_t)hmask;
-            uint64_t hlo = (haddr > (uintptr_t)ctx->guest_base) ?
-                           (uint64_t)(haddr - (uintptr_t)ctx->guest_base) : 0u;
-            int oprot = remap_host_prot_at(regs, nregs, hlo, hlo + hpsz);
-
-            if (mips_vm_file_read_page(ctx, pva, out) != 0)
-                continue;
-            /* Widen the host page to RW before saving a sub-page
-             * (R4-7): a PROT_NONE guest page faults the memcpy when
-             * read through its host cover. */
-            if ((regs[ri].prot & MIPS_PROT_READ) == 0U &&
-                mprotect((void *)haddr, (size_t)hpsz,
-                         PROT_READ | PROT_WRITE) != 0)
-                return -errno;
-            memcpy(out, hp, MIPS64_PAGE_SIZE);
-            if ((regs[ri].prot & MIPS_PROT_READ) == 0U)
-                (void)mprotect((void *)haddr, (size_t)hpsz, oprot);
-        }
-    }
-    return 0;
-}
+/* Moving-mremap span copy lives in src/vm/vm_file_sync.c
+ * (strong def): it runs under mem_lock and must not take vm_lock, so
+ * file pages come from a pre-lock snapshot (R9-5). The weak stub below
+ * only serves standalone test builds without the vm TU; it is never
+ * exercised there (mremap needs the full translator). */
+__attribute__((weak)) int mips_vm_file_copy_span(mips64_ctx_t *ctx, uint8_t *buf,
+    const mips64_region_t *regs, size_t nregs, uint64_t span_va,
+    uint64_t span_len, const void *fsnap)
+{ (void)ctx; (void)buf; (void)regs; (void)nregs; (void)span_va; (void)span_len; (void)fsnap; return -ENOMEM; }
 
 int64_t mips_mem_remap(mips64_ctx_t *ctx, uint64_t old_va, uint64_t old_len,
                        uint64_t new_len, uint64_t flags, uint64_t new_va)
@@ -554,6 +541,7 @@ int64_t mips_mem_remap(mips64_ctx_t *ctx, uint64_t old_va, uint64_t old_len,
     uint64_t old_size, new_size, dst;
     uint32_t prot;
     int rc;
+    void *fsnap;
 
     if (ctx == NULL || ctx->guest_base == 0U || old_len == 0U ||
         new_len == 0U || (old_va & (MIPS64_PAGE_SIZE - 1U)) != 0U)
@@ -607,6 +595,9 @@ int64_t mips_mem_remap(mips64_ctx_t *ctx, uint64_t old_va, uint64_t old_len,
         if (dst == 0U)
             return -(int64_t)ENOMEM;
     }
+    /* R9-5: snapshot file-page contents before mem_lock; the span
+     * copy below must not take vm_lock while mem_lock is held. */
+    fsnap = mips_vm_file_snapshot_spans(ctx, old_va, old_size, dst, new_size);
     mips_qs_begin(ctx);
     mem_lock();
     {
@@ -632,19 +623,23 @@ int64_t mips_mem_remap(mips64_ctx_t *ctx, uint64_t old_va, uint64_t old_len,
             free(rbuf);
             free(dbuf);
             mips_mem_restore(remap_saved, remap_saved_count);
+            mips_vm_file_snapshot_free(fsnap);
             mem_unlock();
             mips_qs_abort(ctx);
             return -(int64_t)ENOMEM;
         }
-        rc = remap_copy_span(ctx, rbuf, remap_saved, remap_saved_count,
-                             old_va, old_size);
+        rc = mips_vm_file_copy_span(ctx, rbuf, remap_saved,
+                                    remap_saved_count, old_va, old_size,
+                                    fsnap);
         if (rc == 0)
-            rc = remap_copy_span(ctx, dbuf, remap_saved, remap_saved_count,
-                                 dst, new_size);
+            rc = mips_vm_file_copy_span(ctx, dbuf, remap_saved,
+                                        remap_saved_count, dst, new_size,
+                                        fsnap);
         if (rc != 0) {
             free(rbuf);
             free(dbuf);
             mips_mem_restore(remap_saved, remap_saved_count);
+            mips_vm_file_snapshot_free(fsnap);
             mem_unlock();
             mips_qs_abort(ctx);
             return (int64_t)rc;
@@ -713,6 +708,7 @@ int64_t mips_mem_remap(mips64_ctx_t *ctx, uint64_t old_va, uint64_t old_len,
             mips_vm_file_restore(ctx, old_va, old_size, dst, new_size);
             free(rbuf);
             free(dbuf);
+            mips_vm_file_snapshot_free(fsnap);
             mem_unlock();
             mips_qs_abort(ctx);
             return (int64_t)rc;
@@ -744,6 +740,7 @@ int64_t mips_mem_remap(mips64_ctx_t *ctx, uint64_t old_va, uint64_t old_len,
         dbt_invalidate_range(dst, new_size);
         free(rbuf);
         free(dbuf);
+        mips_vm_file_snapshot_free(fsnap);
     }
     mem_unlock();
     mips_qs_commit(ctx);
@@ -795,14 +792,10 @@ int mips_mem_exec_ok(const mips64_ctx_t *ctx, uint64_t pc)
     if (ctx == NULL)
         return 0;
     mem_lock();
-    if (g_region_count == 0U) {
-        ok = 1;
-    } else {
-        for (i = 0; i < g_region_count; i++) {
-            if (g_regions[i].start <= pc && pc + 4U <= g_regions[i].end) {
-                ok = (g_regions[i].prot & MIPS_PROT_EXEC) != 0U;
-                break;
-            }
+    for (i = 0; i < g_region_count; i++) {
+        if (g_regions[i].start <= pc && pc + 4U <= g_regions[i].end) {
+            ok = (g_regions[i].prot & MIPS_PROT_EXEC) != 0U;
+            break;
         }
     }
     mem_unlock();

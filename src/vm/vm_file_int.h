@@ -47,6 +47,17 @@ extern int vm_has_shared_fallback;
 
 void vm_lock(void);
 void vm_unlock(void);
+/* R9-5: lock-free region-prot snapshot. The table snapshot is taken
+ * with mem_lock only (never under vm_lock); the apply below then
+ * restores host prots under vm_lock without acquiring mem_lock,
+ * so the unmap/moving-mremap (mem->vm) order is never inverted. */
+typedef struct {
+    uint64_t start, end;
+    uint32_t prot;
+} mips_vm_prot_t;
+size_t mips_vm_prot_snapshot(mips_vm_prot_t *out, size_t cap);
+int mips_vm_prot_apply(mips64_ctx_t *ctx, uint64_t lo, uint64_t hi,
+                       const mips_vm_prot_t *snap, size_t n);
 vm_inode_t *vm_inode_table(void);
 vm_inode_t *vm_inode_lookup(uint64_t dev, uint64_t ino, int create,
                             uint64_t size);
