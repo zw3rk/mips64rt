@@ -4,10 +4,12 @@
  * Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0
  *
- * MIPS follows the asm-generic numbers except ENOSYS (89, not 38).
+ * MIPS renumbers several errnos relative to asm-generic (e.g. ENOSYS 89,
+ * EDEADLK 45, ENAMETOOLONG 78, EOVERFLOW 79, ELOOP 90, ENOTEMPTY 93,
+ * EOPNOTSUPP 122, EDQUOT 1133).
  * Darwin renumbers several more (notably the EAGAIN 35 / EDEADLK 11
  * swap and ETIMEDOUT 60); map every host errno the current syscall
- * set can produce. Linux hosts differ only on ENOSYS. The *at(2)
+ * set can produce. The *at(2)
  * dirfd/flag values differ too (Darwin AT_FDCWD is -2, not -100;
  * NOFOLLOW/EACCESS/REMOVEDIR bits move); the l2a_host_at_* helpers
  * translate those per call flavor. static inline throughout so
@@ -51,6 +53,8 @@ static inline int32_t l2a_errno_from_host(int host_errno)
         return 89; /* ENOSYS */
     case 84:
         return 79; /* EOVERFLOW */
+    case 102:
+        return 122; /* EOPNOTSUPP */
     default:
         return (int32_t)host_errno;
     }
