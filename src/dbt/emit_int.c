@@ -119,9 +119,11 @@ void ei_gst(a64_emit_t *e, unsigned tmp, unsigned r)
     }
 }
 
-/* Link write (RA = pc + 8 for direct links, rd for JALR). Deferred
- * past a guarded COP1/COP1X delay slot so a guard exit reaches the
- * dispatcher with the link (and any JALR rd==rs input) untouched. */
+/* Link write (RA = pc + 8 for direct links, rd for JALR). The
+ * oracle writes the link before the delay slot runs, so the emitter
+ * does the same; linking branches whose slot is a guarded COP1/COP1X
+ * word decline instead (M64-R8-3), as do JALR rd == rs links
+ * (M64-R8-4). */
 static void ei_link(a64_emit_t *e, unsigned rd, uint64_t pc)
 {
     ei_mov64(e, EI_T, pc + 8u);
@@ -181,6 +183,22 @@ void ei_exit_fault_reg(a64_emit_t *e, uint64_t pc, unsigned areg)
     ei_str(e, 0, EI_T, EI_CTX, MIPS64_CTX_PC_OFFSET);
     ei_str(e, 0, EI_T, EI_CTX, EI_OFF_SCRATCH);
     ei_str(e, 1, areg, EI_CTX, MIPS64_CTX_EXIT_REASON_OFFSET + 4u);
+    ei_strb(e, EI_XZR, EI_CTX, MIPS64_CTX_LLBIT_OFFSET);
+    ei_mov32(e, 0u, MIPS64_EXIT_FAULT);
+    ei_str(e, 1, 0u, EI_CTX, MIPS64_CTX_EXIT_REASON_OFFSET);
+    ei_ret(e);
+}
+
+/* Fault exit with a dynamic fault address in sreg (a misaligned
+ * JR/JALR target parked in x25, M64-R8-1): ctx->pc, the scratch
+ * slot, and exit_info track the target value, llbit is cleared like
+ * mips_fault, and next_pc is left alone (fault parity). */
+static void ei_exit_fault_dyn(a64_emit_t *e, unsigned sreg)
+{
+    ei_mov(e, EI_T, sreg);
+    ei_str(e, 0, EI_T, EI_CTX, MIPS64_CTX_PC_OFFSET);
+    ei_str(e, 0, EI_T, EI_CTX, EI_OFF_SCRATCH);
+    ei_str(e, 1, sreg, EI_CTX, MIPS64_CTX_EXIT_REASON_OFFSET + 4u);
     ei_strb(e, EI_XZR, EI_CTX, MIPS64_CTX_LLBIT_OFFSET);
     ei_mov32(e, 0u, MIPS64_EXIT_FAULT);
     ei_str(e, 1, 0u, EI_CTX, MIPS64_CTX_EXIT_REASON_OFFSET);
@@ -279,7 +297,6 @@ static int ei_branch(a64_emit_t *e, const mips_dec_t *d, const mips_dec_t *s,
     unsigned fccbit = 23u;
     unsigned tf = 0u;
     size_t t;
-    int fpslot = 0;
 
     switch (d->op) {
     case 0x02u: /* J */
@@ -378,36 +395,46 @@ static int ei_branch(a64_emit_t *e, const mips_dec_t *d, const mips_dec_t *s,
     default:
         return 1;
     }
-    /* A guarded COP1/COP1X word in the slot of a linking branch runs
-     * before the link write: its guards exit at the branch pc, so RA
-     * (and any JALR rd==rs input) must still be untouched for the
-     * interpreter replay. Pure bit-op/GPR slots keep the old order. */
-    fpslot = (link != 0 && (s->op == 0x11u || s->op == 0x13u)) ? 1 : 0;
+    /* M64-R8-3: a guarded COP1/COP1X word in the slot of a linking
+     * branch cannot run under either link order (an MFC1 to RA would
+     * lose the link, a faulting indexed word would skip it), so the
+     * whole branch declines to interp_step. */
+    if (link != 0 && (s->op == 0x11u || s->op == 0x13u)) {
+        return 1;
+    }
     if (indirect != 0) {
         size_t s1;
         size_t s2;
         size_t ft;
 
+        /* M64-R8-4: a JALR with rd == rs would overwrite the target
+         * input before a faulting slot recovers it (recovery reads
+         * ctx->gpr[rs] for RT_NPC_DYNAMIC_CTX). Fall back. */
+        if (link != 0 && d->rd != 0u && d->rd == d->rs) {
+            return 1;
+        }
+        /* Park the target in x25 first (trampoline-preserved,
+         * emitter-unused): the delay slot owns x21..x24. */
         ei_gld(e, EI_A, d->rs);
-        s1 = ei_tbz(e, 1, EI_A, 0u);
-        s2 = ei_tbz(e, 1, EI_A, 1u);
-        if (link != 0 && fpslot == 0) {
+        ei_mov(e, EI_S, EI_A);
+        if (link != 0) {
             ei_link(e, d->rd, pc);
         }
-        /* The delay slot owns x21..x24, so park the target in x25
-         * (trampoline-preserved, emitter-unused) across it. The slot
-         * site inherits the dynamic NPC: no branch replay on faults. */
-        ei_mov(e, EI_S, EI_A);
+        /* M64-R8-1: link and slot run before the alignment check.
+         * The oracle defers the fault until after link + slot and
+         * reports it at the target. The slot site inherits the
+         * dynamic NPC: no branch replay on faults. */
         ei_mem_branch_note(pc, (unsigned)RT_NPC_DYNAMIC_CTX, 0);
         if (ei_one(e, s, pc + 4u, be, 1) != 0) {
             ei_mem_branch_clear();
             return 1;
         }
         ei_mem_branch_clear();
-        if (fpslot != 0) {
-            ei_link(e, d->rd, pc);
-        }
+        /* Check the parked target after the slot, faulting at the
+         * misaligned target value in x25. */
         ei_mov(e, EI_A, EI_S);
+        s1 = ei_tbz(e, 1, EI_S, 0u);
+        s2 = ei_tbz(e, 1, EI_S, 1u);
         ei_str(e, 0, EI_A, EI_CTX, MIPS64_CTX_PC_OFFSET);
         ei_mov32(e, EI_T, 4u);
         ei_add(e, 0, EI_T, EI_A, EI_T);
@@ -416,7 +443,7 @@ static int ei_branch(a64_emit_t *e, const mips_dec_t *d, const mips_dec_t *s,
         ei_str(e, 1, 0u, EI_CTX, MIPS64_CTX_EXIT_REASON_OFFSET);
         ei_ret(e);
         ft = e == NULL ? 0u : e->len;
-        ei_exit_fault_reg(e, pc, EI_A);
+        ei_exit_fault_dyn(e, EI_S);
         ei_patch_at(e, s1, ft, 0);
         ei_patch_at(e, s2, ft, 0);
         return 0;
@@ -436,7 +463,7 @@ static int ei_branch(a64_emit_t *e, const mips_dec_t *d, const mips_dec_t *s,
             }
         }
     }
-    if (link != 0 && fpslot == 0) {
+    if (link != 0) {
         ei_link(e, MIPS64_REG_RA, pc);
     }
     if (has_cond != 0 && fpcond != 0) {
@@ -451,9 +478,6 @@ static int ei_branch(a64_emit_t *e, const mips_dec_t *d, const mips_dec_t *s,
     if (likely != 0) {
         /* Not-taken likely: skip the slot with no fetch (the link
          * still fires: the interpreter writes RA before the annul). */
-        if (fpslot != 0) {
-            ei_link(e, MIPS64_REG_RA, pc);
-        }
         ei_exit_at(e, pc + 8u, MIPS64_EXIT_BRANCH);
         ei_patch_at(e, t, e == NULL ? 0u : e->len, 0);
         /* Taken-likely path: the not-taken skip may have bypassed
@@ -468,9 +492,6 @@ static int ei_branch(a64_emit_t *e, const mips_dec_t *d, const mips_dec_t *s,
             return 1;
         }
         ei_mem_branch_clear();
-        if (fpslot != 0) {
-            ei_link(e, MIPS64_REG_RA, pc);
-        }
         ei_exit_at(e, tgt, MIPS64_EXIT_BRANCH);
         return 0;
     }
@@ -484,9 +505,6 @@ static int ei_branch(a64_emit_t *e, const mips_dec_t *d, const mips_dec_t *s,
             return 1;
         }
         ei_mem_branch_clear();
-        if (fpslot != 0) {
-            ei_link(e, MIPS64_REG_RA, pc);
-        }
     } else {
         ei_mem_branch_note(pc, (unsigned)RT_NPC_STATIC_TARGET,
                            (int32_t)(tgt - pc));
@@ -495,9 +513,6 @@ static int ei_branch(a64_emit_t *e, const mips_dec_t *d, const mips_dec_t *s,
             return 1;
         }
         ei_mem_branch_clear();
-        if (fpslot != 0) {
-            ei_link(e, MIPS64_REG_RA, pc);
-        }
         ei_exit_at(e, pc + 8u, MIPS64_EXIT_BRANCH);
         ei_patch_at(e, t, e == NULL ? 0u : e->len, 0);
         /* Second slot copy: the fallthrough copy above may have
@@ -513,9 +528,6 @@ static int ei_branch(a64_emit_t *e, const mips_dec_t *d, const mips_dec_t *s,
             return 1;
         }
         ei_mem_branch_clear();
-        if (fpslot != 0) {
-            ei_link(e, MIPS64_REG_RA, pc);
-        }
     }
     ei_exit_at(e, tgt, MIPS64_EXIT_BRANCH);
     return 0;

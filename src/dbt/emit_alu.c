@@ -264,6 +264,12 @@ int ei_special(a64_emit_t *e, const mips_dec_t *d, uint64_t pc,
             d->funct == 0x2Cu || d->funct == 0x2Eu;
         int is_sub = (d->funct & 0x02u) != 0u;
 
+        /* M64-R8-2: a trapping overflow in a delay slot must reach
+         * interp_step with in_delay_slot = 1 (guest BD bit parity),
+         * so the whole branch declines. */
+        if (trapping != 0 && slot != 0) {
+            return 1;
+        }
         ei_gld(e, EI_A, d->rs);
         ei_gld(e, EI_B, d->rt);
         if (is_sub != 0) {
@@ -324,6 +330,11 @@ int ei_special(a64_emit_t *e, const mips_dec_t *d, uint64_t pc,
     case 0x36u: { /* TNE */
         unsigned cc = EI_EQ;
 
+        /* M64-R8-2: conditional traps in a delay slot decline so
+         * the branch falls back to interp_step (in_delay_slot = 1). */
+        if (slot != 0) {
+            return 1;
+        }
         ei_gld(e, EI_A, d->rs);
         ei_gld(e, EI_B, d->rt);
         ei_cmp(e, 0, EI_A, EI_B);
@@ -584,9 +595,12 @@ int ei_special3(a64_emit_t *e, const mips_dec_t *d, uint64_t pc,
 
 int ei_imm(a64_emit_t *e, const mips_dec_t *d, uint64_t pc, int slot)
 {
-    (void)slot;
     switch (d->op) {
     case 0x08u: /* ADDI (trapping) */
+        /* M64-R8-2: trapping overflow in a delay slot declines. */
+        if (slot != 0) {
+            return 1;
+        }
         ei_gld(e, EI_A, d->rs);
         ei_mov32(e, EI_B, (uint32_t)d->simm);
         ei_adds(e, 1, EI_C, EI_A, EI_B);
@@ -636,6 +650,10 @@ int ei_imm(a64_emit_t *e, const mips_dec_t *d, uint64_t pc, int slot)
         ei_gst(e, EI_C, d->rt);
         return 0;
     case 0x18u: /* DADDI (trapping) */
+        /* M64-R8-2: trapping overflow in a delay slot declines. */
+        if (slot != 0) {
+            return 1;
+        }
         ei_gld(e, EI_A, d->rs);
         ei_mov64(e, EI_B, (uint64_t)(int64_t)d->simm);
         ei_adds(e, 0, EI_C, EI_A, EI_B);
@@ -662,7 +680,11 @@ int ei_regimm_trap(a64_emit_t *e, const mips_dec_t *d, uint64_t pc,
 {
     unsigned cc = EI_EQ;
 
-    (void)slot;
+    /* M64-R8-2: conditional traps in a delay slot decline so the
+     * branch falls back to interp_step (SYNCI has no trap and emits). */
+    if (slot != 0 && d->rt != 0x1Fu) {
+        return 1;
+    }
     switch (d->rt) {
     case 0x08u: /* TGEI */
         cc = EI_GE;

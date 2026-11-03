@@ -24,8 +24,8 @@
  * N32) in guest byte order.
  *
  * RC1 integration: expose _POSIX_C_SOURCE so musl sees clock_gettime
- * under strict -std=c11 (same pattern as src/main.c).
- */
+ * under strict -std=c11 (same pattern as src/main.c). */
+#define _DEFAULT_SOURCE
 #define _POSIX_C_SOURCE 200809L
 
 #include "loader.h"

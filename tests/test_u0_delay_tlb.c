@@ -629,6 +629,216 @@ static void test_vmfile(void)
     (void)unlink(path);
 }
 
+/* ---- M64 Round-8 DBT/JIT defects (decline codes + JR ordering) ---- */
+
+static uint32_t r8out[512];
+
+static void r8_make(mips_dec_t *d, unsigned op, unsigned rs, unsigned rt,
+                    unsigned rd, unsigned funct, int32_t simm,
+                    uint32_t target)
+{
+    (void)memset(d, 0, sizeof *d);
+    d->op = (uint8_t)op;
+    d->rs = (uint8_t)rs;
+    d->rt = (uint8_t)rt;
+    d->rd = (uint8_t)rd;
+    d->funct = (uint8_t)funct;
+    d->simm = simm;
+    d->uimm = (uint32_t)simm;
+    d->target = target;
+}
+
+/* R8-2: trapping words decline in delay slots, neighbours still emit. */
+static void test_r8_trapping_slots(void)
+{
+    static const unsigned trap_f[] = { 0x20u, 0x22u, 0x2Cu, 0x2Eu };
+    static const unsigned plain_f[] = { 0x21u, 0x23u, 0x2Du, 0x2Fu };
+    static const unsigned tcond_f[] = { 0x30u, 0x31u, 0x32u, 0x33u,
+                                        0x34u, 0x36u };
+    static const unsigned rts[] = { 0x08u, 0x09u, 0x0Au, 0x0Bu, 0x0Cu,
+                                    0x0Eu };
+    mips_dec_t d;
+    size_t i;
+
+    for (i = 0u; i < sizeof trap_f / sizeof trap_f[0]; i++) {
+        r8_make(&d, 0x00u, 4u, 5u, 6u, trap_f[i], 0, 0u);
+        u0_begin();
+        CHECK(ei_special(&u0e, &d, UINT64_C(0x1000), 1) == 1);
+        CHECK(u0e.len == 0u);
+    }
+    for (i = 0u; i < sizeof plain_f / sizeof plain_f[0]; i++) {
+        r8_make(&d, 0x00u, 4u, 5u, 6u, plain_f[i], 0, 0u);
+        u0_begin();
+        CHECK(ei_special(&u0e, &d, UINT64_C(0x1000), 1) == 0);
+    }
+    for (i = 0u; i < sizeof tcond_f / sizeof tcond_f[0]; i++) {
+        r8_make(&d, 0x00u, 4u, 5u, 6u, tcond_f[i], 0, 0u);
+        u0_begin();
+        CHECK(ei_special(&u0e, &d, UINT64_C(0x1000), 1) == 1);
+        CHECK(u0e.len == 0u);
+    }
+    r8_make(&d, 0x08u, 4u, 5u, 0u, 0u, 1, 0u);
+    u0_begin();
+    CHECK(ei_imm(&u0e, &d, UINT64_C(0x1000), 1) == 1);
+    CHECK(u0e.len == 0u);
+    r8_make(&d, 0x18u, 4u, 5u, 0u, 0u, 1, 0u);
+    u0_begin();
+    CHECK(ei_imm(&u0e, &d, UINT64_C(0x1000), 1) == 1);
+    CHECK(u0e.len == 0u);
+    r8_make(&d, 0x09u, 4u, 5u, 0u, 0u, 1, 0u);
+    u0_begin();
+    CHECK(ei_imm(&u0e, &d, UINT64_C(0x1000), 1) == 0);
+    r8_make(&d, 0x19u, 4u, 5u, 0u, 0u, 1, 0u);
+    u0_begin();
+    CHECK(ei_imm(&u0e, &d, UINT64_C(0x1000), 1) == 0);
+    for (i = 0u; i < sizeof rts / sizeof rts[0]; i++) {
+        r8_make(&d, 0x01u, 4u, rts[i], 0u, 0u, 1, 0u);
+        u0_begin();
+        CHECK(ei_regimm_trap(&u0e, &d, UINT64_C(0x1000), 1) == 1);
+        CHECK(u0e.len == 0u);
+    }
+    /* SYNCI has no trap and still emits in a slot. */
+    r8_make(&d, 0x01u, 4u, 0x1Fu, 0u, 0u, 1, 0u);
+    u0_begin();
+    CHECK(ei_regimm_trap(&u0e, &d, UINT64_C(0x1000), 1) == 0);
+}
+
+static int r8_emit_branch(mips64_ctx_t *ctx, const mips_dec_t *b,
+                         const mips_dec_t *s, size_t *nwords)
+{
+    mips_dec_t insns[2];
+    size_t out_len = 0u;
+    uint64_t out_end = 0u;
+    int rc;
+
+    insns[0] = *b;
+    insns[1] = *s;
+    rc = dbt_emit_int(ctx, U0_PAGE, insns, 2u, (uint8_t *)r8out,
+                      sizeof r8out, &out_len, &out_end);
+    *nwords = out_len / 4u;
+    return rc;
+}
+
+/* R8-3/R8-4/R8-2 at block level: the whole branch+slot declines. */
+static void test_r8_branch_declines(void)
+{
+    static mips64_ctx_t ctx;
+    mips_dec_t b;
+    mips_dec_t s;
+    mips_dec_t t;
+    size_t n = 0u;
+
+    setup_ctx(&ctx, 0);
+    r8_make(&s, 0x09u, 9u, 12u, 0u, 0u, 1, 0u); /* ADDIU slot */
+
+    /* R8-3: JAL with a COP1/COP1X slot declines; GPR slot emits. */
+    r8_make(&b, 0x03u, 0u, 0u, 0u, 0u, 0, 0u);
+    r8_make(&t, 0x11u, 0u, 0u, 0u, 0u, 0, 0u);
+    CHECK(r8_emit_branch(&ctx, &b, &t, &n) != 0);
+    r8_make(&t, 0x13u, 0u, 0u, 0u, 0u, 0, 0u);
+    CHECK(r8_emit_branch(&ctx, &b, &t, &n) != 0);
+    CHECK(r8_emit_branch(&ctx, &b, &s, &n) == 0);
+
+    /* R8-3: a linking conditional with a COP1 slot declines too. */
+    r8_make(&b, 0x01u, 4u, 0x11u, 0u, 0u, 4, 0u); /* BGEZAL */
+    r8_make(&t, 0x11u, 0u, 0u, 0u, 0u, 0, 0u);
+    CHECK(r8_emit_branch(&ctx, &b, &t, &n) != 0);
+    CHECK(r8_emit_branch(&ctx, &b, &s, &n) == 0);
+
+    /* R8-4: JALR rd == rs declines; rd != rs and rd == 0 emit. */
+    r8_make(&b, 0x00u, 8u, 0u, 8u, 0x09u, 0, 0u);
+    CHECK(r8_emit_branch(&ctx, &b, &s, &n) != 0);
+    r8_make(&b, 0x00u, 8u, 0u, 9u, 0x09u, 0, 0u);
+    CHECK(r8_emit_branch(&ctx, &b, &s, &n) == 0);
+    r8_make(&b, 0x00u, 8u, 0u, 0u, 0x09u, 0, 0u);
+    CHECK(r8_emit_branch(&ctx, &b, &s, &n) == 0);
+
+    /* R8-2 at block level: a trapping slot declines the branch. */
+    r8_make(&b, 0x04u, 4u, 5u, 0u, 0u, 4, 0u); /* BEQ */
+    r8_make(&t, 0x00u, 4u, 5u, 6u, 0x20u, 0, 0u); /* ADD */
+    CHECK(r8_emit_branch(&ctx, &b, &t, &n) != 0);
+    CHECK(r8_emit_branch(&ctx, &b, &s, &n) == 0);
+}
+
+static size_t r8_find_word(uint32_t w, size_t n)
+{
+    size_t i;
+
+    for (i = 0u; i < n; i++) {
+        if (r8out[i] == w) {
+            return i;
+        }
+    }
+    return n;
+}
+
+static size_t r8_find_tbnz(size_t n, unsigned rt, unsigned bit)
+{
+    size_t i;
+
+    for (i = 0u; i < n; i++) {
+        uint32_t w = r8out[i];
+
+        if (((w & 0xFF000000u) == 0x37000000u) && ((w & 31u) == rt) &&
+            (((w >> 19) & 31u) == bit)) {
+            return i;
+        }
+    }
+    return n;
+}
+
+/* R8-1: JR parks the target in x25, runs link + slot, then checks. */
+static void test_r8_jr_order(void)
+{
+    static mips64_ctx_t ctx;
+    mips_dec_t b;
+    mips_dec_t s;
+    size_t n = 0u;
+    size_t park;
+    size_t store;
+    size_t chk0;
+    size_t chk1;
+    size_t dyn;
+    size_t i;
+    unsigned found;
+
+    setup_ctx(&ctx, 0);
+    r8_make(&b, 0x00u, 8u, 0u, 0u, 0x08u, 0, 0u); /* JR $t0 */
+    r8_make(&s, 0x09u, 9u, 12u, 0u, 0u, 1, 0u); /* ADDIU slot */
+    CHECK(r8_emit_branch(&ctx, &b, &s, &n) == 0);
+    CHECK(n > 0u);
+
+    /* Target parks in x25 before the slot store ... */
+    park = r8_find_word(0xAA1503F9u, n); /* mov x25, x21 */
+    store = r8_find_word(0xF9003277u, n); /* str x23, [x19, #96] */
+    /* ... and both TBNZ checks on x25 come after the slot. */
+    chk0 = r8_find_tbnz(n, 25u, 0u);
+    chk1 = r8_find_tbnz(n, 25u, 1u);
+    CHECK(park < n && store < n && chk0 < n && chk1 < n);
+    CHECK(park < chk0 && store < chk0);
+    CHECK(park < chk1 && store < chk1);
+    /* No alignment check fires on the pre-slot input register. */
+    for (i = 0u; i < n; i++) {
+        uint32_t w = r8out[i];
+        unsigned is_tb = ((w & 0xFF000000u) == 0x36000000u) ||
+            ((w & 0xFF000000u) == 0x37000000u);
+
+        CHECK(is_tb == 0u || (w & 31u) != 21u);
+    }
+    /* The fault epilogue reports the parked target: x24 carries x25
+     * and the exit_info store reads x25, both after the checks. */
+    dyn = r8_find_word(0xAA1903F8u, n); /* mov x24, x25 */
+    CHECK(dyn < n && chk0 < dyn && chk1 < dyn);
+    found = 0u;
+    for (i = 0u; i < n; i++) {
+        if ((r8out[i] & 0xFFC0001Fu) == 0xB9000019u) { /* str w25 */
+            found = 1u;
+            CHECK(chk0 < i && chk1 < i);
+        }
+    }
+    CHECK(found != 0u);
+}
+
 int main(void)
 {
     test_fixade_emulation();
@@ -637,6 +847,9 @@ int main(void)
     test_soft_tlb();
     test_probe_words();
     test_aligned_words();
+    test_r8_trapping_slots();
+    test_r8_branch_declines();
+    test_r8_jr_order();
     test_vm64_anon();
     test_vmfile();
     (void)printf("U0: %d passed, %d failed\n", passes, fails);
