@@ -4,36 +4,10 @@
  * Copyright 2026 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0
  *
- * Phase 3 lane L3a: scalar single/double COP1 — ADD/SUB/MUL/DIV/SQRT/
- * ABS/NEG/MOV, the CVT/ROUND/TRUNC/CEIL/FLOOR family, C.cond compares +
- * FCC condition bits, BC1T/BC1F/BC1TL/BC1FL with RC1 delay-slot/annul
- * rules, and DMFC1/DMTC1. FR=1 64-bit FPR lanes; S-format results occupy
- * the low 32 bits with the upper lane preserved (the fpmove.c LWC1/MTC1
- * discipline). COP1X/MSA (paired-single, MSA) keep faulting; see the
- * lane commit for the SIMD adjudication.
- *
- * Oracle model (qemu-mips64el/qemu-mips64 user 10.0.13 per E04, legacy
- * NaN toolchain default EF_MIPS_NAN2008==0, qemu master fpu_helper.c for
- * value-level details):
- * - Any NaN operand (quiet or signalling shapes) or invalid combination
- *   (0/0, Inf-Inf, 0*Inf, Inf/Inf, sqrt of a negative) yields the legacy
- *   default quiet NaN (S 0x7FBFFFFF, D 0x7FF7FFFFFFFFFFFF, E04-observed)
- *   with NO FCSR Cause/Flag update (E04: qemu leaves FCSR zero across
- *   the whole NaN run, including 0.0/0.0). Cause/Flag fields are
- *   otherwise preserved untouched (sticky).
- * - ABS/NEG are bitwise (sign-bit clear/flip, payloads bit-exact).
- * - ROUND.W/L round to nearest-even (qemu float_round_* uses
- *   float_round_nearest_even); TRUNC/CEIL/FLOOR use their fixed mode
- *   and CVT.W/L use the current FCSR RM. Out-of-range/NaN/Inf integer
- *   results saturate to the MIPS indefinite values (W 0x7FFFFFFF,
- *   L 0x7FFFFFFFFFFFFFFF, qemu FP_TO_INT{32,64}_OVERFLOW).
- * - FCSR RM (bits 1:0) is honoured in software via exact quad-precision
- *   references (all quad intermediate results are exactly
- *   representable for our operand widths); the host FP control word is
- *   never touched. Default RNE.
- * - C.cond sets FCC[cc] (FCSR bit 23 for cc 0, bits 31:25 for cc 1..7)
- *   with the MIPS predicate table; unordered inputs clear the ordered
- *   predicates. No Cause/Flag update.
+ * L3a scalar S/D COP1 (qemu-mips64el oracle, legacy NaN2008==0):
+ * NaN/invalid yield default quiet NaN without FCSR update; ABS/NEG
+ * bitwise; ROUND ties-even, CVT honors RM; int overflow saturates;
+ * exact quad references, host FP word untouched; C.cond per table.
  */
 
 #include <float.h>
@@ -49,8 +23,7 @@ extern void mips_insn_trap(mips64_ctx_t *ctx, int signo, uint64_t addr);
 extern void mips_insn_trap_code(mips64_ctx_t *ctx, int signo, int32_t code,
                                 uint64_t addr);
 
-/* FCSR: FCC0 at bit 23, FCC1..7 at bits 31:25 (matches the MOVCI mask in
- * interp.c). RM at bits 1:0. Cause/Flag fields are never written here. */
+/* FCSR: FCC0 bit 23, FCC1..7 bits 31:25; RM bits 1:0. */
 #define FP_FCC0_BIT 23u
 #define FP_RM_MASK  3u
 
@@ -110,11 +83,7 @@ static void fp_set_cc(mips64_ctx_t *ctx, unsigned cc, unsigned v)
     }
 }
 
-/* Nonzero iff the raw lane bits are a signalling NaN under the legacy
- * MIPS (pre-nan2008) convention: all-ones exponent, nonzero mantissa,
- * top mantissa bit SET. 0x7FC00000 signals (crafted P3 case, V set);
- * the default 0x7FBFFFFF is quiet and propagates flag-free. Only SNaN
- * inputs raise V on quiet propagation (P3 suite, qemu-blessed). */
+/* Legacy SNaN: all-ones exponent, nonzero mantissa, top bit set. */
 int fp_issn_s(uint32_t u)
 {
     return ((u & 0x7F800000u) == 0x7F800000u) &&
@@ -136,10 +105,7 @@ void fp_clear_trap(void)
     fp_trapped = 0;
 }
 
-/* Set FCSR cause + sticky flag for exception e (FP_EXC_*). When the
- * corresponding FCSR enable bit (7 + e) is set, record an enabled trap
- * (suppressing sticky flag and destination writeback) so fp_finish_trap
- * delivers SIGFPE synchronously. */
+/* Set FCSR cause/flag for e; enabled traps defer to fp_finish_trap. */
 void fp_raise(mips64_ctx_t *ctx, unsigned e)
 {
     if (e > (unsigned)FP_EXC_V) {
@@ -190,30 +156,41 @@ int fp_finish_trap(mips64_ctx_t *ctx, uint64_t cur_pc, unsigned fd,
     return rc;
 }
 
-/* Flag a finished single-precision result rf against its exact value q
- * (exact in double/long double for all S operands): O (+I) on overflow,
- * U (+I) on tiny inexact (or trapped tininess), and I on inexact. */
-void fp_inexact(mips64_ctx_t *ctx, long double rf, long double q)
+/* Single-precision O/U/I bits for rf vs exact q (R4-6 shared path). */
+unsigned fp_inexact_exc(mips64_ctx_t *ctx, long double rf, long double q)
 {
+    unsigned exc = 0u;
+
     if (((isinf(rf) != 0) || (isinf((float)q) != 0)) &&
         (isinf(q) == 0)) {
-        fp_raise(ctx, (unsigned)FP_EXC_O);
-        fp_raise(ctx, (unsigned)FP_EXC_I);
-        return;
+        return (1u << (unsigned)FP_EXC_O) | (1u << (unsigned)FP_EXC_I);
     }
     if (q != 0.0L && fabsl(q) < (long double)FLT_MIN) {
         if (rf != q ||
             (ctx->fcsr & (1u << (7u + (unsigned)FP_EXC_U))) != 0u) {
-            fp_raise(ctx, (unsigned)FP_EXC_U);
+            exc |= 1u << (unsigned)FP_EXC_U;
         }
     }
     if (rf != q) {
-        fp_raise(ctx, (unsigned)FP_EXC_I);
+        exc |= 1u << (unsigned)FP_EXC_I;
+    }
+    return exc;
+}
+
+/* Raise O/U/I for finished single result rf vs exact q. */
+void fp_inexact(mips64_ctx_t *ctx, long double rf, long double q)
+{
+    unsigned exc = fp_inexact_exc(ctx, rf, q);
+    unsigned e;
+
+    for (e = 0u; e <= (unsigned)FP_EXC_V; e++) {
+        if ((exc & (1u << e)) != 0u) {
+            fp_raise(ctx, e);
+        }
     }
 }
 
-/* Host-independent binary64 directed rounding and O/U/I flag accounting
- * from an RNE result r and exact residual sign cmp = sign(exact - r). */
+/* Directed binary64 rounding of RNE r by residual sign cmp. */
 double fp_round_d(mips64_ctx_t *ctx, double r, int cmp, unsigned rm)
 {
     double rf = r;
@@ -265,8 +242,7 @@ double fp_round_d(mips64_ctx_t *ctx, double r, int cmp, unsigned rm)
     return rf;
 }
 
-/* S-format FPR write: low 32 bits replaced, upper lane preserved (FR=1,
- * the fpmove.c LWC1/MTC1 discipline). */
+/* S write: low lane replaced, upper preserved (FR=1). */
 void fp_put_s(mips64_ctx_t *ctx, unsigned fd, uint32_t v)
 {
     ctx->fpr[fd] = (ctx->fpr[fd] & UINT64_C(0xFFFFFFFF00000000)) | v;
@@ -298,9 +274,7 @@ float fp_adj_f(float r, long double q, unsigned rm)
     }
 }
 
-/* Directed-mode correction for sqrt: the square of the RNE result is
- * exact in quad (53x53 / 24x24 bits), so the comparison against x is
- * exact. Toward-zero and toward -inf coincide for non-negative roots. */
+/* Directed sqrt fixup: r*r is exact in quad; compare vs x. */
 static float fp_sqrt_adj_f(float r, float x, unsigned rm)
 {
     long double sq;
@@ -315,8 +289,7 @@ static float fp_sqrt_adj_f(float r, float x, unsigned rm)
     return (sq > (long double)x) ? nextafterf(r, 0.0f) : r;
 }
 
-/* Round quad q to an integer, ties to even. The caller range-checks
- * first, so q - truncl(q) is exact and the halfway case is detectable. */
+/* Round quad q to integer, ties to even. */
 long double fp_rne_q(long double q)
 {
     long double lo = truncl(q);
@@ -342,10 +315,7 @@ static int fp_cmp_sign(double x)
     return (x > 0.0) ? 1 : ((x < 0.0) ? -1 : 0);
 }
 
-/* S/D ADD/SUB/MUL/DIV/SQRT/ABS/NEG/MOV. NaN operands and invalid
- * combinations yield the default quiet NaN; infinities follow the IEEE
- * sign rules. Returns 0, or MIPS_FAULT for an unknown funct (the caller
- * records the fault). */
+/* S/D arithmetic core; unknown funct returns MIPS_FAULT. */
 static int fp_arith(mips64_ctx_t *ctx, const mips_dec_t *d, unsigned is_s)
 {
     unsigned fd = d->sa;
@@ -668,17 +638,20 @@ static int fp_arith(mips64_ctx_t *ctx, const mips_dec_t *d, unsigned is_s)
             }
         }
         if (d->funct == 0x00u || d->funct == 0x01u) {
-            /* ADD.S/SUB.S exact residual (R3-2): the binary64 sum is
-             * the exact reference, except when the small operand is
-             * absorbed (qd == da, b != 0) — then the residual carries
-             * the small operand's sign, one long-double ulp past r. */
+            /* ADD.S/SUB.S residual (R3-2, R4-5): absorbed operand signs. */
             double sb = (d->funct == 0x01u) ? -(double)b : (double)b;
             double qd = (double)a + sb;
+            double da = (double)a;
 
-            q = (isfinite(qd) && qd == (double)a && sb != 0.0) ?
-                nextafterl((long double)r,
-                           sb > 0.0 ? INFINITY : -INFINITY) :
-                (long double)qd;
+            if (isfinite(qd) != 0 && qd == da && sb != 0.0) {
+                q = nextafterl((long double)r,
+                               sb > 0.0 ? INFINITY : -INFINITY);
+            } else if (isfinite(qd) != 0 && qd == sb && a != 0.0f) {
+                q = nextafterl((long double)r,
+                               a > 0.0f ? INFINITY : -INFINITY);
+            } else {
+                q = (long double)qd;
+            }
         }
         {
             float rf = fp_adj_f(r, q, rm);
@@ -742,6 +715,10 @@ static int fp_fmt_sd(mips64_ctx_t *ctx, const mips_dec_t *d)
             l = (a < b) ? 1u : 0u;
             e = (a == b) ? 1u : 0u;
             u = (isnan(a) || isnan(b)) ? 1u : 0u;
+            if ((u != 0u) && (fp_issn_s((uint32_t)ctx->fpr[d->rd]) != 0 ||
+                              fp_issn_s((uint32_t)ctx->fpr[d->rt]) != 0)) {
+                fp_raise(ctx, (unsigned)FP_EXC_V); /* SNaN R4-7 */
+            }
         } else {
             double a = fp_bits_d(ctx->fpr[d->rd]);
             double b = fp_bits_d(ctx->fpr[d->rt]);
@@ -749,6 +726,10 @@ static int fp_fmt_sd(mips64_ctx_t *ctx, const mips_dec_t *d)
             l = (a < b) ? 1u : 0u;
             e = (a == b) ? 1u : 0u;
             u = (isnan(a) || isnan(b)) ? 1u : 0u;
+            if ((u != 0u) && (fp_issn_d(ctx->fpr[d->rd]) != 0 ||
+                              fp_issn_d(ctx->fpr[d->rt]) != 0)) {
+                fp_raise(ctx, (unsigned)FP_EXC_V);
+            }
         }
         switch (cond) {
         case 0x00u: /* F */
@@ -806,10 +787,7 @@ static int fp_fmt_wl(mips64_ctx_t *ctx, const mips_dec_t *d)
     return MIPS_FAULT;
 }
 
-/* BC1F/BC1FL/BC1T/BC1TL (any cc): RC1 delay-slot/annul rules. The slot
- * runs via interp_step with in_delay_slot set, so a fault there keeps
- * pc at the slot and records branch_pc; likely-not-taken annuls the
- * slot with no fetch at all. Returns FP_RC_BRANCH with pc final. */
+/* BC1 branch with RC1 delay-slot/annul rules. */
 static int fp_branch(mips64_ctx_t *ctx, uint64_t cur_pc, const mips_dec_t *d)
 {
     unsigned cc = ((unsigned)d->rt >> 2u) & 7u;

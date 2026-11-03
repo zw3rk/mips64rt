@@ -202,7 +202,14 @@ static long l4f_darwin_wait(uint64_t va, uint32_t *hp, uint32_t val,
     }
     s->waiters++;
     if (have_dl) {
-        rc = pthread_cond_timedwait(&s->cv, &s->mu, &dl);
+        /* Absolute deadline sampled once above; EINTR retries reuse
+         * it so the remaining wait shrinks (R4-5). */
+        for (;;) {
+            rc = pthread_cond_timedwait(&s->cv, &s->mu, &dl);
+            if (rc != EINTR) {
+                break;
+            }
+        }
     } else {
         rc = pthread_cond_wait(&s->cv, &s->mu);
     }
@@ -263,6 +270,48 @@ static long l4f_darwin(uint32_t *uaddr, uint64_t va, int op, int val,
         return -1;
     }
     return l4f_darwin_wake(va, req_nr > 0 ? req_nr : INT_MAX);
+}
+#endif
+
+/* Monotonic deadline for a relative FUTEX_WAIT span, sampled once
+ * before the retry loop (R4-5). EINTR retries recompute the remaining
+ * span from this fixed deadline so the guest observes the full
+ * relative timeout instead of an unbounded extension. */
+#if defined(__linux__) && defined(SYS_futex)
+static void l4f_wait_deadline(const struct timespec *rel,
+                              struct timespec *dl)
+{
+    struct timespec now;
+
+    (void)clock_gettime(CLOCK_MONOTONIC, &now);
+    dl->tv_sec = now.tv_sec + rel->tv_sec;
+    dl->tv_nsec = now.tv_nsec + rel->tv_nsec;
+    while (dl->tv_nsec >= 1000000000L) {
+        dl->tv_sec++;
+        dl->tv_nsec -= 1000000000L;
+    }
+}
+
+/* Remaining span until a monotonic deadline. Returns 0 with *rem set,
+ * or -1 when the deadline has passed. */
+static int l4f_wait_remaining(const struct timespec *dl,
+                              struct timespec *rem)
+{
+    struct timespec now;
+
+    (void)clock_gettime(CLOCK_MONOTONIC, &now);
+    rem->tv_sec = dl->tv_sec - now.tv_sec;
+    rem->tv_nsec = dl->tv_nsec - now.tv_nsec;
+    while (rem->tv_nsec < 0L) {
+        rem->tv_sec--;
+        rem->tv_nsec += 1000000000L;
+    }
+    if (rem->tv_sec < 0) {
+        rem->tv_sec = 0;
+        rem->tv_nsec = 0;
+        return -1;
+    }
+    return 0;
 }
 #endif
 
@@ -392,10 +441,32 @@ int64_t mips_futex_op(mips64_ctx_t *ctx, uint64_t uaddr, uint64_t op,
         }
 #if defined(__linux__) && defined(SYS_futex)
         /* Drop the dispatch lease across the blocking stretch (see
-         * above); the kernel re-checks atomically on entry. */
+         * above); the kernel re-checks atomically on entry. A
+         * relative FUTEX_WAIT uses one monotonic deadline sampled
+         * before the loop; EINTR retries recompute the remaining
+         * span from it (R4-5). Absolute WAIT_BITSET passes through. */
         mips_qs_lease_exit(ctx);
-        rc = l4f_host(hp, hop, (int)(uint32_t)val, top, NULL,
-                      (uint32_t)val3);
+        if (base == L4F_WAIT && top != NULL) {
+            struct timespec dl;
+            struct timespec rem;
+
+            l4f_wait_deadline(top, &dl);
+            for (;;) {
+                if (l4f_wait_remaining(&dl, &rem) != 0) {
+                    errno = ETIMEDOUT;
+                    rc = -1;
+                    break;
+                }
+                rc = l4f_host(hp, hop, (int)(uint32_t)val, &rem,
+                              NULL, (uint32_t)val3);
+                if (rc >= 0 || errno != EINTR) {
+                    break;
+                }
+            }
+        } else {
+            rc = l4f_host(hp, hop, (int)(uint32_t)val, top, NULL,
+                          (uint32_t)val3);
+        }
         mips_qs_lease_enter(ctx);
 #else
         /* WAIT takes a relative span, WAIT_BITSET an absolute stamp

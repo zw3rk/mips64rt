@@ -99,14 +99,18 @@ static int fp_cop1x_mem(mips64_ctx_t *ctx, const mips_dec_t *d)
 
 /* One PS lane: op selects ADD/SUB/MUL on raw 32-bit lanes au/bu.
  * Returns the result lane; *exc accumulates FP_EXC_* bits (bit e set
- * when exception e fires on this lane). */
-static uint32_t fp_ps_lane(unsigned op, uint32_t au, uint32_t bu,
-    unsigned *exc)
+ * when exception e fires on this lane). Rounding follows the guest
+ * FCSR mode via the exact single-precision path shared with scalar
+ * ADD.S/SUB.S/MUL.S (fp_adj_f + fp_inexact_exc), including the
+ * symmetric absorbed-operand residual (R4-5/R4-6). */
+static uint32_t fp_ps_lane(mips64_ctx_t *ctx, unsigned op, uint32_t au,
+    uint32_t bu, unsigned *exc)
 {
     float a = fp_bits_f(au);
     float b = fp_bits_f(bu);
     float r = 0.0f;
     long double q = 0.0L;
+    unsigned rm = fp_rm(ctx);
 
     if (isnan(a) || isnan(b)) {
         if (fp_issn_s(au) != 0 || fp_issn_s(bu) != 0) {
@@ -122,7 +126,7 @@ static uint32_t fp_ps_lane(unsigned op, uint32_t au, uint32_t bu,
             return FP_DEFNAN_S;
         }
         r = a + b;
-        q = (long double)a + (long double)b;
+        q = (long double)((double)a + (double)b);
         break;
     case 0x01u: /* SUB.PS */
         if (isinf(a) && isinf(b) &&
@@ -131,7 +135,7 @@ static uint32_t fp_ps_lane(unsigned op, uint32_t au, uint32_t bu,
             return FP_DEFNAN_S;
         }
         r = a - b;
-        q = (long double)a - (long double)b;
+        q = (long double)((double)a - (double)b);
         break;
     default: /* MUL.PS */
         if ((a == 0.0f && isinf(b)) || (isinf(a) && b == 0.0f)) {
@@ -142,18 +146,28 @@ static uint32_t fp_ps_lane(unsigned op, uint32_t au, uint32_t bu,
         q = (long double)a * (long double)b;
         break;
     }
-    if ((isinf((double)r) != 0) && (isinf(q) == 0)) {
-        *exc |= (1u << (unsigned)FP_EXC_O) | (1u << (unsigned)FP_EXC_I);
-    } else {
-        if (q != 0.0L && fabsl(q) < (long double)FLT_MIN &&
-            (long double)r != q) {
-            *exc |= 1u << (unsigned)FP_EXC_U;
-        }
-        if ((long double)r != q) {
-            *exc |= 1u << (unsigned)FP_EXC_I;
+    if (op == 0x00u || op == 0x01u) {
+        /* Absorbed-operand residual shared with scalar ADD.S/SUB.S:
+         * either effective operand may vanish into the other, and the
+         * lost sign steers directed rounding and Inexact. */
+        double sb = (op == 0x01u) ? -(double)b : (double)b;
+        double qd = (double)a + sb;
+        double da = (double)a;
+
+        if (isfinite(qd) != 0 && qd == da && sb != 0.0) {
+            q = nextafterl((long double)r,
+                           sb > 0.0 ? INFINITY : -INFINITY);
+        } else if (isfinite(qd) != 0 && qd == sb && a != 0.0f) {
+            q = nextafterl((long double)r,
+                           a > 0.0f ? INFINITY : -INFINITY);
         }
     }
-    return fp_f_bits(r);
+    {
+        float rf = fp_adj_f(r, q, rm);
+
+        *exc |= fp_inexact_exc(ctx, (long double)rf, q);
+        return fp_f_bits(rf);
+    }
 }
 
 /* Paired-single arithmetic (fmt 0x16 in d->rs). */
@@ -178,9 +192,9 @@ int fp_ps_cop1(mips64_ctx_t *ctx, uint64_t cur_pc, const mips_dec_t *d)
     case 0x00u: /* ADD.PS */
     case 0x01u: /* SUB.PS */
     case 0x02u: /* MUL.PS */
-        hi = fp_ps_lane(d->funct, (uint32_t)(ctx->fpr[fs] >> 32u),
+        hi = fp_ps_lane(ctx, d->funct, (uint32_t)(ctx->fpr[fs] >> 32u),
             (uint32_t)(ctx->fpr[ft] >> 32u), &exc);
-        lo = fp_ps_lane(d->funct, (uint32_t)ctx->fpr[fs],
+        lo = fp_ps_lane(ctx, d->funct, (uint32_t)ctx->fpr[fs],
             (uint32_t)ctx->fpr[ft], &exc);
         ctx->fpr[fd] = ((uint64_t)hi << 32u) | lo;
         break;

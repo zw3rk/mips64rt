@@ -69,6 +69,10 @@ double fp_round_d(mips64_ctx_t *ctx, double r, int cmp, unsigned rm);
  * U (+I) on tiny inexact (or trapped tiny), I when inexact. */
 void fp_inexact(mips64_ctx_t *ctx, long double rf, long double q);
 
+/* Shared single-precision exception bits for scalar and paired-single
+ * lanes (defined in fp.c; the lane accumulates and raises per bit). */
+unsigned fp_inexact_exc(mips64_ctx_t *ctx, long double rf, long double q);
+
 /* MIPS CVT/round funct field values (destination selectors): */
 #define FP_FN_ROUND_L 0x08u
 #define FP_FN_TRUNC_L 0x09u

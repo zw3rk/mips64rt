@@ -101,6 +101,8 @@ __attribute__((weak)) void mips_vm_file_restore(mips64_ctx_t *ctx,
 __attribute__((weak)) void mips_vm_file_remap_hook(mips64_ctx_t *ctx,
     uint64_t old_va, uint64_t old_size, uint64_t dst_va, uint64_t new_size)
 { (void)ctx; (void)old_va; (void)old_size; (void)dst_va; (void)new_size; }
+__attribute__((weak)) int mips_vm_file_has_shared(uint64_t va, uint64_t len)
+{ (void)va; (void)len; return 0; }
 
 static int split_at(uint64_t task_size, uint64_t va)
 {
@@ -389,7 +391,10 @@ int mips_mem_map_replace(mips64_ctx_t *ctx, uint64_t va, uint64_t len,
     return 0;
 }
 
-/* Protect: skip host downgrade; upgrades use host-rounded range. */
+/* Protect: skip host downgrade; upgrades use host-rounded range.
+ * Shared file mappings are rejected (R4-7): a 4 KiB guest sub-page is
+ * not a valid protection boundary on a 16 KiB Darwin host page, so the
+ * host cover cannot represent shared sub-page permissions. */
 int mips_mem_protect(mips64_ctx_t *ctx, uint64_t va, uint64_t len,
                      uint32_t prot)
 {
@@ -411,6 +416,9 @@ int mips_mem_protect(mips64_ctx_t *ctx, uint64_t va, uint64_t len,
         return -EINVAL;
     }
     end = va + len;
+    if (mips_vm_file_has_shared(va, len) != 0) {
+        return -EINVAL;
+    }
     mips_qs_begin(ctx);
     mem_lock();
     if (!mips_mem_ok(ctx, va, len, 0U)) {
@@ -520,8 +528,12 @@ static int remap_copy_span(mips64_ctx_t *ctx, uint8_t *buf,
 
             if (mips_vm_file_read_page(ctx, pva, out) != 0)
                 continue;
+            /* Widen the host page to RW before saving a sub-page
+             * (R4-7): a PROT_NONE guest page faults the memcpy when
+             * read through its host cover. */
             if ((regs[ri].prot & MIPS_PROT_READ) == 0U &&
-                mprotect((void *)haddr, (size_t)hpsz, oprot | PROT_READ) != 0)
+                mprotect((void *)haddr, (size_t)hpsz,
+                         PROT_READ | PROT_WRITE) != 0)
                 return -errno;
             memcpy(out, hp, MIPS64_PAGE_SIZE);
             if ((regs[ri].prot & MIPS_PROT_READ) == 0U)

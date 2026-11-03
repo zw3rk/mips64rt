@@ -24,6 +24,7 @@
 #include "dbt/dbt.h"
 #include "os/backend.h"
 #include "os/quiesce.h"
+#include "vm/vm_file_int.h"
 #include "vm/vm_pages.h"
 
 #ifndef MAP_NORESERVE
@@ -42,40 +43,25 @@ static long u0f_page_size(void)
 }
 
 extern int mips_vm_inode_page_host_prot(uint64_t page_va);
-extern void mips_vm_inode_zero_span(mips64_ctx_t *ctx, uint64_t page_va, uint64_t from, uint64_t to);
-extern void mips_vm_inode_refresh_span(mips64_ctx_t *ctx, int fd, uint64_t page_va, uint64_t glo, uint64_t ghi, uint64_t fpos);
+extern int mips_vm_inode_zero_span(mips64_ctx_t *ctx, uint64_t page_va, uint64_t from, uint64_t to);
+extern int mips_vm_inode_refresh_span(mips64_ctx_t *ctx, int fd, uint64_t page_va, uint64_t glo, uint64_t ghi, uint64_t fpos);
 
 /* ---- Lane U12 family-shared inode/EOF tracking ---- */
-#define VM_INODE_MAX 64u
-#define VM_INODE_MAPS 128u
-
-typedef struct {
-    pid_t pid;
-    int fd_dup, shared, native;
-    uint64_t va, len, file_offset, min_size, seen_write_seq, seen_resize_seq;
-    uint32_t prot;
-} vm_inode_map_t;
-
-typedef struct {
-    int used, nmaps, wide;
-    uint64_t dev, ino, size, write_seq, resize_seq;
-    vm_inode_map_t maps[VM_INODE_MAPS];
-} vm_inode_t;
-
 typedef struct {
     uint32_t lock, next_ticket;
     vm_inode_t inodes[VM_INODE_MAX];
 } vm_shm_t;
 
 static vm_shm_t *vm_shm_ptr;
-static vm_inode_t *vm_inode_table_ptr;
-static int vm_inode_table_tried, vm_has_shared_fallback, vm_saved_errno;
+/* Shared with src/vm/vm_file_sync.c via vm_file_int.h. */
+vm_inode_t *vm_inode_table_ptr;
+int vm_inode_table_tried, vm_has_shared_fallback;
+static int vm_saved_errno;
 static pid_t vm_pending_ticket;
 static int vm_fork_pipe[2] = { -1, -1 };
 static int vm_reserve_fds[2] = { -1, -1 };
 static pthread_mutex_t vm_inode_mu = PTHREAD_MUTEX_INITIALIZER;
 
-static vm_inode_t *vm_inode_table(void);
 static void vm_inode_fork_sync_locked(pid_t self);
 
 static void vm_reserve_init(void)
@@ -112,7 +98,7 @@ static void vm_shm_unlock(void)
 static _Thread_local int vm_preempt_depth;
 static _Thread_local sigset_t vm_preempt_saved;
 
-static void vm_lock(void)
+void vm_lock(void)
 {
     if (vm_preempt_depth == 0)
         mips_qs_block_preempt(&vm_preempt_saved);
@@ -123,7 +109,7 @@ static void vm_lock(void)
     vm_inode_fork_sync_locked(getpid());
 }
 
-static void vm_unlock(void)
+void vm_unlock(void)
 {
     vm_shm_unlock();
     (void)pthread_mutex_unlock(&vm_inode_mu);
@@ -259,7 +245,7 @@ static void vm_atfork_child(void)
     errno = vm_saved_errno;
 }
 
-static vm_inode_t *vm_inode_table(void)
+vm_inode_t *vm_inode_table(void)
 {
     if (vm_inode_table_ptr == NULL && !vm_inode_table_tried) {
         void *p = mmap(NULL, sizeof(vm_shm_t), PROT_READ | PROT_WRITE,
@@ -296,7 +282,7 @@ static void vm_inode_fork_sync_locked(pid_t self)
     vm_pending_ticket = 0;
 }
 
-static vm_inode_t *vm_inode_lookup(uint64_t dev, uint64_t ino, int create,
+vm_inode_t *vm_inode_lookup(uint64_t dev, uint64_t ino, int create,
                                    uint64_t size)
 {
     vm_inode_t *tab = vm_inode_table();
@@ -308,20 +294,35 @@ static vm_inode_t *vm_inode_lookup(uint64_t dev, uint64_t ino, int create,
         if (tab[i].used != 0 && tab[i].dev == dev && tab[i].ino == ino)
             return &tab[i];
     }
-    for (i = 0u; create && i < VM_INODE_MAX; i++) {
-        if (tab[i].used == 0) {
-            (void)memset(&tab[i], 0, sizeof tab[i]);
-            tab[i].used = 1;
-            tab[i].dev = dev;
-            tab[i].ino = ino;
-            tab[i].size = size;
-            return &tab[i];
+    if (create) {
+        /* Reclaim slots no mapping references anymore (R4-4): an
+         * entry with zero maps carries no per-VA metadata, so its
+         * stale identity/size/sequence state is safe to recycle. */
+        for (i = 0u; i < VM_INODE_MAX; i++) {
+            if (tab[i].used != 0 && tab[i].nmaps == 0) {
+                (void)memset(&tab[i], 0, sizeof tab[i]);
+                tab[i].used = 1;
+                tab[i].dev = dev;
+                tab[i].ino = ino;
+                tab[i].size = size;
+                return &tab[i];
+            }
+        }
+        for (i = 0u; i < VM_INODE_MAX; i++) {
+            if (tab[i].used == 0) {
+                (void)memset(&tab[i], 0, sizeof tab[i]);
+                tab[i].used = 1;
+                tab[i].dev = dev;
+                tab[i].ino = ino;
+                tab[i].size = size;
+                return &tab[i];
+            }
         }
     }
     return NULL;
 }
 
-static void vm_inode_note_resize_locked(vm_inode_t *in, uint64_t newsize,
+void vm_inode_note_resize_locked(vm_inode_t *in, uint64_t newsize,
                                         pid_t self)
 {
     int i;
@@ -359,7 +360,12 @@ static int vm_inode_apply_region_prots(mips64_ctx_t *ctx, uint64_t span_lo,
     return 0;
 }
 
-static void vm_inode_split_at(vm_inode_t *in, pid_t self, uint64_t split_va)
+/* Split the self-owned record straddling split_va (R4-4). Capacity
+ * and the replacement descriptor are reserved BEFORE the stored
+ * record is mutated; on exhaustion or dup failure the existing record
+ * is preserved untouched and -1 is returned so callers can fall back
+ * to conservative (wide) invalidation instead of losing metadata. */
+static int vm_inode_split_at(vm_inode_t *in, pid_t self, uint64_t split_va)
 {
     int i;
 
@@ -368,18 +374,102 @@ static void vm_inode_split_at(vm_inode_t *in, pid_t self, uint64_t split_va)
         vm_inode_map_t *m = &in->maps[i];
         if (m->pid != self || split_va <= m->va || split_va >= m->va + m->len)
             continue;
-        if ((unsigned)in->nmaps < VM_INODE_MAPS) {
+        if ((unsigned)in->nmaps >= VM_INODE_MAPS)
+            return -1;
+        {
             vm_inode_map_t r = *m;
+            int nd = -1;
+
             r.va = split_va;
             r.len = (m->va + m->len) - split_va;
             r.file_offset = m->file_offset + (split_va - m->va);
-            if (r.fd_dup >= 0)
-                r.fd_dup = fcntl(r.fd_dup, F_DUPFD_CLOEXEC, 0);
+            if (r.fd_dup >= 0) {
+                nd = fcntl(r.fd_dup, F_DUPFD_CLOEXEC, 0);
+                if (nd < 0)
+                    return -1;
+                r.fd_dup = nd;
+            }
             m->len = split_va - m->va;
             in->maps[in->nmaps++] = r;
         }
-        return;
+        return 0;
     }
+    return 0;
+}
+
+/* Translator-retained descriptors (R4-6) are never guest CLOEXEC
+ * victims: mapping dups plus the reserve/fork pipes. */
+int mips_vm_file_is_retained_fd(int fd)
+{
+    size_t k;
+    int i;
+
+    if (fd < 0) {
+        return 0;
+    }
+    if (fd == vm_fork_pipe[0] || fd == vm_fork_pipe[1] ||
+        fd == vm_reserve_fds[0] || fd == vm_reserve_fds[1]) {
+        return 1;
+    }
+    vm_lock();
+    if (vm_inode_table_ptr != NULL) {
+        for (k = 0u; k < VM_INODE_MAX; k++) {
+            vm_inode_t *in = &vm_inode_table_ptr[k];
+
+            if (in->used == 0) {
+                continue;
+            }
+            for (i = 0; i < in->nmaps; i++) {
+                if (in->maps[i].fd_dup == fd) {
+                    vm_unlock();
+                    return 1;
+                }
+            }
+        }
+    }
+    vm_unlock();
+    return 0;
+}
+
+/* Shared-mapping overlap probe for the protect path (R4-7). */
+int mips_vm_file_has_shared(uint64_t va, uint64_t len)
+{
+    uint64_t end = va + len;
+    size_t k;
+    int i;
+
+    if (len == 0u || end < va) {
+        return 0;
+    }
+    vm_lock();
+    if (vm_inode_table_ptr != NULL) {
+        for (k = 0u; k < VM_INODE_MAX; k++) {
+            vm_inode_t *in = &vm_inode_table_ptr[k];
+
+            if (in->used == 0) {
+                continue;
+            }
+            for (i = 0; i < in->nmaps; i++) {
+                vm_inode_map_t *m = &in->maps[i];
+                uint64_t mend;
+
+                if (m->shared == 0) {
+                    continue;
+                }
+                mend = m->va + m->len;
+                if (mend < m->va) {
+                    vm_unlock();
+                    return 1;
+                }
+                if (m->va < end && va < mend) {
+                    vm_unlock();
+                    return 1;
+                }
+            }
+        }
+    }
+    vm_unlock();
+    return 0;
 }
 
 void mips_vm_file_map_hook(mips64_ctx_t *ctx, int fd, uint64_t va,
@@ -470,18 +560,33 @@ void mips_vm_file_unmap_hook(uint64_t va, uint64_t len)
             } else if (va > mlo && end >= mhi) {
                 m->len = va - mlo;
             } else {
+                /* Middle punch: reserve the slot and the duped
+                 * descriptor BEFORE truncating the stored record
+                 * (R4-4). On exhaustion the record is preserved
+                 * whole (conservative over-approximation) and the
+                 * inode goes wide so DBT invalidation covers the
+                 * hole. */
                 if ((unsigned)in->nmaps < VM_INODE_MAPS) {
                     vm_inode_map_t r = *m;
+                    int nd = -1;
+
                     r.va = end;
                     r.len = mhi - end;
                     r.file_offset = m->file_offset + (end - mlo);
-                    if (r.fd_dup >= 0)
-                        r.fd_dup = fcntl(r.fd_dup, F_DUPFD_CLOEXEC, 0);
+                    if (r.fd_dup >= 0) {
+                        nd = fcntl(r.fd_dup, F_DUPFD_CLOEXEC, 0);
+                        if (nd < 0) {
+                            in->wide = 1;
+                            i++;
+                            continue;
+                        }
+                        r.fd_dup = nd;
+                    }
                     in->maps[in->nmaps++] = r;
+                    m->len = va - mlo;
                 } else {
                     in->wide = 1;
                 }
-                m->len = va - mlo;
             }
             i++;
         }
@@ -506,10 +611,15 @@ void mips_vm_file_protect_hook(uint64_t va, uint64_t len, uint32_t prot)
         int i;
         if (in->used == 0)
             continue;
-        if ((va & hmask) == 0u)
-            vm_inode_split_at(in, self, va);
-        if (end != ~(uint64_t)0u && (end & hmask) == 0u)
-            vm_inode_split_at(in, self, end);
+        /* A failed split preserves the straddled record; fall back
+         * to whole-inode invalidation so no executable alias keeps
+         * stale translations (R4-4). The containment update below
+         * then only touches exactly covered records. */
+        if ((va & hmask) == 0u && vm_inode_split_at(in, self, va) != 0)
+            in->wide = 1;
+        if (end != ~(uint64_t)0u && (end & hmask) == 0u &&
+            vm_inode_split_at(in, self, end) != 0)
+            in->wide = 1;
         for (i = 0; i < in->nmaps; i++) {
             vm_inode_map_t *m = &in->maps[i];
             if (m->pid == self && m->va >= va && m->va + m->len <= end)
@@ -527,6 +637,12 @@ static void vm_inode_internal_protect(mips64_ctx_t *ctx, uint64_t page,
     vm_inode_internal_prot = 0;
 }
 
+/* Invalidate translated code over a FILE-OFFSET interval [lo, hi)
+ * (R4-1). Each mapping covers file offsets [file_offset,
+ * file_offset + len); the overlap is translated into guest VA before
+ * invalidating, so a write to file offset zero reaches an executable
+ * alias mapped at a nonzero VA. Saturating ends keep the [lo, hi)
+ * shape when either interval wraps. */
 static void vm_inode_invalidate_maps(vm_inode_t *in, uint64_t lo, uint64_t hi)
 {
     pid_t self = getpid();
@@ -536,13 +652,21 @@ static void vm_inode_invalidate_maps(vm_inode_t *in, uint64_t lo, uint64_t hi)
         return;
     }
     for (i = 0; i < in->nmaps; i++) {
-        uint64_t s = in->maps[i].va, e = s + in->maps[i].len;
-        if (in->maps[i].pid == self && e > lo && s < hi)
-            dbt_invalidate_range(s, e - s);
+        uint64_t flo = in->maps[i].file_offset;
+        uint64_t fhi = (flo + in->maps[i].len < flo) ?
+            ~(uint64_t)0u : flo + in->maps[i].len;
+        uint64_t ilo = lo > flo ? lo : flo;
+        uint64_t ihi = hi < fhi ? hi : fhi;
+
+        if (in->maps[i].pid == self && ihi > ilo) {
+            uint64_t gva = in->maps[i].va + (ilo - flo);
+
+            dbt_invalidate_range(gva, ihi - ilo);
+        }
     }
 }
 
-static void vm_inode_apply_write_locked(mips64_ctx_t *ctx, vm_inode_t *in,
+void vm_inode_apply_write_locked(mips64_ctx_t *ctx, vm_inode_t *in,
                                         int fd_hint, uint64_t off, uint64_t n)
 {
     uint64_t wend = (off + n < off) ? ~(uint64_t)0u : off + n;
@@ -553,6 +677,7 @@ static void vm_inode_apply_write_locked(mips64_ctx_t *ctx, vm_inode_t *in,
         vm_inode_map_t *m = &in->maps[i];
         uint64_t mlo = m->va, mhi = m->va + m->len, page;
         int rfd = m->fd_dup >= 0 ? m->fd_dup : fd_hint;
+        int ok = 1;
         if (m->pid != self || m->native != 0)
             continue;
         for (page = mlo & ~(uint64_t)4095U; page < mhi; page += 4096u) {
@@ -571,18 +696,24 @@ static void vm_inode_apply_write_locked(mips64_ctx_t *ctx, vm_inode_t *in,
             if (flo < fhi &&
                 (m->shared != 0 ||
                  (mips_vm_page_flags(page >> 12) &
-                  (unsigned)MIPS_VM_PAGE_COW_CLEAN) != 0u))
-                mips_vm_inode_refresh_span(ctx, rfd, page, ps + (flo - fbase),
-                                           ps + (fhi - fbase), flo);
+                  (unsigned)MIPS_VM_PAGE_COW_CLEAN) != 0u) &&
+                mips_vm_inode_refresh_span(ctx, rfd, page,
+                                           ps + (flo - fbase),
+                                           ps + (fhi - fbase), flo) != 0)
+                ok = 0;
         }
-        m->seen_write_seq = in->write_seq;
-        m->seen_resize_seq = in->resize_seq;
-        m->min_size = in->size;
+        /* A failed refresh leaves the alias stale: keep the old
+         * sequence numbers so the next reconcile retries (R4-3). */
+        if (ok != 0) {
+            m->seen_write_seq = in->write_seq;
+            m->seen_resize_seq = in->resize_seq;
+            m->min_size = in->size;
+        }
     }
     vm_inode_invalidate_maps(in, off, wend);
 }
 
-static void vm_inode_post_truncate_locked(mips64_ctx_t *ctx, vm_inode_t *in,
+void vm_inode_post_truncate_locked(mips64_ctx_t *ctx, vm_inode_t *in,
                                           uint64_t newsize)
 {
     uint64_t eof_page = (newsize + 4095u) & ~(uint64_t)4095u;
@@ -591,6 +722,7 @@ static void vm_inode_post_truncate_locked(mips64_ctx_t *ctx, vm_inode_t *in,
     for (i = 0; i < in->nmaps; i++) {
         vm_inode_map_t *m = &in->maps[i];
         uint64_t mlo = m->va, mhi = m->va + m->len, page;
+        int ok = 1;
         if (m->pid != self || m->native != 0)
             continue;
         for (page = mlo & ~(uint64_t)4095U; page < mhi; page += 4096u) {
@@ -604,13 +736,17 @@ static void vm_inode_post_truncate_locked(mips64_ctx_t *ctx, vm_inode_t *in,
                 continue;
             if (fbase >= newsize) {
                 if (fbase >= eof_page && ps == page && pe == page + 4096u) {
-                    mips_vm_inode_zero_span(ctx, page, 0u, 4096u);
-                    mips_vm_pages_mark(page, 4096u,
-                                       (unsigned)MIPS_VM_PAGE_COW_CLEAN);
+                    if (mips_vm_inode_zero_span(ctx, page, 0u, 4096u) != 0)
+                        ok = 0;
+                    else
+                        mips_vm_pages_mark(page, 4096u,
+                                           (unsigned)MIPS_VM_PAGE_COW_CLEAN);
                     vm_inode_internal_protect(ctx, page, 0u);
                 } else if (m->shared != 0 ||
                            (fl & (unsigned)MIPS_VM_PAGE_COW_CLEAN) != 0u) {
-                    mips_vm_inode_zero_span(ctx, page, ps - page, pe - page);
+                    if (mips_vm_inode_zero_span(ctx, page, ps - page,
+                                                pe - page) != 0)
+                        ok = 0;
                 }
             } else {
                 if (ps == page && pe == page + 4096u &&
@@ -618,131 +754,21 @@ static void vm_inode_post_truncate_locked(mips64_ctx_t *ctx, vm_inode_t *in,
                     vm_inode_internal_protect(ctx, page, m->prot);
                 if (fbase + (pe - ps) > newsize &&
                     (m->shared != 0 ||
-                     (fl & (unsigned)MIPS_VM_PAGE_COW_CLEAN) != 0u))
+                     (fl & (unsigned)MIPS_VM_PAGE_COW_CLEAN) != 0u) &&
                     mips_vm_inode_zero_span(ctx, page,
                                             ps - page + (newsize - fbase),
-                                            pe - page);
+                                            pe - page) != 0)
+                    ok = 0;
             }
         }
-        m->seen_resize_seq = in->resize_seq;
+        /* A failed zero leaves the tail stale: keep the old resize
+         * sequence so the next reconcile retries (R4-3). */
+        if (ok != 0)
+            m->seen_resize_seq = in->resize_seq;
     }
     vm_inode_invalidate_maps(in, 0u, ~(uint64_t)0u);
 }
 
-void mips_vm_file_shared_sync(mips64_ctx_t *ctx, uint64_t va, uint64_t len)
-{
-    vm_inode_t *tab;
-    pid_t self = getpid();
-    size_t k;
-    int synced = 0;
-    if (ctx == NULL || len == 0u || !vm_has_shared_fallback)
-        return;
-    vm_lock();
-    tab = vm_inode_table();
-    for (k = 0u; tab != NULL && k < VM_INODE_MAX; k++) {
-        vm_inode_t *in = &tab[k];
-        int i;
-        for (i = 0; in->used != 0 && i < in->nmaps; i++) {
-            vm_inode_map_t *m = &in->maps[i];
-            uint64_t lo = va > m->va ? va : m->va;
-            uint64_t hi = (va + len) < (m->va + m->len) ? (va + len) :
-                                                         (m->va + m->len);
-            uint64_t foff = m->file_offset + (lo - m->va);
-            if (m->pid != self || m->shared == 0 || m->native != 0 ||
-                m->fd_dup < 0 || lo >= hi)
-                continue;
-            (void)pwrite(m->fd_dup, mips64_guest_ptr(ctx, lo),
-                         (size_t)(hi - lo), (off_t)foff);
-            mips_vm_pages_mark(lo, hi - lo, (unsigned)MIPS_VM_PAGE_COW_CLEAN);
-            in->write_seq++;
-            m->seen_write_seq = in->write_seq;
-            vm_inode_apply_write_locked(ctx, in, m->fd_dup, foff, hi - lo);
-            synced = 1;
-        }
-    }
-    vm_unlock();
-    if (synced != 0)
-        mips_soft_tlb_invalidate_all();
-}
-
-void mips_vm_file_reconcile(mips64_ctx_t *ctx)
-{
-    vm_inode_t *tab;
-    pid_t self = getpid();
-    size_t k;
-    if (ctx == NULL || !vm_inode_table_tried || vm_inode_table_ptr == NULL)
-        return;
-    vm_lock();
-    tab = vm_inode_table_ptr;
-    for (k = 0u; k < VM_INODE_MAX; k++) {
-        vm_inode_t *in = &tab[k];
-        uint64_t min_sz = in->size;
-        int i, need_trunc = 0, need_write = 0;
-        if (in->used == 0)
-            continue;
-        for (i = 0; i < in->nmaps; i++) {
-            vm_inode_map_t *m = &in->maps[i];
-            if (m->pid != self || m->native != 0)
-                continue;
-            if (m->seen_resize_seq < in->resize_seq) {
-                need_trunc = 1;
-                if (m->min_size < min_sz)
-                    min_sz = m->min_size;
-                m->min_size = in->size;
-            }
-            if (m->seen_write_seq != in->write_seq)
-                need_write = 1;
-        }
-        if (need_trunc != 0) {
-            vm_inode_post_truncate_locked(ctx, in, min_sz);
-            if (in->size != min_sz) {
-                vm_inode_post_truncate_locked(ctx, in, in->size);
-                need_write = 1;
-            }
-        }
-        if (need_write != 0)
-            vm_inode_apply_write_locked(ctx, in, -1, 0u, ~(uint64_t)0u);
-    }
-    vm_unlock();
-}
-
-int mips_vm_file_read_page(mips64_ctx_t *ctx, uint64_t page_va,
-                           uint8_t *out_page)
-{
-    vm_inode_t *tab;
-    pid_t self = getpid();
-    size_t k;
-    int done = 0;
-    (void)ctx;
-    if (out_page == NULL || !vm_inode_table_tried || vm_inode_table_ptr == NULL)
-        return 0;
-    vm_lock();
-    tab = vm_inode_table_ptr;
-    for (k = 0u; k < VM_INODE_MAX && done == 0; k++) {
-        vm_inode_t *in = &tab[k];
-        int i;
-        for (i = 0; in->used != 0 && i < in->nmaps; i++) {
-            vm_inode_map_t *m = &in->maps[i];
-            if (m->pid != self || page_va < m->va || page_va >= m->va + m->len)
-                continue;
-            if (m->native != 0 || m->shared != 0 ||
-                (mips_vm_page_flags(page_va >> 12) &
-                 (unsigned)MIPS_VM_PAGE_COW_CLEAN) != 0u) {
-                uint64_t foff = m->file_offset + (page_va - m->va);
-                ssize_t got = (m->fd_dup >= 0) ?
-                    pread(m->fd_dup, out_page, 4096u, (off_t)foff) : 0;
-                if (got < 0)
-                    got = 0;
-                if ((size_t)got < 4096u)
-                    (void)memset(out_page + got, 0, 4096u - (size_t)got);
-                done = 1;
-            }
-            break;
-        }
-    }
-    vm_unlock();
-    return done;
-}
 
 static void vm_inode_restore_slice(mips64_ctx_t *ctx, const vm_inode_map_t *m,
                                    uint64_t slo, uint64_t shi)
@@ -805,8 +831,12 @@ void mips_vm_file_remap_hook(mips64_ctx_t *ctx, uint64_t old_va,
         int i, touched = 0;
         if (in->used == 0)
             continue;
-        vm_inode_split_at(in, self, old_va);
-        vm_inode_split_at(in, self, old_va + kept);
+        /* A failed split preserves the straddled record; the move
+         * loop below then skips the unseparated span and the inode
+         * goes wide so invalidation stays conservative (R4-4). */
+        if (vm_inode_split_at(in, self, old_va) != 0 ||
+            vm_inode_split_at(in, self, old_va + kept) != 0)
+            in->wide = 1;
         for (i = 0; i < in->nmaps; i++) {
             vm_inode_map_t *m = &in->maps[i];
             if (m->pid != self || m->va < old_va || m->va + m->len > old_va + kept)
@@ -844,55 +874,3 @@ void mips_vm_file_remap_hook(mips64_ctx_t *ctx, uint64_t old_va,
     vm_unlock();
 }
 
-void mips_vm_file_post_write(mips64_ctx_t *ctx, int fd, uint64_t off, uint64_t n)
-{
-    struct stat st;
-    vm_inode_t *in;
-    pid_t self = getpid();
-    if (ctx == NULL || fd < 0 || n == 0u || fstat(fd, &st) != 0)
-        return;
-    vm_lock();
-    in = vm_inode_lookup((uint64_t)st.st_dev, (uint64_t)st.st_ino, 0, 0u);
-    if (in != NULL) {
-        if (in->size != (uint64_t)st.st_size)
-            vm_inode_note_resize_locked(in, (uint64_t)st.st_size, self);
-        in->write_seq++;
-        vm_inode_apply_write_locked(ctx, in, fd, off, n);
-    }
-    vm_unlock();
-}
-
-void mips_vm_file_post_write_seq(mips64_ctx_t *ctx, int fd, uint64_t n)
-{
-    off_t cur = (ctx != NULL && fd >= 0 && n != 0u) ? lseek(fd, 0, SEEK_CUR) : -1;
-    if (ctx != NULL && fd >= 0 && n != 0u)
-        mips_vm_file_post_write(ctx, fd,
-                                (cur < 0 || (uint64_t)cur < n) ? 0u : (uint64_t)cur - n,
-                                (cur < 0 || (uint64_t)cur < n) ? ~(uint64_t)0u : n);
-}
-
-void mips_vm_file_post_truncate_fd(mips64_ctx_t *ctx, int fd, uint64_t newsize)
-{
-    struct stat st;
-    vm_inode_t *in;
-    pid_t self = getpid();
-    if (ctx == NULL || fd < 0 || fstat(fd, &st) != 0)
-        return;
-    vm_lock();
-    in = vm_inode_lookup((uint64_t)st.st_dev, (uint64_t)st.st_ino, 0, 0u);
-    if (in != NULL) {
-        vm_inode_note_resize_locked(in, newsize, self);
-        vm_inode_post_truncate_locked(ctx, in, newsize);
-    }
-    vm_unlock();
-}
-
-void mips_vm_file_post_truncate_path(mips64_ctx_t *ctx, const char *host_path,
-                                     uint64_t newsize)
-{
-    int fd = (host_path != NULL) ? open(host_path, O_RDONLY | O_CLOEXEC) : -1;
-    if (fd >= 0) {
-        mips_vm_file_post_truncate_fd(ctx, fd, newsize);
-        (void)close(fd);
-    }
-}

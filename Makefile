@@ -77,6 +77,7 @@ BOOT_COMMON := src/main.c \
 	src/os/quiesce.c \
 	src/vm/vm64.c \
 	src/vm/vm_file.c \
+	src/vm/vm_file_sync.c \
 	src/vm/vm_pages.c \
 	src/dbt/a64_emit.c \
 	src/dbt/dbt.c \
@@ -130,6 +131,7 @@ U0_SRCS := tests/test_u0_delay_tlb.c \
 	$(HOST_BACKEND) \
 	src/vm/vm64.c \
 	src/vm/vm_file.c \
+	src/vm/vm_file_sync.c \
 	src/vm/vm_pages.c \
 	src/dbt/aot/sites.c \
 	src/interp/decode.c \

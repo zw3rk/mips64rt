@@ -333,50 +333,98 @@ int mips_vm_inode_page_host_prot(uint64_t page_va)
     return -1;
 }
 
-void mips_vm_inode_zero_span(mips64_ctx_t *ctx, uint64_t page_va,
-                             uint64_t from, uint64_t to)
+/* Union of guest MIPS_PROT_* bits over [lo, hi). Unmapped holes
+ * contribute nothing, so a restored host cover never grants more than
+ * the software region tables allow. */
+static uint32_t u0_union_prot(uint64_t lo, uint64_t hi)
 {
-    uint8_t *p;
-    int hp;
+    size_t n = mips_mem_region_count(), i;
+    uint32_t u = 0u;
 
-    if (ctx == NULL || from >= to || to > 4096u)
-        return;
-    p = (uint8_t *)mips64_guest_ptr(ctx, page_va);
-    hp = (p != NULL) ? mips_vm_inode_page_host_prot(page_va) : -1;
-    if (hp < 0)
-        return;
-    if ((hp & PROT_WRITE) == 0) {
-        if (mprotect(p, 4096u, PROT_READ | PROT_WRITE) != 0)
-            return;
-        (void)memset(p + from, 0, (size_t)(to - from));
-        (void)mprotect(p, 4096u, hp);
-        return;
+    for (i = 0u; i < n; i++) {
+        uint64_t s = 0u, e = 0u;
+        uint32_t prot = 0u;
+
+        if (mips_mem_region_at(i, &s, &e, &prot) != 0)
+            break;
+        if (s < hi && lo < e)
+            u |= prot;
     }
-    (void)memset(p + from, 0, (size_t)(to - from));
+    return u;
 }
 
-void mips_vm_inode_refresh_span(mips64_ctx_t *ctx, int fd, uint64_t page_va,
-                                uint64_t glo, uint64_t ghi, uint64_t fpos)
+/* 16 KiB host-page cover (lane U12): widen the enclosing host-page
+ * range of one guest page to RW before touching subpages. A guest
+ * page at host offset 0x1000 is not a valid protection boundary on a
+ * 16 KiB host, so guest-granularity mprotect must never be used here.
+ * Returns the host base/len and the union-derived restore prot, or -1
+ * when the range is unusable. */
+static int u0_cover_rw(mips64_ctx_t *ctx, uint64_t page_va, void **host_out,
+                       size_t *len_out, int *restore_out)
+{
+    uint64_t hps = (uint64_t)u0_page_size();
+    uint64_t halo = page_va & ~(hps - 1u);
+    uint64_t hlen = hps;
+    void *host;
+
+    if ((page_va & 4095u) != 0u || hlen == 0u || halo + hlen < halo)
+        return -1;
+    host = mips64_guest_ptr(ctx, halo);
+    if (host == NULL ||
+        mips64_guest_ptr(ctx, halo + hlen - 1u) == NULL)
+        return -1;
+    if (mprotect(host, (size_t)hlen, PROT_READ | PROT_WRITE) != 0)
+        return -1;
+    *host_out = host;
+    *len_out = (size_t)hlen;
+    *restore_out = u0_host_prot(u0_union_prot(halo, halo + hlen));
+    return 0;
+}
+
+int mips_vm_inode_zero_span(mips64_ctx_t *ctx, uint64_t page_va,
+                            uint64_t from, uint64_t to)
+{
+    uint8_t *p;
+    void *host;
+    size_t hlen;
+    int restore;
+
+    if (ctx == NULL || from >= to || to > 4096u)
+        return -1;
+    p = (uint8_t *)mips64_guest_ptr(ctx, page_va);
+    if (p == NULL)
+        return -1;
+    if (u0_cover_rw(ctx, page_va, &host, &hlen, &restore) != 0)
+        return -1;
+    (void)memset(p + from, 0, (size_t)(to - from));
+    if (mprotect(host, hlen, restore) != 0)
+        return -1;
+    return 0;
+}
+
+int mips_vm_inode_refresh_span(mips64_ctx_t *ctx, int fd, uint64_t page_va,
+                               uint64_t glo, uint64_t ghi, uint64_t fpos)
 {
     uint8_t *p;
     uint64_t from, to;
-    int hp;
+    void *host;
+    size_t hlen;
+    int restore;
     ssize_t got;
 
     if (ctx == NULL || fd < 0 || glo >= ghi)
-        return;
-    from = glo - (page_va & ~(uint64_t)4095U);
-    to = ghi - (page_va & ~(uint64_t)4095U);
+        return -1;
+    if ((page_va & 4095u) != 0u || glo < page_va)
+        return -1;
+    from = glo - page_va;
+    to = ghi - page_va;
     if (to > 4096u)
-        return;
-    p = (uint8_t *)mips64_guest_ptr(ctx, page_va & ~(uint64_t)4095U);
-    hp = (p != NULL) ?
-         mips_vm_inode_page_host_prot(page_va & ~(uint64_t)4095U) : -1;
-    if (hp < 0)
-        return;
-    if ((hp & PROT_WRITE) == 0 &&
-        mprotect(p, 4096u, PROT_READ | PROT_WRITE) != 0)
-        return;
+        return -1;
+    p = (uint8_t *)mips64_guest_ptr(ctx, page_va);
+    if (p == NULL)
+        return -1;
+    if (u0_cover_rw(ctx, page_va, &host, &hlen, &restore) != 0)
+        return -1;
     got = pread(fd, p + from, (size_t)(to - from), (off_t)fpos);
     if (got < 0)
         got = 0;
@@ -384,8 +432,9 @@ void mips_vm_inode_refresh_span(mips64_ctx_t *ctx, int fd, uint64_t page_va,
         (void)memset(p + from + (uint64_t)got, 0,
                      (size_t)(to - from - (uint64_t)got));
     }
-    if ((hp & PROT_WRITE) == 0)
-        (void)mprotect(p, 4096u, hp);
+    if (mprotect(host, hlen, restore) != 0)
+        return -1;
+    return 0;
 }
 
 int mips_vm64_reserve(mips_vm64_t *vm, const mips_provider_ops_t *ops,

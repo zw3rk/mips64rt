@@ -180,7 +180,7 @@ if [ -x _build/test_r3_defects ] || "$CC_HOST" -std=c11 -Werror=vla -pedantic -W
     src/interp/fp_ps.c src/os/mem.c src/os/mem_table.c src/os/backend_state.c \
     src/os/proc.c src/os/syscalls.c src/os/syscalls_extra.c src/os/syscalls_sync.c \
     src/os/syscalls_time.c src/os/syscalls_stat.c src/os/host_args.c src/os/quiesce.c \
-    src/os/signal_core.c src/vm/vm64.c src/vm/vm_file.c src/vm/vm_pages.c \
+    src/os/signal_core.c src/vm/vm64.c src/vm/vm_file.c src/vm/vm_file_sync.c src/vm/vm_pages.c \
     src/dbt/aot/sites.c src/dbt/a64_emit.c src/dbt/emit_enc.c src/dbt/emit_alu.c \
     src/dbt/emit_mem.c src/dbt/emit_fpmem.c src/dbt/emit_int.c src/dbt/emit_fp.c \
     src/dbt/arena.c src/dbt/dbt.c src/dbt/mem_recover.c src/dbt/trampoline_a64.S \

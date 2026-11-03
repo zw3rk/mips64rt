@@ -316,6 +316,36 @@ static void free_vec(char **vec, size_t n)
     free(vec);
 }
 
+/* Guest CLOEXEC sweep (R4-6): close every FD_CLOEXEC descriptor
+ * except translator-retained file-mapping fds. Runs only after the
+ * target binary open/ELF validation succeeds, right before image
+ * replacement, so a failing execve path never loses descriptors. */
+extern int mips_vm_file_is_retained_fd(int fd);
+
+static void exec_close_cloexec(void)
+{
+    long maxfd = sysconf(_SC_OPEN_MAX);
+    long fd;
+
+    if (maxfd < 0 || maxfd > 8192L) {
+        maxfd = 8192L;
+    }
+    for (fd = 0; fd < maxfd; fd++) {
+        int flags;
+
+        if (mips_vm_file_is_retained_fd((int)fd) != 0) {
+            continue;
+        }
+        flags = fcntl((int)fd, F_GETFD);
+        if (flags < 0) {
+            continue;
+        }
+        if ((flags & FD_CLOEXEC) != 0) {
+            (void)close((int)fd);
+        }
+    }
+}
+
 /* Clear exec-sensitive state on success: all actions to SIG_DFL, masks
  * and queues empty, altstack off, clear_child_tid forgotten, LL gone. */
 static void reset_state_for_exec(mips64_ctx_t *ctx)
@@ -511,6 +541,10 @@ int64_t mips_sc_exec(mips64_ctx_t *ctx, uint64_t nr, uint64_t path_va,
     }
     free_vec(host_argv, argc);
     free_vec(host_envp, envc);
+    /* Target open/ELF validation succeeded inside the loader; the
+     * image is replaced from here on, so close guest CLOEXEC fds
+     * now (never on the failure path above). */
+    exec_close_cloexec();
     /* Old reservation is now orphaned (the loader zeroed ctx first):
      * release it; the new window owns the address space. */
     if (old_base != 0U && old_size != 0U && old_base != ctx->guest_base) {

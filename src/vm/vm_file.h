@@ -39,6 +39,9 @@ void mips_vm_file_map_hook(mips64_ctx_t *ctx, int fd, uint64_t va,
                            uint64_t len, uint64_t file_offset,
                            uint32_t prot, int is_shared);
 void mips_vm_file_unmap_hook(uint64_t va, uint64_t len);
+/* Translator-retained descriptor (R4-6): file-mapping dup, reserve or
+ * fork pipe. Guest CLOEXEC sweeps on execve must skip these. */
+int mips_vm_file_is_retained_fd(int fd);
 void mips_vm_file_protect_hook(uint64_t va, uint64_t len, uint32_t prot);
 void mips_vm_file_shared_sync(mips64_ctx_t *ctx, uint64_t va, uint64_t len);
 void mips_vm_file_reconcile(mips64_ctx_t *ctx);
@@ -65,5 +68,9 @@ void mips_vm_file_post_truncate_fd(mips64_ctx_t *ctx, int fd,
 void mips_vm_file_post_truncate_path(mips64_ctx_t *ctx,
                                      const char *host_path,
                                      uint64_t newsize);
+/* True when a shared file mapping overlaps [va, va+len) (R4-7): the
+ * host-page protect cover cannot represent shared sub-page
+ * permissions, so the protect path rejects with -EINVAL. */
+int mips_vm_file_has_shared(uint64_t va, uint64_t len);
 
 #endif /* MIPS64RT_VM_VM_FILE_H */
