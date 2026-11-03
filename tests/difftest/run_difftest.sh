@@ -125,6 +125,10 @@ run_engine b "$ENGB"
 rca=$(cat "$TDIR/a.rc")
 rcb=$(cat "$TDIR/b.rc")
 echo "exits: $ENGA=$rca $ENGB=$rcb"
+# R5 scope: single-process deterministic guest fixtures only, where
+# instruction trace order is deterministic. Exit codes >= 124 are
+# reserved for timeout/signal termination (timeout(1)/docker), never
+# for guest exits, and are treated as infrastructure failures below.
 if [ "$rca" -ge 124 ] || [ "$rcb" -ge 124 ]; then
 	echo "DIFFTEST: infrastructure/timeout failure ($ENGA=$rca $ENGB=$rcb)" >&2
 	echo "--- $ENGA stderr tail ---"

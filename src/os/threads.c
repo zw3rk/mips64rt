@@ -494,13 +494,8 @@ void mips_thread_exit(mips64_ctx_t *ctx, int status)
         _Exit(status);
     }
     mips64_ctx_clear_ll(ctx);
-    if (!ctx->is_thread_clone) {
-        while (mips_thread_group_live() > 0) {
-            struct timespec rq = { 0, 1000000L };
-            (void)nanosleep(&rq, NULL);
-        }
-        _Exit(status);
-    }
+    /* R5: clear the CLONE_CHILD_CLEARTID word before any wait so a
+     * worker joining the leader never deadlocks on a stale word. */
     clear_va = ctx->clear_child_tid;
     ctx->clear_child_tid = 0U;
     if (clear_va != 0U && (clear_va & 3U) == 0U &&
@@ -508,6 +503,13 @@ void mips_thread_exit(mips64_ctx_t *ctx, int status)
         (void)guest_st32(ctx, clear_va, 0U);
         l4b_futex_wake((uint32_t *)mips64_guest_ptr(ctx, clear_va));
         l4b_guest_wake(ctx, clear_va);
+    }
+    if (!ctx->is_thread_clone) {
+        while (mips_thread_group_live() > 0) {
+            struct timespec rq = { 0, 1000000L };
+            (void)nanosleep(&rq, NULL);
+        }
+        _Exit(status);
     }
     (void)pthread_mutex_lock(&l4b_mu);
     for (i = 0U; i < L4B_THREAD_MAX; i++) {

@@ -198,16 +198,3 @@ int64_t mips_sc_clock_nanosleep(mips64_ctx_t *ctx, uint64_t clk,
     }
     return l2a_ret(ctx, 0);
 }
-
-/* R5 canonical names (M64-R5-1/10). */
-int64_t mips_sys_clock_nanosleep4(mips64_ctx_t *ctx, uint64_t clk,
-    uint64_t flags, uint64_t req_va, uint64_t rem_va, int is_time64)
-{
-    return mips_sc_clock_nanosleep(ctx, clk, flags, req_va, rem_va,
-        is_time64);
-}
-int64_t mips_sys_clock_getres(mips64_ctx_t *ctx, uint64_t clk,
-    uint64_t res_va, int is64)
-{
-    return mips_sc_clock_getres(ctx, clk, res_va, is64);
-}

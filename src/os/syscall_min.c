@@ -47,6 +47,7 @@ extern int64_t mips_sc_clock_nanosleep(mips64_ctx_t *ctx, uint64_t clk,
 extern int64_t mips_sc_clock_getres(mips64_ctx_t *ctx, uint64_t clk,
                                     uint64_t ts_va, int is64);
 extern int mips_thread_group_live(void);
+extern void mips_thread_exit(mips64_ctx_t *ctx, int status);
 extern int64_t mips_sc_getrandom(mips64_ctx_t *ctx, uint64_t buf_va,
                                  uint64_t len, uint64_t flags);
 extern int64_t mips_sc_futex(mips64_ctx_t *ctx, uint64_t uaddr, uint64_t op,
@@ -569,15 +570,11 @@ static int64_t mips_syscall_inner(mips64_ctx_t *ctx)
         }
         if (!is_group && !ctx->is_thread_clone &&
             mips_thread_group_live() > 0) {
-            struct timespec rq = { 0, 1000000L };
-            mips_qs_lease_exit(ctx);
-            while (mips_thread_group_live() > 0) {
-                (void)nanosleep(&rq, NULL);
-            }
             if (getenv("MIPS64RT_DUMPSTATE") != NULL) {
                 mips_dump_regs(ctx, stderr);
             }
-            _Exit((int)(a0 & 0xFFU));
+            mips_qs_lease_exit(ctx);
+            mips_thread_exit(ctx, (int)a0);
             return sc_ret(ctx, 0); /* unreachable */
         }
         if (getenv("MIPS64RT_DUMPSTATE") != NULL) {

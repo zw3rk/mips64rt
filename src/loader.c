@@ -39,7 +39,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/types.h>
-#include <time.h>
+#include <sys/random.h>
 #include <unistd.h>
 
 /* Region helpers owned by src/os/mem.c (lane L1c). */
@@ -242,9 +242,10 @@ static size_t str_len(const char *s)
     return n;
 }
 
-/* AT_RANDOM: host CSPRNG (/dev/urandom, EINTR retry); RANDSEED
- * overrides for deterministic difftest runs. */
-static void rand16(uint8_t out[16])
+/* AT_RANDOM: host CSPRNG (getentropy, then /dev/urandom); RANDSEED
+ * overrides for deterministic difftest runs. Fail closed: no
+ * clock/PID fallback, so production never uses predictable bytes. */
+static int rand16(uint8_t out[16])
 {
     const char *env = getenv("MIPS64RT_RANDSEED");
     uint64_t s = 0U;
@@ -253,30 +254,30 @@ static void rand16(uint8_t out[16])
     if (env != NULL && env[0] != '\0') {
         s = (uint64_t)strtoull(env, NULL, 0);
     } else {
-        int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
-        if (fd >= 0) {
-            size_t done = 0U;
-            while (done < 16U) {
-                ssize_t got = read(fd, out + done, 16U - done);
-                if (got < 0) {
-                    if (errno == EINTR) {
-                        continue;
-                    }
-                    break;
-                }
-                if (got == 0) {
-                    break;
-                }
-                done += (size_t)got;
-            }
-            (void)close(fd);
-            if (done == 16U) {
-                return;
-            }
-        }
-        { struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
-          s = (uint64_t)ts.tv_nsec ^ ((uint64_t)getpid() << 32) ^
-              (uint64_t)ts.tv_sec; }
+        if (getentropy(out, 16) == 0) return 0;
+        { int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+          size_t done = 0U;
+          if (fd >= 0) {
+              while (done < 16U) {
+                  ssize_t got = read(fd, out + done, 16U - done);
+                  if (got < 0) {
+                      if (errno == EINTR) {
+                          continue;
+                      }
+                      break;
+                  }
+                  if (got == 0) {
+                      break;
+                  }
+                  done += (size_t)got;
+              }
+              (void)close(fd);
+              if (done == 16U) {
+                  return 0;
+              }
+          } }
+        errno = EIO;
+        return -1;
     }
     if (s == 0U) {
         s = UINT64_C(0x9E3779B97F4A7C15);
@@ -285,6 +286,7 @@ static void rand16(uint8_t out[16])
         s ^= s << 13; s ^= s >> 7; s ^= s << 17;
         out[i] = (uint8_t)s;
     }
+    return 0;
 }
 
 /* Host-only environment never reaches the guest: LD_* (a host
@@ -675,7 +677,9 @@ static int build_stack(mips64_ctx_t *ctx, int argc, char **argv, char **envp,
         }
         memcpy(mem + (execfn_va - stack_base), guest_path,
            str_len(guest_path) + 1U);
-        rand16(rnd);
+        if (rand16(rnd) != 0) {
+            return -1;
+        }
         memcpy(mem + (rnd_va - stack_base), rnd, 16U);
     }
     sp = (argv_base - frame) & ~UINT64_C(15);
