@@ -346,13 +346,14 @@ static void exec_close_cloexec(void)
     }
 }
 
-/* Clear exec-sensitive state on success: all actions to SIG_DFL, masks
- * and queues empty, altstack off, clear_child_tid forgotten, LL gone. */
+extern int mips_thread_group_live(void);
+
+/* Clear exec-sensitive state on success: caught actions to SIG_DFL
+ * (SIG_IGN and sig_blocked preserved per signal(7)), queues empty,
+ * altstack off, clear_child_tid forgotten, LL gone. */
 static void reset_state_for_exec(mips64_ctx_t *ctx)
 {
     mips64_signals_reset_for_exec(ctx);
-    ctx->sig_blocked[0] = 0U;
-    ctx->sig_blocked[1] = 0U;
     ctx->pend_head = 0U;
     ctx->pend_count = 0U;
     ctx->sigalt_sp = 0U;
@@ -397,8 +398,8 @@ int64_t mips_sc_exec(mips64_ctx_t *ctx, uint64_t nr, uint64_t path_va,
         nr != (uint64_t)(n32 ? MIPS64_NR32_execve : MIPS64_NR_execve)) {
         return exec_ret(ctx, -(int64_t)ENOSYS);
     }
-    /* Refuse with -EPERM under CLONE_THREAD (Linux execve semantics). */
-    if (ctx->is_thread_clone) {
+    /* Refuse when a sibling thread clone is live (M64-R10-1). */
+    if (ctx->is_thread_clone || mips_thread_group_live() > 0) {
         return exec_ret(ctx, -(int64_t)EPERM);
     }
     if (is_at) {

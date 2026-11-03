@@ -463,8 +463,8 @@ int mips_signal_has_handler(int signo)
     return (l4a_handler_words[l4a_word(signo)] & l4a_bit(signo)) != 0U;
 }
 
-/* execve reset: every action to SIG_DFL, masks and queues cleared,
- * altstack disabled, handler mirror refreshed. */
+/* execve reset (M64-R10-2): caught actions to SIG_DFL, SIG_IGN (1) and
+ * sig_blocked preserved per signal(7), queues/altstack cleared. */
 void mips64_signals_reset_for_exec(mips64_ctx_t *ctx)
 {
     size_t i;
@@ -473,14 +473,14 @@ void mips64_signals_reset_for_exec(mips64_ctx_t *ctx)
         return;
     }
     for (i = 0U; i < 129U; i++) {
-        ctx->sigactions[i].handler = 0U;
+        if (ctx->sigactions[i].handler != 1U) {
+            ctx->sigactions[i].handler = 0U;
+        }
         ctx->sigactions[i].flags = 0U;
         ctx->sigactions[i].mask[0] = 0U;
         ctx->sigactions[i].mask[1] = 0U;
         ctx->sigactions[i].restorer = 0U;
     }
-    ctx->sig_blocked[0] = 0U;
-    ctx->sig_blocked[1] = 0U;
     ctx->pend_head = 0U;
     ctx->pend_count = 0U;
     ctx->sigalt_sp = 0U;
