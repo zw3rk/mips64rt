@@ -26,7 +26,7 @@ static inline int32_t l2a_errno_from_host(int host_errno)
 #if defined(__APPLE__)
     switch (host_errno) {
     case 11:
-        return 35; /* EDEADLK */
+        return 45; /* EDEADLK */
     case 35:
         return 11; /* EAGAIN (== EWOULDBLOCK) */
     case 36:
@@ -38,24 +38,43 @@ static inline int32_t l2a_errno_from_host(int host_errno)
     case 60:
         return 110; /* ETIMEDOUT */
     case 62:
-        return 40; /* ELOOP */
+        return 90; /* ELOOP */
     case 63:
-        return 36; /* ENAMETOOLONG */
+        return 78; /* ENAMETOOLONG */
     case 66:
-        return 39; /* ENOTEMPTY */
+        return 93; /* ENOTEMPTY */
     case 69:
-        return 122; /* EDQUOT */
+        return 1133; /* EDQUOT */
     case 77:
         return 37; /* ENOLCK */
     case 78:
         return 89; /* ENOSYS */
     case 84:
-        return 75; /* EOVERFLOW */
+        return 79; /* EOVERFLOW */
     default:
         return (int32_t)host_errno;
     }
 #else
-    return (host_errno == 38) ? 89 : (int32_t)host_errno;
+    switch (host_errno) {
+    case 35:
+        return 45; /* EDEADLK */
+    case 36:
+        return 78; /* ENAMETOOLONG */
+    case 38:
+        return 89; /* ENOSYS */
+    case 39:
+        return 93; /* ENOTEMPTY */
+    case 40:
+        return 90; /* ELOOP */
+    case 75:
+        return 79; /* EOVERFLOW */
+    case 95:
+        return 122; /* EOPNOTSUPP */
+    case 122:
+        return 1133; /* EDQUOT */
+    default:
+        return (int32_t)host_errno;
+    }
 #endif
 }
 
