@@ -143,9 +143,13 @@ int fpmove_cop0(mips64_ctx_t *ctx, const mips_dec_t *d);
  * MIPS_FAULT with the fault already recorded. */
 int interp_exec_mem(mips64_ctx_t *ctx, uint64_t cur_pc, const mips_dec_t *d);
 
-/* True when the decoded instruction transfers control with a delay slot:
- * J/JAL, all (likely and non-likely) integer branches, JR/JALR. Traps,
- * SYSCALL/BREAK and SYNCI are not control transfers (no delay slot). */
+/* Canonical delay-slot classifier (both engines): J/JAL, all (likely
+ * and non-likely) integer branches, JR/JALR, and COP1 BC1F/BC1T/BC1FL/
+ * BC1TL (op 0x11, rs 0x08; every rt names an FCC/cc variant). Traps,
+ * SYSCALL/BREAK and SYNCI are not control transfers (no delay slot).
+ * NOTE: interp_step keeps BC1 on the fpmove run-stop protocol via
+ * exec_simple (exec_branch has no COP1 case), so its two routing checks
+ * exclude op 0x11 explicitly. */
 static inline int interp_is_control(const mips_dec_t *d)
 {
     switch (d->op) {
@@ -176,6 +180,8 @@ static inline int interp_is_control(const mips_dec_t *d)
         }
     case 0x00u: /* SPECIAL */
         return d->funct == 0x08u || d->funct == 0x09u; /* JR / JALR */
+    case 0x11u: /* COP1 BC1F/BC1T/BC1FL/BC1TL (lane L3b) */
+        return d->rs == 0x08u;
     default:
         return 0;
     }

@@ -183,6 +183,21 @@ static void insert_region(uint64_t va, uint64_t len, uint32_t prot,
     }
 }
 
+/* First region with r->end > va (regions are sorted). O(log N). */
+static size_t region_lower_bound(uint64_t va)
+{
+    size_t lo = 0U, hi = g_region_count;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2U;
+
+        if (g_regions[mid].end <= va)
+            lo = mid + 1U;
+        else
+            hi = mid;
+    }
+    return lo;
+}
+
 int mips_mem_ok(const mips64_ctx_t *ctx, uint64_t va, uint64_t len,
                 uint32_t need)
 {
@@ -197,13 +212,12 @@ int mips_mem_ok(const mips64_ctx_t *ctx, uint64_t va, uint64_t len,
     end = va + len;
     cur = va;
     mem_lock();
-    for (i = 0; i < g_region_count; i++) {
+    /* Advance only across contiguous abutting regions covering [va, end). */
+    for (i = region_lower_bound(cur); i < g_region_count; i++) {
         const mips64_region_t *r = &g_regions[i];
 
         if (r->start > cur)
             break;
-        if (r->end <= cur)
-            continue;
         if ((r->prot & need) != need)
             break;
         cur = r->end;
@@ -212,14 +226,11 @@ int mips_mem_ok(const mips64_ctx_t *ctx, uint64_t va, uint64_t len,
             break;
         }
     }
-    if (cur >= end)
-        ok = 1;
     mem_unlock();
     return ok;
 }
 
-/* Region flag: host MAP_SHARED backing (MAP_SHARED|MAP_ANONYMOUS),
- * so host fork() preserves sharing instead of COW-diverging. */
+/* Region flag: host MAP_SHARED backing, so host fork() shares. */
 #define MIPS_REGION_SHARED 1U
 
 /* Mark covered regions shared; caller holds mem_lock. */
@@ -419,10 +430,8 @@ static int replace_inner(mips64_ctx_t *ctx, uint64_t va, uint64_t len,
 int mips_mem_map_replace(mips64_ctx_t *ctx, uint64_t va, uint64_t len, uint32_t prot, const char *tag) { return replace_inner(ctx, va, len, prot, tag, 0); }
 int mips_mem_map_replace_shared(mips64_ctx_t *ctx, uint64_t va, uint64_t len, uint32_t prot, const char *tag) { return replace_inner(ctx, va, len, prot, tag, 1); }
 
-/* Protect: skip host downgrade; upgrades use host-rounded range.
- * Shared file mappings are rejected (R4-7): a 4 KiB guest sub-page is
- * not a valid protection boundary on a 16 KiB Darwin host page, so the
- * host cover cannot represent shared sub-page permissions. */
+/* Protect: skip host downgrade; upgrades use the host-rounded range
+ * (R4-7: shared sub-pages rejected on 16 KiB host pages). */
 int mips_mem_protect(mips64_ctx_t *ctx, uint64_t va, uint64_t len,
                      uint32_t prot)
 {
@@ -524,11 +533,9 @@ static uint32_t remap_prot(uint64_t va, char *tag_out)
     return 0U;
 }
 
-/* Moving-mremap span copy lives in src/vm/vm_file_sync.c
- * (strong def): it runs under mem_lock and must not take vm_lock, so
- * file pages come from a pre-lock snapshot (R9-5). The weak stub below
- * only serves standalone test builds without the vm TU; it is never
- * exercised there (mremap needs the full translator). */
+/* Moving-mremap span copy (src/vm/vm_file_sync.c, R9-5): runs under
+ * mem_lock without vm_lock, from a pre-lock snapshot. The weak stub
+ * below only serves standalone test builds. */
 __attribute__((weak)) int mips_vm_file_copy_span(mips64_ctx_t *ctx, uint8_t *buf,
     const mips64_region_t *regs, size_t nregs, uint64_t span_va,
     uint64_t span_len, const void *fsnap)
@@ -792,11 +799,11 @@ int mips_mem_exec_ok(const mips64_ctx_t *ctx, uint64_t pc)
     if (ctx == NULL)
         return 0;
     mem_lock();
-    for (i = 0; i < g_region_count; i++) {
-        if (g_regions[i].start <= pc && pc + 4U <= g_regions[i].end) {
-            ok = (g_regions[i].prot & MIPS_PROT_EXEC) != 0U;
-            break;
-        }
+    /* Regions are sorted: only the lower-bound hit can contain pc. */
+    i = region_lower_bound(pc);
+    if (i < g_region_count && g_regions[i].start <= pc &&
+        pc + 4U <= g_regions[i].end) {
+        ok = (g_regions[i].prot & MIPS_PROT_EXEC) != 0U;
     }
     mem_unlock();
     return ok;

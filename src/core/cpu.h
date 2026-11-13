@@ -421,7 +421,6 @@ typedef struct dbt_block {
 } dbt_block_t;
 
 /* Direct block chaining + 4096-entry IBTC + RAS (src/dbt/dbt.c, L2b). */
-void *dbt_lookup(mips64_ctx_t *ctx, uint64_t pc);
 int   dbt_compile(mips64_ctx_t *ctx, uint64_t pc);
 /* Integer emitter (src/dbt/emit_int.c, L2c). */
 int   dbt_emit_int(mips64_ctx_t *ctx, uint64_t pc, const mips_dec_t *insns,

@@ -537,8 +537,9 @@ int mips_vm_file_copy_span(mips64_ctx_t *ctx, uint8_t *buf,
                          PROT_READ | PROT_WRITE) != 0)
                 return -errno;
             memcpy(out, hp, MIPS64_PAGE_SIZE);
-            if ((regs[ri].prot & MIPS_PROT_READ) == 0U)
-                (void)mprotect((void *)haddr, (size_t)hpsz, oprot);
+            if ((regs[ri].prot & MIPS_PROT_READ) == 0U &&
+                mprotect((void *)haddr, (size_t)hpsz, oprot) != 0)
+                return -errno;
         }
     }
     return 0;

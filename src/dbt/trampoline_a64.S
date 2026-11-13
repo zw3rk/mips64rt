@@ -43,8 +43,8 @@
     .global _mips64_dbt_enter
     .set _mips64_dbt_enter, mips64_dbt_enter
 mips64_dbt_enter:
-    /* Enter: ctx in x0, guest base in x1, code in x2, chain budget in
-     * x3, SMC epoch pointer in x4. Save fp/lr plus x19-x28 (x19/x20
+    /* Enter: ctx in x0, U0 soft-TLB base in x1, code in x2, chain
+     * budget in x3, SMC epoch pointer in x4. Save fp/lr plus x19-x28
      * are repinned, so their old values must survive the round trip;
      * x26-x28 carry the chaining state, the rest are scratch but
      * saved for hygiene). */

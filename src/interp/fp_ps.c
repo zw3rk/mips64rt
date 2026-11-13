@@ -9,9 +9,12 @@
  * guest RM; NMSUB negates after rounding). Per-lane IEEE semantics
  * with MIPS R2 FCSR accounting shared with fp.c (V on invalid lanes,
  * I on inexact, U (+I) on FS-flushed tiny results, O (+I) on overflow
- * to infinity). DIV.PS/SQRT.PS/CVT.PS/
- * C.cond.PS and the indexed COP1X memory ops fault (untested by the
- * RC3 suite; DBT falls back to interp_step for every word here).
+ * to infinity). DIV.PS/SQRT.PS/CVT.PS/C.cond.PS fault (untested by
+ * the RC3 suite; DBT falls back to interp_step for every word here).
+ * fp_cop1x_mem executes the supported indexed moves (LWXC1/SWXC1
+ * 4-byte aligned, LDXC1/SDXC1 8-byte aligned, LUXC1/SUXC1 with the
+ * low 3 address bits ignored); PREFX is a hint no-op returning 0,
+ * and unaligned/unsupported forms fault.
  */
 
 #include <float.h>

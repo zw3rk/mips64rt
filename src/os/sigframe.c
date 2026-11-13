@@ -70,6 +70,7 @@ extern void mips_l4a_action_reset(mips64_ctx_t *ctx, int signo);
 /* sigaltstack report bits (asm/signal.h). */
 #define L4B_SS_ONSTACK UINT32_C(1)
 #define L4B_SS_DISABLE UINT32_C(2)
+#define L4B_SS_AUTODISARM UINT32_C(0x80000000)
 
 /* Synchronous trap signals (MIPS asm/signal.h numbers). */
 #define L4B_SIGILL  4
@@ -281,6 +282,13 @@ int mips_raise_guest(mips64_ctx_t *ctx, int signo, uint64_t fault_addr)
 
         if (!on_stack) {
             sp = ctx->sigalt_sp + ctx->sigalt_size;
+            /* Linux SS_AUTODISARM: entering the handler on the
+             * altstack disarms it (later queries report DISABLE). */
+            if ((ctx->sigalt_flags & L4B_SS_AUTODISARM) != 0U) {
+                ctx->sigalt_sp = 0U;
+                ctx->sigalt_size = 0U;
+                ctx->sigalt_flags = 0U;
+            }
         }
     }
     if (sp < size) {

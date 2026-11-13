@@ -259,6 +259,9 @@ R7TEST_SRCS := tests/test_r7_defects.c src/loader.c \
 R7FPTEST_SRCS := tests/test_r7_fp.c \
 	$(filter-out tests/test_r3_defects.c tests/stubs_signal.c,$(R3TEST_SRCS))
 
+R1316TEST_SRCS := tests/test_r1316_defects.c \
+	$(filter-out tests/test_r3_defects.c tests/stubs_signal.c,$(R3TEST_SRCS))
+
 test: check-line-limits
 	@mkdir -p $(BUILD)
 	$(HOST_CC) -std=c11 -Werror=vla -pedantic -Wall -Wextra -Werror -Isrc tests/check_abi_invariants.c -o $(BUILD)/check_abi_invariants
@@ -269,6 +272,8 @@ test: check-line-limits
 	$(BUILD)/test_r7_defects
 	$(HOST_CC) -std=c11 -Werror=vla -pedantic -Wall -Wextra -Werror -pthread -Isrc $(R7FPTEST_SRCS) -o $(BUILD)/test_r7_fp
 	$(BUILD)/test_r7_fp
+	$(HOST_CC) -std=c11 -Werror=vla -pedantic -Wall -Wextra -Werror -pthread -Isrc $(R1316TEST_SRCS) -o $(BUILD)/test_r1316_defects
+	$(BUILD)/test_r1316_defects
 
 clean:
 	rm -rf $(BUILD)

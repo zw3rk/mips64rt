@@ -831,7 +831,8 @@ static int exec_branch(mips64_ctx_t *ctx, uint64_t pc, const mips_dec_t *d)
         if (fetch_decode(ctx, pc + 4u, &s) != 0) {
             return MIPS_FAULT;
         }
-        if (interp_is_control(&s)) {
+        /* BC1 keeps the fpmove run-stop protocol (no COP1 case above). */
+        if (interp_is_control(&s) && s.op != 0x11u) {
             return exec_branch(ctx, pc + 4u, &s);
         }
         rc = exec_simple(ctx, pc + 4u, &s);
@@ -860,7 +861,8 @@ int interp_step(mips64_ctx_t *ctx)
     mips_dec_t d;
     int rc = fetch_decode(ctx, pc, &d);
 
-    if (rc == 0 && interp_is_control(&d)) {
+    /* BC1 stays on the fpmove run-stop protocol (see above). */
+    if (rc == 0 && interp_is_control(&d) && d.op != 0x11u) {
         rc = exec_branch(ctx, pc, &d);
     } else if (rc == 0) {
         rc = exec_simple(ctx, pc, &d);

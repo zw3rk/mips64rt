@@ -56,6 +56,9 @@ extern int64_t mips_sc_truncate(mips64_ctx_t *ctx, uint64_t path_va,
                                 uint64_t len);
 extern int64_t mips_sc_ftruncate(mips64_ctx_t *ctx, uint64_t fd,
                                  uint64_t len);
+extern int64_t mips_sc_unlink(mips64_ctx_t *ctx, uint64_t path_va);
+extern int64_t mips_sc_symlinkat(mips64_ctx_t *ctx, uint64_t target_va,
+                                 uint64_t dirfd, uint64_t link_va);
 /* TIF_FIXADE control hook owned by the OS backend TU. */
 extern int mips_fixade_ctl(mips64_ctx_t *ctx, unsigned long cmd,
                            unsigned long arg);
@@ -80,39 +83,6 @@ extern int mips_fixade_ctl(mips64_ctx_t *ctx, unsigned long cmd,
 #define MIPS_SIG_BLOCK          1
 #define MIPS_SIG_UNBLOCK        2
 #define MIPS_SIG_SETMASK        3
-
-/* Single-threaded futex minimum: WAIT mismatches get EAGAIN, matches
- * return 0 (a legal spurious wakeup); WAKE has nobody to wake. Beyond
- * WAIT/WAKE (+PRIVATE_FLAG): ENOSYS. */
-int64_t mips_sc_futex(mips64_ctx_t *ctx, uint64_t uaddr, uint64_t op,
-                      uint64_t val, uint64_t timeout_va, uint64_t uaddr2,
-                      uint64_t val3)
-{
-    uint8_t *p;
-    uint32_t cur;
-    uint64_t cmd;
-
-    (void)timeout_va;
-    (void)uaddr2;
-    (void)val3;
-    if ((uaddr & 3U) != 0U) {
-        return l2a_ret(ctx, -(int64_t)EINVAL);
-    }
-    cmd = op & ~(uint64_t)MIPS_FUTEX_PRIVATE_FLAG;
-    if (cmd != (uint64_t)MIPS_FUTEX_WAIT &&
-        cmd != (uint64_t)MIPS_FUTEX_WAKE) {
-        return l2a_ret(ctx, -(int64_t)ENOSYS);
-    }
-    p = guest_range(ctx, uaddr, 4U, 0);
-    if (p == NULL) {
-        return l2a_ret(ctx, -(int64_t)EFAULT);
-    }
-    cur = (uint32_t)getn(p, 4, ctx->is_be != 0U);
-    if (cmd == (uint64_t)MIPS_FUTEX_WAIT && cur != (uint32_t)val) {
-        return l2a_ret(ctx, -(int64_t)EAGAIN);
-    }
-    return l2a_ret(ctx, 0);
-}
 
 /* Robust lists are recorded in ctx, never installed on the host.
  * len is sizeof(struct robust_list_head): 24 on N64 (3x8), 12 on N32. */
@@ -448,6 +418,15 @@ int64_t mips_sc_file_extra(mips64_ctx_t *ctx, int n32, uint64_t nr,
                              : MIPS64_NR_ftruncate)) {
         *claimed = 1;
         return mips_sc_ftruncate(ctx, a0, a1);
+    }
+    if (nr == (uint64_t)(n32 ? MIPS64_NR32_unlink : MIPS64_NR_unlink)) {
+        *claimed = 1;
+        return mips_sc_unlink(ctx, a0);
+    }
+    if (nr == (uint64_t)(n32 ? MIPS64_NR32_symlinkat
+                             : MIPS64_NR_symlinkat)) {
+        *claimed = 1;
+        return mips_sc_symlinkat(ctx, a0, a1, a2);
     }
     if (nr == (uint64_t)(n32 ? MIPS64_NR32_pread64 : MIPS64_NR_pread64)) {
         *claimed = 1;

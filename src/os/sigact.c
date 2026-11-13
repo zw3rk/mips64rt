@@ -400,8 +400,9 @@ int64_t mips_sc_sigaltstack(mips64_ctx_t *ctx, uint64_t sp)
     be = ctx->is_be != 0U;
     on_stack = ctx->sigalt_size != 0U && sp > ctx->sigalt_sp &&
                sp - ctx->sigalt_sp <= ctx->sigalt_size;
-    reported = ctx->sigalt_size == 0U ? L4A_SS_DISABLE :
-               (on_stack ? L4A_SS_ONSTACK : 0U);
+    reported = (ctx->sigalt_flags & L4A_SS_AUTODISARM) |
+               (ctx->sigalt_size == 0U ? L4A_SS_DISABLE :
+                (on_stack ? L4A_SS_ONSTACK : 0U));
     {
         uint64_t old_sp = ctx->sigalt_sp;
         uint64_t old_size = ctx->sigalt_size;

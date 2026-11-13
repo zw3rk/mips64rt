@@ -31,6 +31,7 @@
 
 #include "dbt/emit_int.h"
 #include "dbt/emit_mem.h"
+#include "interp/interp.h"
 
 /* Lane L3b FP entry point (src/dbt/emit_fp.c): 0 emitted, nonzero for
  * unknown words (dispatcher falls back to interp_step). */
@@ -239,43 +240,11 @@ void ei_bfault(a64_emit_t *e, uint64_t pc, size_t slot)
 
 /* ---- Block driver (0 continue, 1 fallback, 2 block ended) ---- */
 
-/* True for words that transfer control with a delay slot (mirrors
- * interp_is_control; interp.h is lane-internal and not included here). */
+/* Block-driver predicate: the canonical delay-slot classifier from
+ * src/interp/interp.h (one helper for both engines, COP1 BC1 included). */
 static int ei_is_control(const mips_dec_t *d)
 {
-    switch (d->op) {
-    case 0x02u: /* J */
-    case 0x03u: /* JAL */
-    case 0x04u: /* BEQ */
-    case 0x05u: /* BNE */
-    case 0x06u: /* BLEZ */
-    case 0x07u: /* BGTZ */
-    case 0x14u: /* BEQL */
-    case 0x15u: /* BNEL */
-    case 0x16u: /* BLEZL */
-    case 0x17u: /* BGTZL */
-        return 1;
-    case 0x01u: /* REGIMM */
-        switch (d->rt) {
-        case 0x00u: /* BLTZ */
-        case 0x01u: /* BGEZ */
-        case 0x02u: /* BLTZL */
-        case 0x03u: /* BGEZL */
-        case 0x10u: /* BLTZAL */
-        case 0x11u: /* BGEZAL */
-        case 0x12u: /* BLTZALL */
-        case 0x13u: /* BGEZALL */
-            return 1;
-        default:
-            return 0;
-        }
-    case 0x00u: /* JR / JALR */
-        return d->funct == 0x08u || d->funct == 0x09u;
-    case 0x11u: /* COP1 BC1T/BC1F/likely (lane L3b; no other COP1 moves) */
-        return d->rs == 0x08u ? 1 : 0;
-    default:
-        return 0;
-    }
+    return interp_is_control(d);
 }
 
 static int ei_one(a64_emit_t *e, const mips_dec_t *d, uint64_t pc, int be,
@@ -393,6 +362,13 @@ static int ei_branch(a64_emit_t *e, const mips_dec_t *d, const mips_dec_t *s,
         }
         break;
     default:
+        return 1;
+    }
+    /* A link branch testing $ra mis-evaluates after the link write
+     * (BLTZAL/BGEZAL $ra): the delay-slot miss path would test the
+     * new pc + 8 instead of the original $ra. Decline to interp_step,
+     * which tests before linking. */
+    if (link != 0 && d->op == 0x01u && d->rs == MIPS64_REG_RA) {
         return 1;
     }
     /* M64-R8-3: a guarded COP1/COP1X word in the slot of a linking

@@ -431,11 +431,53 @@ int dbt_mem_recover(mips64_ctx_t *ctx, const dbt_mem_site_t *site,
         }
         mips_decode(w, &d);
     }
+    /* No memory span: an integer trap (BREAK, Tcc/TccI, trapping
+     * ADD/SUB/DADD/DSUB) that exits via EXIT_FAULT/TRAP. Run it through
+     * the interpreter so the exact SIGTRAP/SIGFPE/SIGILL delivers
+     * instead of a SIGSEGV. */
     if (dbt_mem_span(ctx, &d, &ea, &base, &len, &need) != 0) {
+        if (site != NULL &&
+            (site->flags & (uint8_t)DBT_MEM_F_IN_DELAY_SLOT) != 0u) {
+            branch_pc = slot_pc - 4u;
+            if (dbt_resolve_delay_target(ctx, branch_pc, site,
+                                         &target) != 0) {
+                ctx->pc = slot_pc;
+                dbt_trace_fault_prefix(ctx, block_pc, slot_pc);
+                mips_fault(ctx, slot_pc);
+                return 2;
+            }
+            ctx->pc = branch_pc;
+            ctx->next_pc = slot_pc;
+            ctx->in_delay_slot = 0U;
+            dbt_trace_fault_prefix(ctx, block_pc, branch_pc);
+            if (mips_fetch(ctx, branch_pc, &bw) == 0) {
+                mips64_dbt_trace(ctx, branch_pc, bw);
+            }
+            ctx->pc = slot_pc;
+            ctx->next_pc = slot_pc + 4u;
+            ctx->in_delay_slot = 1U;
+            mips_delay_target_set(ctx, target);
+            rc = interp_step(ctx);
+            /* A handler redirect (pc off the slot) resumes in the
+             * handler; a clean slot applies the branch target. */
+            if (rc != 0 || ctx->in_delay_slot == 0U ||
+                ctx->pc != slot_pc + 4u) {
+                mips_delay_target_clear(ctx);
+                return rc == 0 ? 0 : 1;
+            }
+            {
+                uint64_t applied = 0U;
+
+                (void)mips_npc_resume_step(ctx, &applied);
+            }
+            return 0;
+        }
         ctx->pc = slot_pc;
+        ctx->next_pc = slot_pc + 4u;
+        ctx->in_delay_slot = 0U;
         dbt_trace_fault_prefix(ctx, block_pc, slot_pc);
-        mips_fault(ctx, slot_pc);
-        return 2;
+        rc = interp_step(ctx);
+        return rc == 0 ? 0 : 1;
     }
     /* FIXADE class first: when disabled, a misaligned integer access
      * delivers SIGBUS before any fill; when enabled, it falls through

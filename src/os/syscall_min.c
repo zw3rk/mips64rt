@@ -50,9 +50,6 @@ extern int mips_thread_group_live(void);
 extern void mips_thread_exit(mips64_ctx_t *ctx, int status);
 extern int64_t mips_sc_getrandom(mips64_ctx_t *ctx, uint64_t buf_va,
                                  uint64_t len, uint64_t flags);
-extern int64_t mips_sc_futex(mips64_ctx_t *ctx, uint64_t uaddr, uint64_t op,
-                             uint64_t val, uint64_t timeout_va,
-                             uint64_t uaddr2, uint64_t val3);
 extern int64_t mips_sc_ioctl(mips64_ctx_t *ctx, uint64_t fd, uint64_t cmd,
                              uint64_t arg);
 extern int64_t mips_sc_lseek(mips64_ctx_t *ctx, uint64_t fd, uint64_t offset,
@@ -235,7 +232,7 @@ static int64_t sc_brk(mips64_ctx_t *ctx, uint64_t addr)
     if (aligned > ctx->task_size) {
         return sc_ret(ctx, -(int64_t)ENOMEM);
     }
-    /* RC1 integration: map only the not-yet-mapped extension. */
+    /* Map only the not-yet-mapped extension. */
     have = ctx->brk_curr > ctx->brk_base ?
            ((ctx->brk_curr + (MIPS64_PAGE_SIZE - 1U)) &
             MIPS64_PAGE_MASK) : ctx->brk_base;
@@ -324,8 +321,7 @@ static int64_t sc_mmap(mips64_ctx_t *ctx, uint64_t addr, uint64_t len,
             return sc_ret(ctx, -(int64_t)EEXIST);
         }
     }
-    /* Pre-stage file bytes before touching any mapping so a bad fd or
-     * unreadable file leaves a MAP_FIXED destination untouched. */
+    /* Pre-stage file bytes first (MAP_FIXED stays clean on bad fd). */
     if (!anon) {
         uint64_t left = size;
         uint64_t off = 0U;
@@ -359,9 +355,7 @@ static int64_t sc_mmap(mips64_ctx_t *ctx, uint64_t addr, uint64_t len,
         rc = shared != 0 ? mips_mem_map_replace_shared(ctx, va, size, (uint32_t)(prot & 7U), "map") : mips_mem_map_replace(ctx, va, size, (uint32_t)(prot & 7U), "map");
         if (rc == -ENOMEM &&
             sysconf(_SC_PAGESIZE) > (long)MIPS64_PAGE_SIZE) {
-            /* Big-host fallback: the fixed mmap above only fails for 4
-             * KiB-granular ranges inside a 16 KiB host page; unmap then
-             * re-adds the range (a second quiescence section). */
+            /* Big-host fallback: unmap then re-add (2nd quiescence). */
             rc = mips_mem_unmap(ctx, va, size);
             if (rc == 0) {
                 rc = shared != 0 ? mips_mem_map_shared(ctx, va, size, (uint32_t)(prot & 7U), "map") : mips_mem_map(ctx, va, size, (uint32_t)(prot & 7U), "map");
@@ -380,12 +374,20 @@ static int64_t sc_mmap(mips64_ctx_t *ctx, uint64_t addr, uint64_t len,
         int hp = (((uint32_t)prot & MIPS_PROT_READ) != 0U ? PROT_READ : 0) |
                  (((uint32_t)prot & MIPS_PROT_WRITE) != 0U ? PROT_WRITE : 0);
 
-        if ((hp & PROT_WRITE) == 0) {
-            (void)mprotect(dst, (size_t)size, PROT_READ | PROT_WRITE);
+        if ((hp & PROT_WRITE) == 0 &&
+            mprotect(dst, (size_t)size, PROT_READ | PROT_WRITE) != 0) {
+            int e = errno;
+            mips_mem_unmap(ctx, va, size);
+            free(fbuf);
+            return sc_ret(ctx, -(int64_t)e);
         }
         memcpy(dst, fbuf, (size_t)size);
-        if ((hp & PROT_WRITE) == 0) {
-            (void)mprotect(dst, (size_t)size, hp);
+        if ((hp & PROT_WRITE) == 0 &&
+            mprotect(dst, (size_t)size, hp) != 0) {
+            int e = errno;
+            mips_mem_unmap(ctx, va, size);
+            free(fbuf);
+            return sc_ret(ctx, -(int64_t)e);
         }
         free(fbuf);
         mips_vm_file_map_hook(ctx, (int)fd, va, size, offset,
@@ -638,8 +640,7 @@ static int64_t mips_syscall_inner(mips64_ctx_t *ctx)
         return sc_uname(ctx, a0);
     }
     if (nr == (uint64_t)(n32 ? MIPS64_NR32_fork : MIPS64_NR_fork)) {
-        /* RC1 integration: the P1 gate forks children for fault
-         * tests (full clone(2) is Phase 4, lane L4b). */
+        /* Fault-test fork (full clone(2) is lane L4b). */
         return sc_fork(ctx);
     }
     if (nr == (uint64_t)(n32 ? MIPS64_NR32_clone : MIPS64_NR_clone)) {

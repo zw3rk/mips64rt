@@ -341,16 +341,20 @@ void mips_soft_tlb_fill(mips64_ctx_t *ctx, uint64_t va)
     }
     page = va & ~(uint64_t)0xFFFU;
     vpn = page >> 12;
+    /* Lock-free probes first: mips_mem_ok takes the region-table lock
+     * and mips_vm_page_writable takes the page-flag lock, so both run
+     * outside u0_lock (lock ordering). Only the slot lookup and the
+     * single entry update below hold the slot lock. */
     can_read = mips_mem_ok(ctx, page, 4096U, (uint32_t)MIPS_PROT_READ);
     prot_write = mips_mem_ok(ctx, page, 4096U, (uint32_t)MIPS_PROT_WRITE);
-
-    u0_lock();
     can_write = prot_write &&
                 mips_vm_page_writable(vpn) &&
                 (ctx->llbit == 0U || (ctx->lladdr >> 12) != vpn);
+    idx = (size_t)(vpn & MIPS64_SOFT_TLB_INDEX_MASK);
+
+    u0_lock();
     s = u0_slot_locked(ctx, 1);
     if (s != NULL) {
-        idx = (size_t)(vpn & MIPS64_SOFT_TLB_INDEX_MASK);
         e = &s->tlb[idx];
         e->read_tag = (can_read != 0) ? page : UINT64_MAX;
         e->write_tag = (can_write != 0) ? page : UINT64_MAX;

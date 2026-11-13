@@ -357,26 +357,6 @@ static dbt_entry_t *lookup_entry(mips64_ctx_t *ctx, uint64_t pc)
     return e;
 }
 
-void *dbt_lookup(mips64_ctx_t *ctx, uint64_t pc)
-{
-    dbt_entry_t *e;
-    mips64_ibtc_slot_t *slots;
-
-    if (ctx == NULL)
-        return NULL;
-    if (ensure_ibtc(ctx) != 0)
-        return NULL;
-    /* Single probe: the epoch gate above makes the snapshot scan free
-     * on the hot path, so one lookup serves the IBTC refresh too. */
-    e = lookup_entry(ctx, pc);
-    if (e == NULL || e->fallback || e->blk.code == NULL)
-        return NULL;
-    slots = (void *)(uintptr_t)ctx->ibtc_ptr;
-    slots[ibtc_index(pc)].guest = pc;
-    slots[ibtc_index(pc)].host = e->blk.code;
-    return e->blk.code;
-}
-
 /* Privileged words end the block without a delay slot (the emitter
  * exits to the dispatcher and `interp` evaluates them). MIPS16
  * entry (`JALX`) likewise: `interp` faults, never jumps. FP words
