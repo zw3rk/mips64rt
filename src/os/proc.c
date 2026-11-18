@@ -246,6 +246,11 @@ static int proc_write_all(int fd, const void *buf, size_t len)
     while (done < len) {
         ssize_t got = write(fd, p + done, len - done);
 
+        /* Staging retry: the materialization bytes are not
+         * guest-visible until committed. */
+        if (got < 0 && errno == EINTR) {
+            continue;
+        }
         if (got <= 0) {
             return -1;
         }

@@ -12,6 +12,7 @@
 #include "core/cpu.h"
 
 #include "os/host_args.h"
+#include "os/signal_core.h"
 #include "os/syscall_nr.h"
 #include "vm/vm_pages.h"
 
@@ -48,6 +49,8 @@
 /* Guest window check owned by src/os/mem.c. */
 extern int mips_mem_ok(const mips64_ctx_t *ctx, uint64_t va, uint64_t len,
                        uint32_t need);
+/* Lane L4b vfork channel write end (src/os/threads_vfork.c). */
+extern int mips64_vfork_pipe_fd(void);
 
 /* MIPS open flags (UAPI asm/fcntl.h). N64 and N32 agree except
  * O_LARGEFILE, which is 0 on N64 and 0x2000 on N32. */
@@ -321,7 +324,11 @@ int64_t mips_sc_openat(mips64_ctx_t *ctx, uint64_t dirfd, uint64_t path_va,
     return l2a_ret(ctx, (int64_t)fd);
 }
 
-int64_t mips_sc_fcntl(mips64_ctx_t *ctx, uint64_t fd, uint64_t cmd,
+extern int64_t mips_sc_fcntl_lock(mips64_ctx_t *ctx, int n32,
+                                  uint64_t fd, uint64_t cmd,
+                                  uint64_t arg);
+
+int64_t mips_sc_fcntl(mips64_ctx_t *ctx, int n32, uint64_t fd, uint64_t cmd,
                       uint64_t arg)
 {
     int rc;
@@ -364,9 +371,9 @@ int64_t mips_sc_fcntl(mips64_ctx_t *ctx, uint64_t fd, uint64_t cmd,
         int hfl = 0;
         size_t i;
 
-        if ((arg & ~settable) != 0U) {
-            return l2a_ret(ctx, -(int64_t)EINVAL);
-        }
+        /* Linux silently ignores non-settable bits (access mode,
+         * O_CREAT, ...), so a GETFL value can be fed back to SETFL. */
+        arg &= settable;
         for (i = 0U; i < sizeof l2a_oflags / sizeof l2a_oflags[0]; i++) {
             if ((arg & l2a_oflags[i].mf & settable) != 0U) {
                 hfl |= l2a_oflags[i].hf;
@@ -380,8 +387,11 @@ int64_t mips_sc_fcntl(mips64_ctx_t *ctx, uint64_t fd, uint64_t cmd,
     }
     /* Valid-but-unimplemented lock/ownership commands are ENOSYS;
      * bogus commands are EINVAL, matching Linux. */
-    if (cmd == 6U || cmd == 7U || cmd == 14U || cmd == 33U || cmd == 34U ||
-        cmd == 35U || cmd == 23U || cmd == 24U) {
+    if (cmd == 6U || cmd == 7U || cmd == 14U || cmd == 33U ||
+        cmd == 34U || cmd == 35U) {
+        return mips_sc_fcntl_lock(ctx, n32, fd, cmd, arg);
+    }
+    if (cmd == 23U || cmd == 24U) {
         return l2a_ret(ctx, -(int64_t)ENOSYS);
     }
     return l2a_ret(ctx, -(int64_t)EINVAL);
@@ -394,10 +404,24 @@ int64_t mips_sc_fcntl(mips64_ctx_t *ctx, uint64_t fd, uint64_t cmd,
 int64_t mips_sc_ioctl(mips64_ctx_t *ctx, uint64_t fd, uint64_t cmd,
                       uint64_t arg)
 {
-    int rc = ioctl((int)fd, (unsigned long)cmd, (void *)(uintptr_t)arg);
+    int rc;
+    int saved_err;
 
+    /* EINTR with no deliverable guest signal re-enters the host call
+     * instead of surfacing (ioctl is restartable under SA_RESTART);
+     * the lease drops across the possibly-blocking host call. */
+    mips_qs_lease_exit(ctx);
+    for (;;) {
+        rc = ioctl((int)fd, (unsigned long)cmd, (void *)(uintptr_t)arg);
+        saved_err = errno;
+        if (rc >= 0 || saved_err != EINTR ||
+            mips64_host_eintr_retry(ctx) == 0) {
+            break;
+        }
+    }
+    mips_qs_lease_enter(ctx);
     if (rc < 0) {
-        return l2a_ret(ctx, -(int64_t)errno);
+        return l2a_ret(ctx, -(int64_t)saved_err);
     }
     return l2a_ret(ctx, (int64_t)rc);
 }
@@ -600,6 +624,8 @@ int64_t mips_sc_unlinkat(mips64_ctx_t *ctx, uint64_t dirfd, uint64_t path_va,
 int64_t mips_sc_close_range(mips64_ctx_t *ctx, uint64_t first, uint64_t last,
                             uint64_t flags)
 {
+    int vfd = mips64_vfork_pipe_fd();
+
     if ((flags & ~(uint64_t)(CLOSE_RANGE_UNSHARE |
                              CLOSE_RANGE_CLOEXEC)) != 0U) {
         return l2a_ret(ctx, -(int64_t)EINVAL);
@@ -607,6 +633,27 @@ int64_t mips_sc_close_range(mips64_ctx_t *ctx, uint64_t first, uint64_t last,
     if (first > last || first > (uint64_t)UINT_MAX ||
         last > (uint64_t)UINT_MAX) {
         return l2a_ret(ctx, -(int64_t)EINVAL);
+    }
+    /* The live vfork channel write end is skipped: closing it would
+     * strand the vfork parent (its fd sits above 512). UNSHARE cannot
+     * skip one fd through the host call, so it falls through. The
+     * split issues at most two host close_range calls (O(1)) instead
+     * of one syscall per fd, so close_range(3, ~0U, 0) — the libc
+     * posix_spawn / shell close-all idiom — never loops 4B times. */
+    if (vfd >= 0 && (flags & (uint64_t)CLOSE_RANGE_UNSHARE) == 0U &&
+        (uint64_t)(unsigned)vfd >= first &&
+        (uint64_t)(unsigned)vfd <= last) {
+        int64_t r = 0;
+
+        if ((uint64_t)(unsigned)vfd > first) {
+            r = l2a_close_range_host(first, (uint64_t)(unsigned)vfd - 1U,
+                                     flags);
+        }
+        if (r == 0 && (uint64_t)(unsigned)vfd < last) {
+            r = l2a_close_range_host((uint64_t)(unsigned)vfd + 1U, last,
+                                     flags);
+        }
+        return l2a_ret(ctx, r);
     }
     return l2a_ret(ctx, l2a_close_range_host(first, last, flags));
 }

@@ -15,6 +15,7 @@
 
 #include "core/cpu.h"
 
+#include "os/signal_core.h"
 #include "os/syscall_nr.h"
 
 #include <errno.h>
@@ -105,32 +106,41 @@ int64_t mips_sc_nanosleep(mips64_ctx_t *ctx, uint64_t req_va,
 {
     struct timespec rq;
     struct timespec rm;
-    struct timespec *remp = NULL;
     int64_t rc;
+    int e;
 
     /* The kernel validates both pointers before sleeping. */
     if (xfer_ts(ctx, req_va, is64, &rq, 0) != 0) {
         return l2a_ret(ctx, -(int64_t)EFAULT);
     }
-    if (rem_va != 0U) {
-        if (!mips_mem_ok(ctx, rem_va, is64 ? 16U : 8U,
-                         (uint32_t)MIPS_PROT_WRITE)) {
-            return l2a_ret(ctx, -(int64_t)EFAULT);
-        }
-        remp = &rm;
+    if (rem_va != 0U &&
+        !mips_mem_ok(ctx, rem_va, is64 ? 16U : 8U,
+                     (uint32_t)MIPS_PROT_WRITE)) {
+        return l2a_ret(ctx, -(int64_t)EFAULT);
     }
     if (rq.tv_nsec < 0 || rq.tv_nsec >= L2A_NSEC_PER_SEC) {
         return l2a_ret(ctx, -(int64_t)EINVAL);
     }
     /* Relative sleep only (clock_nanosleep lives in syscalls_extra.c).
-     * Park with 0 leases across the blocking sleep. */
+     * Park with 0 leases across the blocking sleep. The remainder
+     * always stages in a local (even with no guest rem pointer) so a
+     * spurious-EINTR retry shrinks the sleep instead of restarting it.
+     * EINTR with no deliverable guest signal resumes the remainder. */
     mips_qs_lease_exit(ctx);
-    rc = (int64_t)nanosleep(&rq, remp);
+    for (;;) {
+        rc = (int64_t)nanosleep(&rq, &rm);
+        e = errno;
+        if (rc == 0 || e != EINTR ||
+            mips64_host_eintr_retry(ctx) == 0) {
+            break;
+        }
+        rq = rm;
+    }
     mips_qs_lease_enter(ctx);
     if (rc != 0) {
-        rc = -(int64_t)errno;
-        if (remp != NULL && errno == EINTR) {
-            (void)xfer_ts(ctx, rem_va, is64, remp, 1);
+        rc = -(int64_t)e;
+        if (rem_va != 0U && e == EINTR) {
+            (void)xfer_ts(ctx, rem_va, is64, &rm, 1);
         }
         return l2a_ret(ctx, rc);
     }

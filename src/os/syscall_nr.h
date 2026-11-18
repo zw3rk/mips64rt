@@ -127,6 +127,12 @@
 #define MIPS64_NR32_faccessat 6263
 #define MIPS64_NR_faccessat2 5439 /* n64 index 439: sys_faccessat2 */
 #define MIPS64_NR32_faccessat2 6439
+#define MIPS64_NR_getcwd     5077 /* n64 index 77: sys_getcwd */
+#define MIPS64_NR32_getcwd   6077
+#define MIPS64_NR_chdir      5078 /* n64 index 78: sys_chdir */
+#define MIPS64_NR32_chdir    6078
+#define MIPS64_NR_fchdir     5079 /* n64 index 79: sys_fchdir */
+#define MIPS64_NR32_fchdir   6079 /* n32 index 79: sys_fchdir */
 #define MIPS64_NR_unlink     5085 /* n64 index 85: sys_unlink */
 #define MIPS64_NR32_unlink   6085
 #define MIPS64_NR_unlinkat   5253 /* n64 index 253: sys_unlinkat */

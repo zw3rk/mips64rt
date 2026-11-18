@@ -17,12 +17,14 @@
 #include "core/cpu.h"
 
 #include "os/quiesce.h"
+#include "os/signal_core.h"
 #include "os/syscall_nr.h"
 #include "vm/vm_pages.h"
 
 #include <errno.h>
 #include <limits.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/syscall.h>
@@ -57,6 +59,16 @@ extern int64_t mips_sc_truncate(mips64_ctx_t *ctx, uint64_t path_va,
 extern int64_t mips_sc_ftruncate(mips64_ctx_t *ctx, uint64_t fd,
                                  uint64_t len);
 extern int64_t mips_sc_unlink(mips64_ctx_t *ctx, uint64_t path_va);
+extern int64_t mips_sc_fs_extra(mips64_ctx_t *ctx, int n32, uint64_t nr,
+                                uint64_t a0, uint64_t a1, uint64_t a2,
+                                uint64_t a3, uint64_t a4, int *claimed);
+extern int64_t mips_sc_misc_extra(mips64_ctx_t *ctx, int n32, uint64_t nr,
+                                  uint64_t a0, uint64_t a1, uint64_t a2,
+                                  uint64_t a3, uint64_t a4, int *claimed);
+extern int64_t mips_sc_getcwd(mips64_ctx_t *ctx, uint64_t buf_va,
+                              uint64_t size);
+extern int64_t mips_sc_chdir(mips64_ctx_t *ctx, uint64_t path_va);
+extern int64_t mips_sc_fchdir(mips64_ctx_t *ctx, uint64_t fd);
 extern int64_t mips_sc_symlinkat(mips64_ctx_t *ctx, uint64_t target_va,
                                  uint64_t dirfd, uint64_t link_va);
 /* TIF_FIXADE control hook owned by the OS backend TU. */
@@ -277,15 +289,26 @@ int64_t mips_sc_vec(mips64_ctx_t *ctx, uint64_t fd, uint64_t iov_va,
         hv[k].iov_base = kbuf[k];
         want += len;
     }
+    /* EINTR with no deliverable guest signal re-enters the host
+     * call instead of surfacing; a non-restart guest handler sees
+     * EINTR so the dispatcher can deliver it (same verdict as the
+     * scalar path below). */
     mips_qs_lease_exit(ctx);
-    if (is_p) {
-        rc = is_write ? pwritev((int)fd, hv, (int)iovcnt, (off_t)off) :
-                        preadv((int)fd, hv, (int)iovcnt, (off_t)off);
-    } else {
-        rc = is_write ? writev((int)fd, hv, (int)iovcnt) :
-                        readv((int)fd, hv, (int)iovcnt);
+    for (;;) {
+        if (is_p) {
+            rc = is_write ?
+                pwritev((int)fd, hv, (int)iovcnt, (off_t)off) :
+                preadv((int)fd, hv, (int)iovcnt, (off_t)off);
+        } else {
+            rc = is_write ? writev((int)fd, hv, (int)iovcnt) :
+                            readv((int)fd, hv, (int)iovcnt);
+        }
+        saved_err = errno;
+        if (rc >= 0 || saved_err != EINTR ||
+            mips64_host_eintr_retry(ctx) == 0) {
+            break;
+        }
     }
-    saved_err = errno;
     mips_qs_lease_enter(ctx);
     if (rc < 0) {
         l2a_vec_free_desc(hv, gva, glen, kbuf, iovcnt);
@@ -340,15 +363,26 @@ static int64_t l2a_io_common(mips64_ctx_t *ctx, uint64_t fd, uint64_t buf,
     if (is_write != 0) {
         memcpy(kbuf, mips64_guest_ptr(ctx, buf), (size_t)cap);
     }
+    /* EINTR from a child exit (host SIGCHLD, never SA_RESTART)
+     * restarts here when no deliverable guest signal is pending;
+     * a non-restart guest handler sees EINTR so the dispatcher
+     * can deliver it. */
     mips_qs_lease_exit(ctx);
-    if (is_p != 0) {
-        n = is_write ? pwrite((int)fd, kbuf, (size_t)cap, (off_t)off) :
-                       pread((int)fd, kbuf, (size_t)cap, (off_t)off);
-    } else {
-        n = is_write ? write((int)fd, kbuf, (size_t)cap) :
-                       read((int)fd, kbuf, (size_t)cap);
+    for (;;) {
+        if (is_p != 0) {
+            n = is_write ? pwrite((int)fd, kbuf, (size_t)cap,
+                                  (off_t)off) :
+                           pread((int)fd, kbuf, (size_t)cap, (off_t)off);
+        } else {
+            n = is_write ? write((int)fd, kbuf, (size_t)cap) :
+                           read((int)fd, kbuf, (size_t)cap);
+        }
+        saved_err = errno;
+        if (n >= 0 || saved_err != EINTR ||
+            mips64_host_eintr_retry(ctx) == 0) {
+            break;
+        }
     }
-    saved_err = errno;
     mips_qs_lease_enter(ctx);
     if (n < 0) {
         if (kbuf != sbuf) {
@@ -402,55 +436,78 @@ static int64_t l2a_pio(mips64_ctx_t *ctx, uint64_t fd, uint64_t buf_va,
  * is then -ENOSYS). */
 int64_t mips_sc_file_extra(mips64_ctx_t *ctx, int n32, uint64_t nr,
                            uint64_t a0, uint64_t a1, uint64_t a2,
-                           uint64_t a3, int *claimed)
+                           uint64_t a3, uint64_t a4, int *claimed)
 {
-    if (claimed != NULL) {
-        *claimed = 0;
-    }
-    if (ctx == NULL || claimed == NULL) {
+    int c = 0;
+    int64_t r;
+
+    if (ctx == NULL) {
         return -(int64_t)EINVAL;
     }
     if (nr == (uint64_t)(n32 ? MIPS64_NR32_truncate : MIPS64_NR_truncate)) {
-        *claimed = 1;
-        return mips_sc_truncate(ctx, a0, a1);
-    }
-    if (nr == (uint64_t)(n32 ? MIPS64_NR32_ftruncate
-                             : MIPS64_NR_ftruncate)) {
-        *claimed = 1;
-        return mips_sc_ftruncate(ctx, a0, a1);
-    }
-    if (nr == (uint64_t)(n32 ? MIPS64_NR32_unlink : MIPS64_NR_unlink)) {
-        *claimed = 1;
-        return mips_sc_unlink(ctx, a0);
-    }
-    if (nr == (uint64_t)(n32 ? MIPS64_NR32_symlinkat
-                             : MIPS64_NR_symlinkat)) {
-        *claimed = 1;
-        return mips_sc_symlinkat(ctx, a0, a1, a2);
-    }
-    if (nr == (uint64_t)(n32 ? MIPS64_NR32_pread64 : MIPS64_NR_pread64)) {
-        *claimed = 1;
-        return l2a_pio(ctx, a0, a1, a2, a3, 0);
-    }
-    if (nr == (uint64_t)(n32 ? MIPS64_NR32_pwrite64 : MIPS64_NR_pwrite64)) {
-        *claimed = 1;
-        return l2a_pio(ctx, a0, a1, a2, a3, 1);
-    }
-    if (nr == (uint64_t)(n32 ? MIPS64_NR32_sysmips : MIPS64_NR_sysmips)) {
+        c = 1;
+        r = mips_sc_truncate(ctx, a0, a1);
+    } else if (nr == (uint64_t)(n32 ? MIPS64_NR32_ftruncate
+                                     : MIPS64_NR_ftruncate)) {
+        c = 1;
+        r = mips_sc_ftruncate(ctx, a0, a1);
+    } else if (nr ==
+               (uint64_t)(n32 ? MIPS64_NR32_unlink : MIPS64_NR_unlink)) {
+        c = 1;
+        r = mips_sc_unlink(ctx, a0);
+    } else if (nr ==
+               (uint64_t)(n32 ? MIPS64_NR32_getcwd : MIPS64_NR_getcwd)) {
+        c = 1;
+        r = mips_sc_getcwd(ctx, a0, a1);
+    } else if (nr ==
+               (uint64_t)(n32 ? MIPS64_NR32_chdir : MIPS64_NR_chdir)) {
+        c = 1;
+        r = mips_sc_chdir(ctx, a0);
+    } else if (nr ==
+               (uint64_t)(n32 ? MIPS64_NR32_fchdir : MIPS64_NR_fchdir)) {
+        c = 1;
+        r = mips_sc_fchdir(ctx, a0);
+    } else if (nr == (uint64_t)(n32 ? MIPS64_NR32_symlinkat
+                                    : MIPS64_NR_symlinkat)) {
+        c = 1;
+        r = mips_sc_symlinkat(ctx, a0, a1, a2);
+    } else if (nr ==
+               (uint64_t)(n32 ? MIPS64_NR32_pread64 : MIPS64_NR_pread64)) {
+        c = 1;
+        r = l2a_pio(ctx, a0, a1, a2, a3, 0);
+    } else if (nr ==
+               (uint64_t)(n32 ? MIPS64_NR32_pwrite64 : MIPS64_NR_pwrite64)) {
+        c = 1;
+        r = l2a_pio(ctx, a0, a1, a2, a3, 1);
+    } else if (nr ==
+               (uint64_t)(n32 ? MIPS64_NR32_sysmips : MIPS64_NR_sysmips)) {
         int frc;
 
-        *claimed = 1;
+        c = 1;
         /* Only the FIXADE control is implemented; SETNAME,
          * FLUSH_CACHE, and unknown commands are -EINVAL, matching
          * Linux sysmips(2). */
         if (a0 != (uint64_t)MIPS_SYNC_FIXADE) {
-            return l2a_ret(ctx, -(int64_t)EINVAL);
+            r = l2a_ret(ctx, -(int64_t)EINVAL);
+        } else {
+            frc = mips_fixade_ctl(ctx, (unsigned long)a0,
+                                 (unsigned long)a1);
+            r = frc != 0 ? l2a_ret(ctx, -(int64_t)EINVAL) :
+                           l2a_ret(ctx, 0);
         }
-        frc = mips_fixade_ctl(ctx, (unsigned long)a0, (unsigned long)a1);
-        if (frc != 0) {
-            return l2a_ret(ctx, -(int64_t)EINVAL);
+    } else {
+        /* The sub-dispatchers take a local so a NULL claimed can
+         * never be dereferenced. */
+        r = mips_sc_fs_extra(ctx, n32, nr, a0, a1, a2, a3, a4, &c);
+        if (c == 0) {
+            r = mips_sc_misc_extra(ctx, n32, nr, a0, a1, a2, a3, a4, &c);
         }
-        return l2a_ret(ctx, 0);
+        if (c == 0) {
+            r = -(int64_t)ENOSYS;
+        }
     }
-    return -(int64_t)ENOSYS;
+    if (claimed != NULL) {
+        *claimed = c;
+    }
+    return r;
 }

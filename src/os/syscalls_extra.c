@@ -17,10 +17,12 @@
 #include "core/cpu.h"
 
 #include "os/host_args.h"
+#include "os/signal_core.h"
 
 #include <errno.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -39,6 +41,9 @@ extern uint8_t *guest_range(mips64_ctx_t *ctx, uint64_t va, uint64_t len,
                             int write);
 extern int64_t mips_sc_copyout(mips64_ctx_t *ctx, uint64_t va,
                                const void *src, uint64_t len);
+extern int64_t guest_str(mips64_ctx_t *ctx, uint64_t va, char *out);
+
+#define L2A_CWD_PATH_MAX 4096U
 
 /* Quiescence lease hooks (src/os/quiesce.c): a blocking sleep must
  * not hold the dispatch lease. */
@@ -134,7 +139,7 @@ int64_t mips_sc_clock_nanosleep(mips64_ctx_t *ctx, uint64_t clk,
 {
     struct timespec rq;
     struct timespec rm;
-    struct timespec *remp = NULL;
+    struct timespec *remp;
     uint8_t *p;
     int64_t rc;
     int be;
@@ -155,30 +160,42 @@ int64_t mips_sc_clock_nanosleep(mips64_ctx_t *ctx, uint64_t clk,
         rq.tv_sec = (time_t)(int32_t)getn(p, 4, be);
         rq.tv_nsec = (long)(int32_t)getn(p + 4, 4, be);
     }
-    if (rem_va != 0U) {
-        if (!mips_mem_ok(ctx, rem_va, is64 ? 16U : 8U,
-                         (uint32_t)MIPS_PROT_WRITE)) {
-            return l2a_ret(ctx, -(int64_t)EFAULT);
-        }
-        remp = &rm;
+    if (rem_va != 0U &&
+        !mips_mem_ok(ctx, rem_va, is64 ? 16U : 8U,
+                     (uint32_t)MIPS_PROT_WRITE)) {
+        return l2a_ret(ctx, -(int64_t)EFAULT);
     }
     if (rq.tv_nsec < 0 || rq.tv_nsec >= 1000000000L) {
         return l2a_ret(ctx, -(int64_t)EINVAL);
     }
+    /* Relative sleeps always stage the remainder in a local (even
+     * with no guest rem pointer) so a spurious-EINTR retry shrinks
+     * the sleep; absolute sleeps pass NULL and re-enter untouched. */
+    remp = ((flags & (uint64_t)TIMER_ABSTIME) == 0U) ? &rm : NULL;
+    /* EINTR with no deliverable guest signal resumes the remaining
+     * sleep (absolute sleeps re-enter with the same target). */
     mips_qs_lease_exit(ctx);
+    for (;;) {
 #if defined(__linux__)
-    rc = (int64_t)clock_nanosleep((clockid_t)(int)clk, (int)flags, &rq,
-                                  remp);
-    saved_err = (int)rc;
+        rc = (int64_t)clock_nanosleep((clockid_t)(int)clk, (int)flags, &rq,
+                                      remp);
+        saved_err = (int)rc;
 #else
-    rc = l2a_clock_sleep_fallback(clk, flags, &rq, remp);
-    saved_err = errno;
+        rc = l2a_clock_sleep_fallback(clk, flags, &rq, remp);
+        saved_err = errno;
 #endif
+        if (rc == 0 || saved_err != EINTR ||
+            mips64_host_eintr_retry(ctx) == 0) {
+            break;
+        }
+        if (remp != NULL) {
+            rq = *remp;
+        }
+    }
     mips_qs_lease_enter(ctx);
     if (rc != 0) {
         rc = -(int64_t)saved_err;
-        if (remp != NULL && saved_err == EINTR &&
-            (flags & (uint64_t)TIMER_ABSTIME) == 0U) {
+        if (remp != NULL && rem_va != 0U && saved_err == EINTR) {
             uint8_t img[16];
 
             if (is64) {
@@ -197,4 +214,67 @@ int64_t mips_sc_clock_nanosleep(mips64_ctx_t *ctx, uint64_t clk,
         return l2a_ret(ctx, rc);
     }
     return l2a_ret(ctx, 0);
+}
+
+/* chdir(2): the guest path joins the host sysroot (if any) like every
+ * other path syscall; relative paths resolve against the host cwd. */
+int64_t mips_sc_chdir(mips64_ctx_t *ctx, uint64_t path_va)
+{
+    char path[L2A_CWD_PATH_MAX + 1U];
+    char full[L2A_CWD_PATH_MAX + MIPS64RT_HOST_ARGS_PATH_MAX + 2U];
+    int64_t rc = guest_str(ctx, path_va, path);
+
+    if (rc < 0) {
+        return l2a_ret(ctx, rc);
+    }
+    if (mips64_sysroot_join(mips64_host_sysroot(), path, full,
+                            sizeof full) != 0) {
+        return l2a_ret(ctx, -(int64_t)ENAMETOOLONG);
+    }
+    if (chdir(full) != 0) {
+        return l2a_ret(ctx, -(int64_t)errno);
+    }
+    return l2a_ret(ctx, 0);
+}
+
+int64_t mips_sc_fchdir(mips64_ctx_t *ctx, uint64_t fd)
+{
+    if (fchdir((int)fd) != 0) {
+        return l2a_ret(ctx, -(int64_t)errno);
+    }
+    return l2a_ret(ctx, 0);
+}
+
+/* getcwd(2): returns the byte count including the NUL. With a host
+ * sysroot the sysroot prefix is stripped so the guest sees "/"-rooted
+ * paths; a cwd outside the sysroot is reported verbatim. */
+int64_t mips_sc_getcwd(mips64_ctx_t *ctx, uint64_t buf_va, uint64_t size)
+{
+    char cwd[L2A_CWD_PATH_MAX + 1U];
+    const char *out = cwd;
+    const char *root = mips64_host_sysroot();
+    size_t n;
+
+    if (getcwd(cwd, sizeof cwd) == NULL) {
+        return l2a_ret(ctx, -(int64_t)errno);
+    }
+    if (root != NULL && root[0] != '\0') {
+        size_t rn = strlen(root);
+
+        while (rn > 0U && root[rn - 1U] == '/') {
+            rn--;
+        }
+        if (rn > 0U && strncmp(cwd, root, rn) == 0 &&
+            (cwd[rn] == '/' || cwd[rn] == '\0')) {
+            out = cwd[rn] == '\0' ? "/" : cwd + rn;
+        }
+    }
+    n = strlen(out) + 1U;
+    if (n > size) {
+        return l2a_ret(ctx, -(int64_t)ERANGE);
+    }
+    if (mips_sc_copyout(ctx, buf_va, out, n) != 0) {
+        return l2a_ret(ctx, -(int64_t)EFAULT);
+    }
+    return l2a_ret(ctx, (int64_t)n);
 }
