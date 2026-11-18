@@ -38,6 +38,8 @@
 
 #include <errno.h>
 #include <stddef.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
 #include <sys/types.h>
@@ -255,6 +257,8 @@ int mips_raise_guest(mips64_ctx_t *ctx, int signo, uint64_t fault_addr)
     uint8_t stage[L4B_FRAME_MAX];
     uint8_t *f = stage;
     uint64_t sc_pc;
+    uint64_t saved[2];
+    int have_saved;
     uint32_t i;
 
     if (ctx == NULL || !l4b_signo_valid(signo)) {
@@ -315,15 +319,50 @@ int mips_raise_guest(mips64_ctx_t *ctx, int signo, uint64_t fault_addr)
         return 1;
     }
     memset(f, 0, sizeof stage);
-    /* siginfo: signo@0 code@4 errno@8, then addr at +16 (8 bytes
-     * N64) or +12 (4 bytes N32: 4-byte pointers need no pad). */
-    putn(f + 24, (uint64_t)(uint32_t)signo, 4, be);
-    putn(f + 28, (uint64_t)(uint32_t)code, 4, be);
-    putn(f + 32, (uint64_t)(uint32_t)errnum, 4, be);
-    if (n32) {
-        putn(f + 36, addr & UINT64_C(0xffffffff), 4, be);
+    /* siginfo: signo@0 code@4 errno@8. Faults carry the address at
+     * +16 (8 bytes N64) or +12 (4 bytes N32: 4-byte pointers need no
+     * pad). The _sifields union starts at +16 on N64 (8-byte pointer
+     * alignment) and at +12 on N32, so SIGCHLD carries {pid, uid,
+     * status} at f+40/f+44/f+48 on N64 and f+36/f+40/f+44 on N32. */
+    if (signo == (int)MIPS64_SIGCHLD) {
+        uint32_t cpid = 0U;
+        uint32_t cuid = 0U;
+        int32_t cstatus = 0;
+        int32_t ccode = 0;
+
+        if (mips64_sigchld_info(&cpid, &cuid, &cstatus, &ccode)) {
+            code = ccode;
+            putn(f + 24, (uint64_t)(uint32_t)signo, 4, be);
+            putn(f + 28, (uint64_t)(uint32_t)code, 4, be);
+            putn(f + 32, (uint64_t)(uint32_t)errnum, 4, be);
+            if (n32) {
+                putn(f + 36, (uint64_t)cpid, 4, be);
+                putn(f + 40, (uint64_t)cuid, 4, be);
+                putn(f + 44, (uint64_t)(uint32_t)cstatus, 4, be);
+            } else {
+                putn(f + 40, (uint64_t)cpid, 4, be);
+                putn(f + 44, (uint64_t)cuid, 4, be);
+                putn(f + 48, (uint64_t)(uint32_t)cstatus, 4, be);
+            }
+        } else {
+            putn(f + 24, (uint64_t)(uint32_t)signo, 4, be);
+            putn(f + 28, (uint64_t)(uint32_t)code, 4, be);
+            putn(f + 32, (uint64_t)(uint32_t)errnum, 4, be);
+            if (n32) {
+                putn(f + 36, addr & UINT64_C(0xffffffff), 4, be);
+            } else {
+                putn(f + 40, addr, 8, be);
+            }
+        }
     } else {
-        putn(f + 40, addr, 8, be);
+        putn(f + 24, (uint64_t)(uint32_t)signo, 4, be);
+        putn(f + 28, (uint64_t)(uint32_t)code, 4, be);
+        putn(f + 32, (uint64_t)(uint32_t)errnum, 4, be);
+        if (n32) {
+            putn(f + 36, addr & UINT64_C(0xffffffff), 4, be);
+        } else {
+            putn(f + 40, addr, 8, be);
+        }
     }
     /* ucontext flags/link zeroed; altstack report mirrors current. */
     {
@@ -372,29 +411,31 @@ int mips_raise_guest(mips64_ctx_t *ctx, int signo, uint64_t fault_addr)
         putn(m + L4B_SC_MATH, 1U, 4, be);
         putn(m + L4B_SC_DSP, 0U, 4, be);
     }
-    /* Saved mask: the pre-delivery blocked set. */
+    /* Saved mask: the pre-delivery blocked set, or the caller's mask
+     * parked by a sigmask-taking wait (pselect6/ppoll); the parked
+     * mask is consumed only once the frame commits (below). */
     {
         uint8_t *s = f + (n32 ? 776U : 792U);
 
+        saved[0] = ctx->sig_blocked[0];
+        saved[1] = ctx->sig_blocked[1];
+        have_saved = mips64_sig_take_saved(saved);
         if (n32) {
-            putn(s, ctx->sig_blocked[0] & UINT64_C(0xffffffff), 4,
-                 be);
-            putn(s + 4,
-                 (ctx->sig_blocked[0] >> 32) & UINT64_C(0xffffffff),
-                 4, be);
-            putn(s + 8, ctx->sig_blocked[1] & UINT64_C(0xffffffff),
-                 4, be);
-            putn(s + 12,
-                 (ctx->sig_blocked[1] >> 32) & UINT64_C(0xffffffff),
-                 4, be);
+            putn(s, saved[0] & UINT64_C(0xffffffff), 4, be);
+            putn(s + 4, (saved[0] >> 32) & UINT64_C(0xffffffff), 4, be);
+            putn(s + 8, saved[1] & UINT64_C(0xffffffff), 4, be);
+            putn(s + 12, (saved[1] >> 32) & UINT64_C(0xffffffff), 4, be);
         } else {
-            putn(s, ctx->sig_blocked[0], 8, be);
-            putn(s + 8, ctx->sig_blocked[1], 8, be);
+            putn(s, saved[0], 8, be);
+            putn(s + 8, saved[1], 8, be);
         }
     }
     /* Commit the staged frame under sc_lock (R3-1); a revalidation
      * failure mirrors the old unreadable-frame path. */
     if (mips_sc_copyout(ctx, frame, f, size) != 0) {
+        if (have_saved) {
+            mips64_sig_defer_restore(saved);
+        }
         if (signo == L4B_SIGSEGV) {
             return 1;
         }

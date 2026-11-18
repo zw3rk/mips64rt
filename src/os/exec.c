@@ -82,6 +82,9 @@ extern void mips_mem_restore(const mips64_region_t *regs, size_t count);
 extern int guest_ld32(mips64_ctx_t *ctx, uint64_t va, uint64_t *out);
 extern int guest_ld64(mips64_ctx_t *ctx, uint64_t va, uint64_t *out);
 extern int guest_st32(mips64_ctx_t *ctx, uint64_t va, uint64_t val);
+/* Lane L4b vfork channel (src/os/threads_vfork.c). */
+extern void mips64_vfork_flush_pre_exec(mips64_ctx_t *ctx);
+extern void mips64_vfork_drop(void);
 
 /* Linux AT constants (arch-independent). */
 #ifndef AT_FDCWD
@@ -497,11 +500,23 @@ int64_t mips_sc_exec(mips64_ctx_t *ctx, uint64_t nr, uint64_t path_va,
         mips_mem_snapshot(backup->regions, MIPS64_MAX_REGIONS);
     old_base = backup->guest_base;
     old_size = backup->task_size;
+    /* A vfork child execing a guest image replays its parent-stack-window
+     * diffs first (same as the host-execve branch below): the loader
+     * wipes and replaces the guest address space the snapshot window
+     * points into, so unflushed writes would be lost. The channel stays
+     * live across the load so a failing load still reports through it
+     * (args->err, then the exit-path flush closes it); the committed
+     * image drops it below. */
+    mips64_vfork_flush_pre_exec(ctx);
     rc = mips_load_elf(ctx, path_buf, guest_buf, host_argv, host_envp);
     if (rc != 0) {
         int e = errno != 0 ? errno : ENOEXEC;
         /* Tear down the partial new window, restore the old image. */
-        if (ctx->guest_base != 0U && ctx->task_size != 0U) {
+        /* An early failure (open/ELF parse) returns before the loader
+         * touches ctx, so guest_base still names the live window and
+         * must not be unmapped. */
+        if (ctx->guest_base != 0U && ctx->task_size != 0U &&
+            ctx->guest_base != old_base) {
             (void)munmap((void *)(uintptr_t)ctx->guest_base,
                          (size_t)ctx->task_size);
         }
@@ -529,6 +544,12 @@ int64_t mips_sc_exec(mips64_ctx_t *ctx, uint64_t nr, uint64_t path_va,
             }
             host_envp[w] = NULL;
             envc = w;
+            /* A vfork child execing the host image replays its
+             * parent-stack-window diffs first but keeps the channel
+             * live: the exec closes it via CLOEXEC (resuming the
+             * parent), while a failed execve still reports through
+             * it (args->err, then the exit-path flush closes it). */
+            mips64_vfork_flush_pre_exec(ctx);
             (void)execve(path_buf, host_argv, host_envp);
             e = errno != 0 ? errno : ENOEXEC;
         }
@@ -542,6 +563,12 @@ int64_t mips_sc_exec(mips64_ctx_t *ctx, uint64_t nr, uint64_t path_va,
     }
     free_vec(host_argv, argc);
     free_vec(host_envp, envc);
+    /* The loader replaced the image, so the snapshotted window is gone:
+     * drop the vfork channel (a success-path child wrote nothing to
+     * the parent window, so EOF alone is the resume; the pre-exec
+     * bytes are already history). Never on the failure path above,
+     * where the child continues and flushes at _exit instead. */
+    mips64_vfork_drop();
     /* Target open/ELF validation succeeded inside the loader; the
      * image is replaced from here on, so close guest CLOEXEC fds
      * now (never on the failure path above). */
@@ -672,9 +699,18 @@ int64_t mips_sc_waitid(mips64_ctx_t *ctx, uint64_t which, uint64_t pid,
     if (nowait) {
         wflags |= WNOWAIT;
     }
+    /* EINTR with no deliverable guest signal re-enters the wait
+     * instead of surfacing (WNOHANG callers never block, so the loop
+     * only repeats a genuinely interrupted blocking wait). */
     mips_qs_lease_exit(ctx);
-    got = waitpid(want, &status, wflags);
-    saved_err = errno;
+    for (;;) {
+        got = waitpid(want, &status, wflags);
+        saved_err = errno;
+        if (got >= 0 || saved_err != EINTR ||
+            mips64_host_eintr_retry(ctx) == 0) {
+            break;
+        }
+    }
     mips_qs_lease_enter(ctx);
     if (got < 0) {
         return exec_ret(ctx, -(int64_t)saved_err);

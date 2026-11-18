@@ -12,10 +12,12 @@
 
 #include "core/cpu.h"
 #include "os/errno_map.h"
+#include "os/signal_core.h"
 #include "os/syscall_nr.h"
 #include "vm/vm_pages.h"
 
 #include <errno.h>
+#include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -35,8 +37,8 @@ extern int mips_mem_ok(const mips64_ctx_t *ctx, uint64_t va, uint64_t len,
 extern int64_t mips_sc_openat(mips64_ctx_t *ctx, uint64_t dirfd,
                               uint64_t path_va, uint64_t flags,
                               uint64_t mode);
-extern int64_t mips_sc_fcntl(mips64_ctx_t *ctx, uint64_t fd, uint64_t cmd,
-                             uint64_t arg);
+extern int64_t mips_sc_fcntl(mips64_ctx_t *ctx, int n32, uint64_t fd,
+                             uint64_t cmd, uint64_t arg);
 extern int64_t mips_sc_clock_gettime(mips64_ctx_t *ctx, uint64_t clk,
                                      uint64_t ts_va, int is64);
 extern int64_t mips_sc_nanosleep(mips64_ctx_t *ctx, uint64_t req_va,
@@ -87,7 +89,7 @@ extern int64_t mips_sc_vec(mips64_ctx_t *ctx, uint64_t fd, uint64_t iov_va,
 /* Lane H2 file-mutation + sysmips tail (src/os/syscalls_sync.c). */
 extern int64_t mips_sc_file_extra(mips64_ctx_t *ctx, int n32, uint64_t nr,
                                   uint64_t a0, uint64_t a1, uint64_t a2,
-                                  uint64_t a3, int *claimed);
+                                  uint64_t a3, uint64_t a4, int *claimed);
 /* Lane U12 scalar read/write (src/os/syscalls_sync.c). */
 extern int64_t mips_sc_read(mips64_ctx_t *ctx, uint64_t fd, uint64_t buf,
                             uint64_t count);
@@ -96,6 +98,9 @@ extern int64_t mips_sc_write(mips64_ctx_t *ctx, uint64_t fd, uint64_t buf,
 /* Lane U12 quiescence lease (src/os/quiesce.c). */
 extern void mips_qs_lease_enter(mips64_ctx_t *ctx);
 extern void mips_qs_lease_exit(mips64_ctx_t *ctx);
+/* Lane L4b vfork channel (src/os/threads_vfork.c). */
+extern void mips64_vfork_flush(mips64_ctx_t *ctx);
+extern int mips64_vfork_pipe_fd(void);
 /* Lane U12 Provider A file-map hook (src/vm/vm_file.c). */
 extern void mips_vm_file_map_hook(mips64_ctx_t *ctx, int fd, uint64_t va,
                                   uint64_t len, uint64_t file_offset,
@@ -206,52 +211,8 @@ static void copy_uts_field(uint8_t *dst, const char *src)
  * as mips_sc_read/mips_sc_write (lane U12 file-I/O home); the lease
  * wraps the whole dispatch in mips_syscall below. */
 
-static int64_t sc_brk(mips64_ctx_t *ctx, uint64_t addr)
-{
-    uint64_t aligned;
-    uint64_t have;
-    int rc;
-
-    if (addr == 0U || addr == ctx->brk_curr) {
-        return sc_ret(ctx, (int64_t)ctx->brk_curr);
-    }
-    if (addr <= ctx->brk_base) {
-        return sc_ret(ctx, (int64_t)ctx->brk_curr);
-    }
-    if (addr < ctx->brk_curr) {
-        ctx->brk_curr = addr; /* shrink: keep mappings, move the mark */
-        return sc_ret(ctx, (int64_t)ctx->brk_curr);
-    }
-    if (ctx->brk_base == 0U) {
-        return sc_ret(ctx, (int64_t)ctx->brk_curr);
-    }
-    aligned = (addr + (MIPS64_PAGE_SIZE - 1U)) & MIPS64_PAGE_MASK;
-    if (aligned < addr) {
-        return sc_ret(ctx, -(int64_t)ENOMEM);
-    }
-    if (aligned > ctx->task_size) {
-        return sc_ret(ctx, -(int64_t)ENOMEM);
-    }
-    /* Map only the not-yet-mapped extension. */
-    have = ctx->brk_curr > ctx->brk_base ?
-           ((ctx->brk_curr + (MIPS64_PAGE_SIZE - 1U)) &
-            MIPS64_PAGE_MASK) : ctx->brk_base;
-    if (aligned > have) {
-        rc = mips_mem_map(ctx, have, aligned - have,
-                          MIPS_PROT_READ | MIPS_PROT_WRITE, "heap");
-        if (rc == -EEXIST &&
-            !mips_mem_ok(ctx, have, aligned - have,
-                         MIPS_PROT_READ | MIPS_PROT_WRITE)) {
-            return sc_ret(ctx, -(int64_t)ENOMEM);
-        }
-        if (rc != 0 && rc != -EEXIST) {
-            return sc_ret(ctx, -(int64_t)rc);
-        }
-    }
-    ctx->brk_curr = addr;
-    return sc_ret(ctx, (int64_t)ctx->brk_curr);
-}
-
+/* brk(2) lives in src/os/syscalls_misc.c (line-limit split). */
+extern int64_t mips_sc_brk(mips64_ctx_t *ctx, uint64_t addr);
 /* First gap of at least size bytes at or after cand (page granular).
  * Served from the process-global table (lane H4): a per-context copy
  * goes stale at clone and could hand out a live mapping. */
@@ -337,6 +298,12 @@ static int64_t sc_mmap(mips64_ctx_t *ctx, uint64_t addr, uint64_t len,
             if (got < 0) {
                 int e = errno;
 
+                /* Staging retry: file content is not guest-visible
+                 * until mapped, so a signal-interrupted fill
+                 * re-issues instead of surfacing EINTR from mmap. */
+                if (e == EINTR) {
+                    continue;
+                }
                 free(fbuf);
                 return sc_ret(ctx, -(int64_t)e);
             }
@@ -414,7 +381,8 @@ static int64_t sc_uname(mips64_ctx_t *ctx, uint64_t va)
     copy_uts_field(dst + 1U * MIPS_UTS_FIELD, un.nodename);
     copy_uts_field(dst + 2U * MIPS_UTS_FIELD, un.release);
     copy_uts_field(dst + 3U * MIPS_UTS_FIELD, un.version);
-    copy_uts_field(dst + 4U * MIPS_UTS_FIELD, un.machine);
+    /* Report the guest ISA, not the host's (userland probes uname -m). */
+    copy_uts_field(dst + 4U * MIPS_UTS_FIELD, "mips64");
 #if defined(__linux__) && !defined(__GLIBC__)
     /* musl spells the sixth utsname field with leading underscores. */
     copy_uts_field(dst + 5U * MIPS_UTS_FIELD, un.__domainname);
@@ -432,9 +400,17 @@ static int64_t sc_uname(mips64_ctx_t *ctx, uint64_t va)
 }
 
 /* close(2): pass through to the host (RC4: the test's exec/pipe
- * round-trip closes the write end so the reader sees EOF). */
+ * round-trip closes the write end so the reader sees EOF). The live
+ * vfork channel write end is skipped: a child dup2/close over it must
+ * not strand the vfork parent (its fd sits above 512, so this only
+ * fires on a deliberate close of exactly that number). */
 static int64_t sc_close(mips64_ctx_t *ctx, uint64_t fd)
 {
+    int vfd = mips64_vfork_pipe_fd();
+
+    if (vfd >= 0 && (int)fd == vfd) {
+        return sc_ret(ctx, 0);
+    }
     if (close((int)fd) != 0) {
         return sc_ret(ctx, -(int64_t)errno);
     }
@@ -469,6 +445,7 @@ static int64_t sc_wait4(mips64_ctx_t *ctx, uint64_t pid, uint64_t status_va,
 {
     int status = 0;
     pid_t ret;
+    int saved_err = 0;
 
     if (rusage_va != 0U) {
         return sc_ret(ctx, -(int64_t)ENOSYS);
@@ -480,13 +457,22 @@ static int64_t sc_wait4(mips64_ctx_t *ctx, uint64_t pid, uint64_t status_va,
     }
     /* A blocking wait must not hold the dispatch lease: park with 0
      * leases so a concurrent VM mutation is never stalled by a
-     * thread that is not touching memory. */
+     * thread that is not touching memory. EINTR with no deliverable
+     * guest signal re-enters the wait instead of surfacing. */
     mips_qs_lease_exit(ctx);
-    ret = waitpid((pid_t)(int64_t)pid, status_va != 0U ? &status : NULL,
-                  (int)(options & 0xFFFFFFFFU));
+    for (;;) {
+        ret = waitpid((pid_t)(int64_t)pid,
+                      status_va != 0U ? &status : NULL,
+                      (int)(options & 0xFFFFFFFFU));
+        saved_err = errno;
+        if (ret >= 0 || saved_err != EINTR ||
+            mips64_host_eintr_retry(ctx) == 0) {
+            break;
+        }
+    }
     mips_qs_lease_enter(ctx);
     if (ret < 0) {
-        return sc_ret(ctx, -(int64_t)errno);
+        return sc_ret(ctx, -(int64_t)saved_err);
     }
     if (status_va != 0U) {
         if (!mips_mem_ok(ctx, status_va, 4U, MIPS_PROT_WRITE)) {
@@ -500,45 +486,10 @@ static int64_t sc_wait4(mips64_ctx_t *ctx, uint64_t pid, uint64_t status_va,
     return sc_ret(ctx, (int64_t)ret);
 }
 
-/* RC4: deliver the first queued signal with a live unblocked handler.
- * The interrupted syscall already completed, so pc advances past it
- * before the frame is built (sc_pc resumes after the syscall). Runs at
- * the end of every mips_syscall; both engines observe the redirected pc
- * via their pc-moved checks. */
-static void sc_deliver_pending(mips64_ctx_t *ctx)
-{
-    uint32_t i;
-
-    if (ctx == NULL || ctx->pend_count == 0U) {
-        return;
-    }
-    for (i = 0U; i < ctx->pend_count; i++) {
-        uint32_t slot = (ctx->pend_head + i) % 16U;
-        int signo = (int)ctx->pend_queue[slot].signo;
-        unsigned w;
-        uint64_t bit;
-
-        if (signo < 1 || signo > 128) {
-            continue;
-        }
-        if (mips_signal_has_handler(signo) == 0) {
-            continue;
-        }
-        w = (unsigned)(signo - 1) / 64U;
-        bit = (uint64_t)1U << ((unsigned)(signo - 1) % 64U);
-        if ((ctx->sig_blocked[w] & bit) != 0U) {
-            continue;
-        }
-        ctx->pc += 4U; /* syscall done; resume after it on sigreturn */
-        ctx->next_pc = ctx->pc + 4U;
-        if (mips_raise_guest(ctx, signo,
-                             ctx->pend_queue[slot].addr) == 0) {
-            return;
-        }
-        break;
-    }
-}
-
+/* RC4 pending-signal sweep lives in src/os/signal_core.c
+ * (mips64_sc_deliver_pending, shared with the unit gate); the entry
+ * $v0/$a3 are saved here because a -EINTR writeback clobbers them and
+ * a guest SA_RESTART restart must restore them. */
 static int64_t mips_syscall_inner(mips64_ctx_t *ctx)
 {
     uint64_t nr;
@@ -589,6 +540,10 @@ static int64_t mips_syscall_inner(mips64_ctx_t *ctx)
             /* RC2 difftest: exit-state dump shared by both engines. */
             mips_dump_regs(ctx, stderr);
         }
+        /* A vfork child exiting here replays its parent-stack-window
+         * diffs (posix_spawn args->err) before the exit resumes the
+         * parent. Thread exits flush in mips_thread_exit instead. */
+        mips64_vfork_flush(ctx);
         _Exit((int)(a0 & 0xFFU));
         return sc_ret(ctx, 0); /* unreachable */
     }
@@ -599,7 +554,7 @@ static int64_t mips_syscall_inner(mips64_ctx_t *ctx)
         return mips_sc_write(ctx, a0, a1, a2);
     }
     if (nr == (uint64_t)(n32 ? MIPS64_NR32_brk : MIPS64_NR_brk)) {
-        return sc_brk(ctx, a0);
+        return mips_sc_brk(ctx, a0);
     }
     if (nr == (uint64_t)(n32 ? MIPS64_NR32_mmap : MIPS64_NR_mmap)) {
         return sc_mmap(ctx, a0, a1, a2, a3, a4, a5);
@@ -624,6 +579,9 @@ static int64_t mips_syscall_inner(mips64_ctx_t *ctx)
     if (nr == (uint64_t)(n32 ? MIPS64_NR32_mprotect : MIPS64_NR_mprotect)) {
         int rc;
 
+        /* PROT_GROWSDOWN/GROWSUP (ld.so execstack) are accepted; the
+         * guest stack is fully mapped, so the range is used as given. */
+        a2 &= ~(uint64_t)0x03000000U;
         if ((a0 & (MIPS64_PAGE_SIZE - 1U)) != 0U ||
             (a2 & ~(uint64_t)7U) != 0U) {
             return sc_ret(ctx, -(int64_t)EINVAL);
@@ -679,7 +637,7 @@ static int64_t mips_syscall_inner(mips64_ctx_t *ctx)
         return mips_sc_openat(ctx, a0, a1, a2, a3);
     }
     if (nr == (uint64_t)(n32 ? MIPS64_NR32_fcntl : MIPS64_NR_fcntl)) {
-        return mips_sc_fcntl(ctx, a0, a1, a2);
+        return mips_sc_fcntl(ctx, n32, a0, a1, a2);
     }
     if (nr == (uint64_t)(n32 ? MIPS64_NR32_clock_gettime
                              : MIPS64_NR_clock_gettime)) {
@@ -795,6 +753,11 @@ static int64_t mips_syscall_inner(mips64_ctx_t *ctx)
     }
     if (nr == (uint64_t)(n32 ? MIPS64_NR32_faccessat
                              : MIPS64_NR_faccessat)) {
+        /* Kernel faccessat has no flags word; a3 is caller garbage. */
+        return mips_sc_access_at(ctx, a0, a1, a2, 0U);
+    }
+    if (nr == (uint64_t)(n32 ? MIPS64_NR32_faccessat2
+                             : MIPS64_NR_faccessat2)) {
         return mips_sc_access_at(ctx, a0, a1, a2, a3);
     }
     if (nr == (uint64_t)(n32 ? MIPS64_NR32_pipe2 : MIPS64_NR_pipe2)) {
@@ -873,7 +836,7 @@ static int64_t mips_syscall_inner(mips64_ctx_t *ctx)
          * sysmips(MIPS_FIXADE) live in the file-extra tail. */
         int claimed = 0;
         int64_t extra =
-            mips_sc_file_extra(ctx, n32 ? 1 : 0, nr, a0, a1, a2, a3,
+            mips_sc_file_extra(ctx, n32 ? 1 : 0, nr, a0, a1, a2, a3, a4,
                                &claimed);
 
         if (claimed != 0) {
@@ -889,12 +852,19 @@ static int64_t mips_syscall_inner(mips64_ctx_t *ctx)
  * both engines treat the moved pc as final and resume there). */
 int64_t mips_syscall(mips64_ctx_t *ctx)
 {
+    uint64_t orig_v0;
+    uint64_t orig_a3;
     int64_t rc;
 
+    orig_v0 = ctx->gpr[MIPS64_REG_V0];
+    orig_a3 = ctx->gpr[MIPS64_REG_A3];
     mips_qs_lease_enter(ctx);
     mips_vm_file_reconcile(ctx);
     rc = mips_syscall_inner(ctx);
     mips_qs_lease_exit(ctx);
-    sc_deliver_pending(ctx);
+    mips64_host_sigchld_poll(ctx);
+    mips64_sc_deliver_pending(ctx, orig_v0, orig_a3, rc);
+    /* A parked pselect6/ppoll mask that no delivery consumed. */
+    mips64_sig_restore_saved(ctx);
     return rc;
 }

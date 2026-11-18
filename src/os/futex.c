@@ -63,6 +63,7 @@ extern int64_t l2a_ret(mips64_ctx_t *ctx, int64_t raw);
 extern uint64_t getn(const uint8_t *p, unsigned n, int be);
 extern int mips_mem_ok(const mips64_ctx_t *ctx, uint64_t va, uint64_t len,
                        uint32_t need);
+extern int mips64_host_eintr_retry(mips64_ctx_t *ctx);
 
 /* N32 carries 32-bit pointers: truncate to the low word (N64 VAs use
  * the full 64 bits). */
@@ -471,6 +472,7 @@ int64_t mips_futex_op(mips64_ctx_t *ctx, uint64_t uaddr, uint64_t op,
         struct timespec to;
         const struct timespec *top = NULL;
         int trc;
+        int saved_err = 0;
 
         if (l4f_word(ctx, hp) != (uint32_t)val) {
             return l2a_ret(ctx, -(int64_t)EAGAIN);
@@ -498,15 +500,23 @@ int64_t mips_futex_op(mips64_ctx_t *ctx, uint64_t uaddr, uint64_t op,
                                          ctx->is_be != 0);
 
             l4f_wait_deadline(top, &dl);
+            /* EINTR with no deliverable guest signal (e.g. a child
+             * exit while SIGCHLD is blocked, and the guest SIGCHLD
+             * action lacks SA_RESTART) re-enters the wait instead of
+             * surfacing, so a non-restart guest handler still sees
+             * EINTR and the dispatcher can deliver it. */
             for (;;) {
                 if (l4f_wait_remaining(&dl, &rem) != 0) {
                     errno = ETIMEDOUT;
+                    saved_err = ETIMEDOUT;
                     rc = -1;
                     break;
                 }
                 rc = l4f_host(hp, hop, exp, &rem,
                               NULL, (uint32_t)val3);
-                if (rc >= 0 || errno != EINTR) {
+                saved_err = errno;
+                if (rc >= 0 || saved_err != EINTR ||
+                    mips64_host_eintr_retry(ctx) == 0) {
                     break;
                 }
             }
@@ -514,8 +524,15 @@ int64_t mips_futex_op(mips64_ctx_t *ctx, uint64_t uaddr, uint64_t op,
             int exp = (int)l4f_host_word((uint32_t)val,
                                          ctx->is_be != 0);
 
-            rc = l4f_host(hp, hop, exp, top, NULL,
-                          (uint32_t)val3);
+            for (;;) {
+                rc = l4f_host(hp, hop, exp, top, NULL,
+                              (uint32_t)val3);
+                saved_err = errno;
+                if (rc >= 0 || saved_err != EINTR ||
+                    mips64_host_eintr_retry(ctx) == 0) {
+                    break;
+                }
+            }
         }
         mips_qs_lease_enter(ctx);
 #else
@@ -528,6 +545,7 @@ int64_t mips_futex_op(mips64_ctx_t *ctx, uint64_t uaddr, uint64_t op,
                         base == L4F_WAIT_BITSET ? 1 : 0,
                         (hop & 0x100) != 0 ? 1 : 0, NULL, 0U, 0, 0,
                         0u);
+        saved_err = errno;
         mips_qs_lease_enter(ctx);
 #endif
         /* A mutation may have retired the mapping mid-wait; treat a
@@ -537,6 +555,9 @@ int64_t mips_futex_op(mips64_ctx_t *ctx, uint64_t uaddr, uint64_t op,
             return l2a_ret(ctx, -(int64_t)EFAULT);
         }
         if (rc < 0L) {
+            /* The EINTR verdict (waitid) and the lease re-entry above
+             * may have clobbered errno: report the wait's own error. */
+            errno = saved_err;
             return l2a_ret(ctx, -(int64_t)errno);
         }
         return l2a_ret(ctx, (int64_t)rc);

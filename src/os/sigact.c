@@ -262,9 +262,22 @@ int64_t mips_sc_rt_sigaction(mips64_ctx_t *ctx, uint64_t sp)
         if (handler >= 2U) {
             l4a_handler_words[l4a_word((int)signo)] |=
                 l4a_bit((int)signo);
+            if (signo == (uint64_t)L4A_SIGCHLD) {
+                /* The host disposition mirrors the guest SA_RESTART
+                 * bit (re-installed when the guest changes it). */
+                mips64_host_sigchld_arm(
+                    ctx->sigactions[(uint64_t)L4A_SIGCHLD].flags);
+            }
         } else {
             l4a_handler_words[l4a_word((int)signo)] &=
                 ~l4a_bit((int)signo);
+            if (signo == (uint64_t)L4A_SIGCHLD) {
+                /* DFL or IGN (with or without SA_NOCLDWAIT): the
+                 * host bridge stands down so a child exit stops
+                 * interrupting host waits with a signal nobody
+                 * will ever deliver. */
+                mips64_host_sigchld_disarm();
+            }
             if (l4a_is_ignored(ctx, (int)signo)) {
                 l4a_pend_purge(ctx, (int)signo);
             }
@@ -506,6 +519,7 @@ void mips64_signals_reset_for_exec(mips64_ctx_t *ctx)
     ctx->clear_child_tid = 0U;
     l4a_handler_words[0] = 0U;
     l4a_handler_words[1] = 0U;
+    mips64_host_sigchld_disarm();
     l4a_mark_active(ctx);
 }
 

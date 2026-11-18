@@ -8,7 +8,9 @@
  * guard for JIT code. Thread-group clones (CLONE_VM|CLONE_THREAD|
  * CLONE_SIGHAND) spawn a host pthread sharing the guest reservation
  * (guest_base + va is process memory, so host threads share it by
- * construction); process clones fall back to fork(2). The LL/SC
+ * construction); process clones fall back to fork(2). CLONE_VFORK
+ * additionally replays the child's parent-stack-window writes over
+ * the threads_vfork.c channel (posix_spawn args->err). The LL/SC
  * reservation is invalidated across every clone. Mirrors
  * ../rvrt/src/linux/thread.c (flag decoding) and
  * ../rvrt/src/runtime/exec_tid.c (per-thread TID bookkeeping).
@@ -20,8 +22,11 @@
  *
  * Limitations (documented RC4 scope): signal actions are shared
  * by value (memcpy at clone, no shared sighand); a lone CLONE_VM
- * without the thread-group triple reports -ENOSYS (fork cannot share
- * an address space); vfork arrives as fork without parent suspension;
+ * without CLONE_THREAD and without CLONE_VFORK reports -ENOSYS
+ * (fork cannot share an address space); vfork arrives as fork
+ * (private address space)
+ * with the parent suspended on the vfork diff channel until exec or
+ * exit (threads_vfork.c replays the child's stack-window writes);
  * robust lists are recorded per thread, never installed on the host;
  * fork while another thread holds the clone lock is unsupported.
  */
@@ -40,6 +45,7 @@
 #include "os/signal_core.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <pthread.h>
 #include <setjmp.h>
@@ -94,6 +100,8 @@ extern int mips_sig_enqueue(mips64_ctx_t *ctx, int signo, int32_t code,
 extern void mips_llsc_release(const mips64_ctx_t *ctx);
 extern void mips_llsc_atfork_child(const mips64_ctx_t *ctx);
 extern void dbt_thread_exit(mips64_ctx_t *ctx);
+extern void mips_qs_lease_enter(mips64_ctx_t *ctx);
+extern void mips_qs_lease_exit(mips64_ctx_t *ctx);
 void mips_threads_atfork_child(mips64_ctx_t *ctx);
 
 /* N32 carries 32-bit pointers: truncate the register to the low word
@@ -124,6 +132,17 @@ static long l4b_gettid(void)
 extern int64_t mips_futex_op(mips64_ctx_t *ctx, uint64_t uaddr, uint64_t op,
                              uint64_t val, uint64_t timeout_va, uint64_t uaddr2,
                              uint64_t val3);
+/* CLONE_VFORK channel (src/os/threads_vfork.c): pre-fork snapshot +
+ * resume pipe, child install, parent diff replay, exit/exec flush. */
+extern int64_t mips64_vfork_pre(mips64_ctx_t *ctx, uint64_t flags, int *rfd,
+                                int *wfd, uint64_t *va, size_t *len,
+                                uint8_t **snap);
+extern void mips64_vfork_pre_abort(int rfd, int wfd, uint8_t *snap);
+extern void mips64_vfork_child(uint64_t va, size_t len, uint8_t *snap,
+                               int rfd, int wfd);
+extern void mips64_vfork_parent(mips64_ctx_t *ctx, int rfd, int wfd);
+extern void mips64_vfork_flush(mips64_ctx_t *ctx);
+extern void mips64_vfork_drop(void);
 static void l4b_futex_wake(uint32_t *word)
 {
 #if defined(__linux__) && defined(SYS_futex)
@@ -199,6 +218,57 @@ int mips_thread_kill(mips64_ctx_t *caller, long tid, int signo, int32_t code)
     rc = mips_sig_enqueue(target, signo, code, 0U);
     (void)pthread_mutex_unlock(&l4b_mu);
     return rc;
+}
+
+/* Wake a peer guest thread that has MIPS SIGCHLD (18) unblocked in
+ * its guest mask (lane L4a SIGCHLD bridge): the caller saw the recorded
+ * host SIGCHLD while SIGCHLD is blocked in its own mask, so the flag
+ * stays set for a peer parked in ppoll/pselect6/read. A directed host
+ * SIGCHLD interrupts the peer's wait (its ppoll wait mask leaves host
+ * SIGCHLD unblocked exactly when the guest leaves it unblocked), so it
+ * polls the flag immediately instead of stalling to its timeout. The
+ * leader (main thread, host tid == pid) is tried first; worker slots
+ * use tgkill (Linux) or pthread_kill (Darwin). Normal syscall context
+ * only (takes l4b_mu; never from a signal handler). */
+void mips_threads_wake_sigchld_peer(const mips64_ctx_t *self)
+{
+    uint64_t bit = UINT64_C(1) << ((unsigned)(MIPS64_SIGCHLD - 1) % 64U);
+    unsigned word = ((unsigned)MIPS64_SIGCHLD - 1U) / 64U;
+    size_t i;
+
+    (void)pthread_mutex_lock(&l4b_mu);
+    if (l4b_leader_ctx != NULL && l4b_leader_ctx != self &&
+        (l4b_leader_ctx->sig_blocked[word] & bit) == 0U) {
+#if defined(__linux__) && defined(SYS_tgkill)
+        (void)syscall((long)SYS_tgkill, (long)getpid(), (long)getpid(),
+                      (int)SIGCHLD);
+#else
+        (void)kill(getpid(), SIGCHLD);
+#endif
+        (void)pthread_mutex_unlock(&l4b_mu);
+        return;
+    }
+    for (i = 0U; i < L4B_THREAD_MAX; i++) {
+        mips64_ctx_t *c = l4b_slots[i].child;
+
+        if (l4b_slots[i].used == 0 || c == NULL || c == self) {
+            continue;
+        }
+        if ((c->sig_blocked[word] & bit) != 0U) {
+            continue;
+        }
+#if defined(__linux__) && defined(SYS_tgkill)
+        if (l4b_slots[i].host_tid >= 0) {
+            (void)syscall((long)SYS_tgkill, (long)getpid(),
+                          (long)l4b_slots[i].host_tid, (int)SIGCHLD);
+            break;
+        }
+#else
+        (void)pthread_kill(l4b_slots[i].pt, SIGCHLD);
+        break;
+#endif
+    }
+    (void)pthread_mutex_unlock(&l4b_mu);
 }
 
 /* Endian-aware 32-bit tid store. Pre-validated by the caller; records
@@ -393,12 +463,25 @@ static int64_t l4b_clone_thread(mips64_ctx_t *ctx, uint64_t flags,
 
 /* Process clone: host fork(2) with the sc_clone tid bookkeeping. Never
  * touches the thread table lock (the lock state is undefined in the
- * child when other threads exist). */
+ * child when other threads exist). With CLONE_VFORK the parent blocks
+ * on the vfork channel until the child execs or exits: fork gives the
+ * child a private copy of the address space, so a shared-mm child that
+ * outlives the parent's view is not representable, but the parent
+ * suspension (the observable half of the vfork contract, which glibc
+ * posix_spawn and dash vforkexec rely on) is exact, and the child's
+ * parent-stack-window writes (posix_spawn args->err) are replayed
+ * into the parent before it resumes. */
 static int64_t l4b_clone_fork(mips64_ctx_t *ctx, uint64_t flags,
                                uint64_t stack_va, uint64_t parent_tid_va,
                                uint64_t tls_va, uint64_t child_tid_va)
 {
     pid_t pid;
+    int rfd = -1;
+    int wfd = -1;
+    uint64_t vf_va = 0U;
+    size_t vf_len = 0U;
+    uint8_t *vf_snap = NULL;
+    int64_t pre;
 
     if (((flags & L4B_CLONE_PARENT_SETTID) != 0U &&
          l4b_check_tid(ctx, parent_tid_va) != 0) ||
@@ -407,9 +490,19 @@ static int64_t l4b_clone_fork(mips64_ctx_t *ctx, uint64_t flags,
          l4b_check_tid(ctx, child_tid_va) != 0)) {
         return l2a_ret(ctx, -(int64_t)EFAULT);
     }
+    pre = mips64_vfork_pre(ctx, flags, &rfd, &wfd, &vf_va, &vf_len,
+                           &vf_snap);
+    if (pre < 0) {
+        return l2a_ret(ctx, pre);
+    }
     pid = fork();
     if (pid < 0) {
-        return l2a_ret(ctx, -(int64_t)errno);
+        int e = errno;
+
+        if (pre > 0) {
+            mips64_vfork_pre_abort(rfd, wfd, vf_snap);
+        }
+        return l2a_ret(ctx, -(int64_t)e);
     }
     if (pid == 0) {
         int32_t tid;
@@ -418,6 +511,11 @@ static int64_t l4b_clone_fork(mips64_ctx_t *ctx, uint64_t flags,
         ctx->is_thread_clone = false;
         ctx->host_tid = 0;
         mips_threads_atfork_child(ctx);
+        /* Install after atfork: atfork drops any inherited older
+         * channel (nested vfork resumes the outer parent). */
+        if (pre > 0) {
+            mips64_vfork_child(vf_va, vf_len, vf_snap, rfd, wfd);
+        }
         if (stack_va != 0U) {
             ctx->gpr[29] = stack_va;
         }
@@ -432,6 +530,12 @@ static int64_t l4b_clone_fork(mips64_ctx_t *ctx, uint64_t flags,
             l4b_store_tid(ctx, child_tid_va, (uint32_t)tid);
         }
         return l2a_ret(ctx, 0);
+    }
+    if (pre > 0) {
+        mips64_vfork_parent(ctx, rfd, wfd);
+        /* Only the fork child consumes vf_snap (diffs before
+         * exit/exec); the parent's copy is dead after the replay. */
+        free(vf_snap);
     }
     if ((flags & L4B_CLONE_PARENT_SETTID) != 0U) {
         l4b_store_tid(ctx, parent_tid_va, (uint32_t)pid);
@@ -465,10 +569,17 @@ int64_t mips_clone_full(mips64_ctx_t *ctx, uint64_t flags,
         return l4b_clone_thread(ctx, flags, stack_va, parent_tid_va,
                                 tls_va, child_tid_va);
     }
-    if ((flags & L4B_CLONE_VM) != 0U) {
-        /* Shared-mm process clone: fork cannot share the address
-         * space, so report -ENOSYS (same precedent as the Phase 1
-         * sc_clone share mask). */
+    /* A lone CLONE_VM without CLONE_THREAD and without CLONE_VFORK
+     * (a shared mm fork cannot provide) reports -ENOSYS. CLONE_VM
+     * with CLONE_VFORK (glibc vfork / posix_spawn / dash vforkexec)
+     * runs as a fork-equivalent with the parent suspended until exec
+     * or exit (see l4b_clone_fork): the child gets a private copy of
+     * the address space, which is observably the same for the
+     * exec-or-_exit contract of a vfork child. A shared-mm child that
+     * outlives the parent's view, or one that writes parent memory
+     * and keeps running, is not representable. */
+    if ((flags & L4B_CLONE_VM) != 0U &&
+        (flags & (L4B_CLONE_THREAD | L4B_CLONE_VFORK)) == 0U) {
         return l2a_ret(ctx, -(int64_t)ENOSYS);
     }
     return l4b_clone_fork(ctx, flags, stack_va, parent_tid_va, tls_va,
@@ -506,6 +617,9 @@ void mips_thread_exit(mips64_ctx_t *ctx, int status)
     if (ctx == NULL) {
         _Exit(status);
     }
+    /* A vfork child exiting here replays its parent-stack-window diffs
+     * (posix_spawn args->err) before the exit closes the channel. */
+    mips64_vfork_flush(ctx);
     mips64_ctx_clear_ll(ctx);
     /* R5: clear the CLONE_CHILD_CLEARTID word before any wait so a
      * worker joining the leader never deadlocks on a stale word. */
@@ -744,6 +858,13 @@ void mips_threads_atfork_child(mips64_ctx_t *ctx)
     if (ctx != NULL) {
         mips64_ctx_clear_ll(ctx);
     }
+    /* A pre-fork child exit belongs to the parent's wait set: drop the
+     * recorded host SIGCHLD so the child never sees a phantom one.
+     * Likewise a vfork channel belongs to the forking thread's
+     * parent: a plain-fork child never inherits it (its write end
+     * would strand the outer vfork parent past this child's exit). */
+    mips64_host_sigchld_fork_child();
+    mips64_vfork_drop();
     (void)memcpy(&l4b_mu, &fresh_mu, sizeof l4b_mu);
     (void)memcpy(&l4b_cv, &fresh_cv, sizeof l4b_cv);
     (void)memcpy(&l4b_hmu, &fresh_mu, sizeof l4b_hmu);

@@ -230,6 +230,11 @@ typedef struct mips64_ctx {
      * at admission until R6 compact branches/forbidden slots are
      * implemented, so only R2 encodings ever execute. */
     uint32_t isa_rev;
+
+    /* Process comm for prctl PR_SET_NAME/PR_GET_NAME (16 bytes,
+     * NUL-padded; empty means the default "mips64rt"). C-only tail:
+     * never part of the ABI-locked prefix above. */
+    char comm[16];
 } mips64_ctx_t;
 
 /* ABI-locked offsets (SPEC 2.1, verified by tests/check_abi_invariants). */
